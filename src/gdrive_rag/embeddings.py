@@ -14,7 +14,7 @@ import time
 from collections.abc import Sequence
 from typing import Protocol
 from urllib.error import HTTPError, URLError
-from urllib.request import Request, urlopen
+from urllib.request import HTTPRedirectHandler, Request, build_opener
 
 from .config import Settings
 
@@ -23,6 +23,17 @@ RETRY_STATUSES = frozenset({408, 429, 500, 502, 503, 504})
 
 
 REJECTED_STATUSES = frozenset({400, 413, 422})
+
+
+class _NoRedirect(HTTPRedirectHandler):
+    """Never follow a redirect: it would carry the ``Authorization`` header to another host
+    (or from https to http). A 3xx answer becomes an error naming only its status."""
+
+    def redirect_request(self, *args: object, **kwargs: object) -> None:
+        return None
+
+
+_OPENER = build_opener(_NoRedirect)
 
 
 class EmbeddingError(RuntimeError):
@@ -112,7 +123,7 @@ class OpenAICompatibleEmbeddings:
         payload: dict[str, object] = {}
         for attempt in range(retries + 1):
             try:
-                with urlopen(request, timeout=timeout) as response:
+                with _OPENER.open(request, timeout=timeout) as response:
                     payload = json.loads(response.read().decode())
                 break
             except HTTPError as exc:

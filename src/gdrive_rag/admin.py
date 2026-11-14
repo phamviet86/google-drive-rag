@@ -21,8 +21,10 @@ Rules every operation follows:
 from __future__ import annotations
 
 import contextlib
+import ipaddress
 import json
 import os
+import re
 import threading
 import time
 from collections.abc import Callable
@@ -34,6 +36,7 @@ from urllib.parse import urlparse
 from .auth import (
     GoogleOAuthFlow,
     OAuthFlow,
+    import_client_secret,
     import_service_account,
     parse_client_secret,
     parse_redirect,
@@ -58,6 +61,15 @@ GOOGLE_ENV = ("GDRAG_GOOGLE_AUTH", "GDRAG_GOOGLE_CREDENTIALS")
 OAUTH_EXPIRY_SECONDS = 600
 MAX_SECRET_FILE_BYTES = 1_000_000
 MAX_API_KEY_CHARS = 4096
+KEY_PATTERN = re.compile(rf"[A-Za-z0-9._~+/=-]{{16,{MAX_API_KEY_CHARS}}}")
+HTTP_ENV = "GDRAG_ALLOW_HTTP_EMBEDDINGS"
+METADATA_HOSTS = {"metadata.google.internal", "metadata"}
+TRUE = {"1", "true", "yes", "on"}
+REVOKE_HINT = (
+    "Access is not revoked at Google. For a Gmail sign-in, remove this app at "
+    "https://myaccount.google.com/permissions; for a service account, delete its key in Google "
+    "Cloud console (IAM & Admin > Service accounts > Keys) or stop sharing the folders with it."
+)
 
 
 class AdminRefused(ValueError):
@@ -114,11 +126,11 @@ class Admin:
         except (OSError, RuntimeError):
             resolved = None
         if resolved is None or not resolved.is_relative_to(root):  # one answer: no probing
-            raise AdminRefused(f"no such file inside the secrets folder: {name}")
+            raise AdminRefused("no such file inside the secrets folder")
         if not resolved.is_file():
-            raise AdminRefused(f"not a regular file: {name}")
+            raise AdminRefused("that name is not a regular file in the secrets folder")
         if resolved.stat().st_size > MAX_SECRET_FILE_BYTES:
-            raise AdminRefused(f"file is too large: {name}")
+            raise AdminRefused("that file is too large")
         return resolved
 
     def _read_secret(self, value: str) -> str:
@@ -126,23 +138,25 @@ class Admin:
         try:
             return path.read_text(encoding="utf-8")
         except (OSError, UnicodeDecodeError):
-            raise AdminRefused(f"cannot read {value} (check its owner and mode)") from None
+            raise AdminRefused("cannot read that file (check its owner and mode)") from None
 
     # -- sources -------------------------------------------------------------------------------
     def add_source(self, link: str) -> dict[str, Any]:
         result = self.service.add_sources([link])[0]
         if "id" not in result:  # not a Drive link: nothing was stored
-            raise AdminRefused(f"could not add {link}: {result.get('error')}")
+            raise AdminRefused("could not add: not a Google Drive folder or file link")
         answer = {"applied": not result.get("already_added"), "source": _source(result)}
         if result.get("already_added"):
             answer["message"] = "This source was already added; nothing changed."
             return answer
-        if not result.get("ok"):
-            answer["message"] = (
-                f"Source added, but Google cannot open it now ({result.get('error')}). Share it "
-                "with the Google account in use, then call sync_now; or remove it."
+        if result.get("status") == "error":
+            # Google answered "not found or not shared": keep nothing (a bare ID that is really
+            # a mistyped key must not end up in list_sources)
+            self.service.discard_source(int(result["id"]))
+            raise AdminRefused(
+                "Google cannot open that link or ID (not found, or not shared with the Google "
+                "account in use); nothing was added"
             )
-            return answer
         answer["sync"] = self.service.queue_sync(int(result["id"]))
         answer["message"] = "Source added; it is read in the background. Check sync_status."
         return answer
@@ -192,12 +206,7 @@ class Admin:
         }
 
     def _google_unlocked(self) -> None:
-        locked = [n for n in GOOGLE_ENV if os.environ.get(n, "").strip()]
-        if locked:
-            raise AdminRefused(
-                f"Google access is set by {', '.join(locked)} in the environment (.env), which "
-                "wins at every restart; change it there, or empty it and restart first"
-            )
+        require_google_unlocked()
 
     def set_service_account(self, file: str, confirm: bool) -> dict[str, Any]:
         self._google_unlocked()
@@ -289,30 +298,48 @@ class Admin:
             self._pending = None
         removed = remove_google_files(self.service.settings)
         self.service.reload()
-        return {"applied": True, "removed": removed, "message": message}
+        return {
+            "applied": True,
+            "removed": removed,
+            "message": message,
+            "not_revoked_at_google": REVOKE_HINT,
+        }
 
     # -- embeddings ----------------------------------------------------------------------------
     def set_embedding(
         self,
-        base_url: str,
-        model: str,
+        base_url: str | None = None,
+        model: str | None = None,
         api_key_file: str | None = None,
         api_key: str | None = None,
         dimensions: int | None = None,
         confirm: bool = False,
     ) -> dict[str, Any]:
         settings = self.service.reload()
-        base_url = _endpoint(base_url or DEFAULT_BASE_URL)
-        model = str(model or "").strip()
+        # omitted address or model: keep the current one (stored, environment or default)
+        base_url = _endpoint(base_url or settings.embedding_base_url or DEFAULT_BASE_URL)
+        model = str(model or settings.embedding_model or "").strip()
         if not model:
             raise AdminRefused("give the embedding model name")
         if api_key_file and api_key:
             raise AdminRefused("give api_key_file or api_key, not both")
-        key = settings.embedding_api_key
+        new_key = ""
         if api_key_file:
-            key = _api_key(self._read_secret(api_key_file))
+            new_key = _api_key(self._read_secret(api_key_file))
         elif api_key:
-            key = _api_key(api_key)
+            new_key = _api_key(api_key)
+        moves = _origin(base_url) != _origin(settings.embedding_base_url)
+        if moves and settings.embedding_api_key and not new_key:
+            # the current key was issued for the current host; never send it anywhere else
+            raise AdminRefused(
+                "a new address needs its own API key: pass api_key_file (or api_key) as well"
+            )
+        if moves and os.environ.get("GDRAG_EMBEDDING_API_KEY", "").strip():
+            raise AdminRefused(
+                "the API key comes from GDRAG_EMBEDDING_API_KEY in the environment (.env); the "
+                "address cannot change while it does. Empty it and restart first"
+            )
+        key = new_key or settings.embedding_api_key
         if not key:
             raise AdminRefused("an API key is needed (api_key_file or api_key)")
         dims = settings.embedding_dimensions if dimensions is None else int(dimensions)
@@ -333,9 +360,18 @@ class Admin:
                 connection.execute("SELECT count(DISTINCT chunk_hash) FROM chunks").fetchone()[0]
             )
         same = stored == identity
-        host = urlparse(base_url).hostname or ""
-        plan = {
+        url = urlparse(base_url)
+        host = url.hostname or ""
+        port = url.port or (443 if url.scheme == "https" else 80)
+        plan: dict[str, Any] = {
             "sends_text_to": host,
+            "endpoint": {
+                "scheme": url.scheme,
+                "host": host,
+                "port": port,
+                "path": url.path or "/",
+            },
+            "host_changes": moves,
             "model": model,
             "dimensions": dims,
             "reembeds_all": not same,
@@ -343,7 +379,9 @@ class Admin:
             "chunks_to_embed": max(0, chunks - vectors) if same else chunks,
         }
         warning = (
-            f"The text of every indexed document will be sent to {host} to compute embeddings."
+            f"Your API key and the text of every indexed document will be sent to {host} "
+            f"({url.scheme}, port {port}, path {url.path or '/'}) to "
+            "compute embeddings."
         )
         if not same and vectors:
             warning += (
@@ -380,6 +418,63 @@ class Admin:
         return {"applied": True, "message": message, "vectors_kept": vectors}
 
 
+def import_environment(service: Service) -> dict[str, Any]:
+    """Copy the settings the environment provides into stored config (key 0600, credentials
+    under ``<data_dir>/google``, links as sources) and list the ``.env`` lines that may then be
+    emptied, so the CLI and the admin tools can manage those settings. Never returns a value."""
+    settings = service.settings
+    blank: list[str] = []
+    problems: dict[str, str] = {}
+    values = {
+        key: os.environ[name].strip()
+        for name, key in ENV_FIELDS.items()
+        if os.environ.get(name, "").strip()
+    }
+    if values:
+        save_config(settings.data_dir, values)
+        blank += [name for name, key in ENV_FIELDS.items() if key in values]
+    credentials = os.environ.get("GDRAG_GOOGLE_CREDENTIALS", "").strip()
+    if credentials:
+        try:
+            payload = Path(credentials).read_text(encoding="utf-8")
+            kind = json.loads(payload).get("type")
+            if kind == "service_account":
+                import_service_account(settings, payload)
+            else:
+                import_client_secret(settings, payload)
+            blank.append("GDRAG_GOOGLE_CREDENTIALS")
+        except (OSError, ValueError, AttributeError):
+            problems["GDRAG_GOOGLE_CREDENTIALS"] = "the file could not be read or imported"
+    links = os.environ.get("GDRAG_DRIVE_LINKS", "").replace(",", " ").split()
+    if links:
+        results = service.add_sources(links)
+        if all("id" in result for result in results):
+            blank.append("GDRAG_DRIVE_LINKS")
+        else:
+            problems["GDRAG_DRIVE_LINKS"] = "a link is not a Google Drive link; fix it first"
+    service.reload()
+    return {
+        "may_blank_in_env": blank,
+        "not_imported": problems,
+        "next_step": (
+            "Empty these lines in .env (keep the name, delete the value), then restart with "
+            "`docker compose up -d`. Until then the environment still wins."
+            if blank
+            else "Nothing to import: no GDRAG_* setting is set in the environment."
+        ),
+    }
+
+
+def require_google_unlocked() -> None:
+    """The one precedence rule for Google access, used by the admin tools and the CLI."""
+    locked = [n for n in GOOGLE_ENV if os.environ.get(n, "").strip()]
+    if locked:
+        raise AdminRefused(
+            f"Google access is set by {', '.join(locked)} in the environment (.env), which "
+            "wins at every restart; change it there, or empty it and restart first"
+        )
+
+
 def _source(row: dict[str, Any]) -> dict[str, Any]:
     keys = ("id", "name", "kind", "link", "status", "error")
     return {key: row.get(key) for key in keys}
@@ -407,16 +502,57 @@ def _refuse_environment(changes: dict[str, Any]) -> dict[str, Any]:
 
 
 def _endpoint(value: str) -> str:
-    url = urlparse(str(value).strip())
-    if url.scheme not in {"https", "http"} or not url.hostname:
-        raise AdminRefused("base_url must be an http(s) address such as https://host/api/v1")
+    """https only; plain http only to a loopback or private address and only when
+    ``GDRAG_ALLOW_HTTP_EMBEDDINGS`` is on. Link-local (cloud metadata) addresses are refused."""
+    text = str(value).strip()
+    try:
+        url = urlparse(text)
+        url.port  # noqa: B018 - raises on a bad port
+    except ValueError:
+        raise AdminRefused("base_url is not a valid address") from None
+    host = (url.hostname or "").lower()
+    if url.scheme not in {"https", "http"} or not host:
+        raise AdminRefused("base_url must be an https address such as https://host/api/v1")
     if url.username or url.password or url.query or url.fragment:
         raise AdminRefused("base_url must not contain a user name, password or query")
-    return str(value).strip().rstrip("/")
+    address = _ip(host)
+    if host in METADATA_HOSTS or (address is not None and address.is_link_local):
+        raise AdminRefused("base_url points at a link-local or cloud metadata address")
+    if url.scheme == "http":
+        local = host == "localhost" or (
+            address is not None and (address.is_loopback or address.is_private)
+        )
+        if not local or os.environ.get(HTTP_ENV, "").strip().lower() not in TRUE:
+            raise AdminRefused(
+                f"base_url must use https (plain http is allowed only to a loopback or private "
+                f"address, with {HTTP_ENV}=1)"
+            )
+    return text.rstrip("/")
+
+
+def _ip(host: str) -> ipaddress.IPv4Address | ipaddress.IPv6Address | None:
+    try:
+        return ipaddress.ip_address(host.strip("[]"))
+    except ValueError:
+        return None
+
+
+def _origin(base_url: str) -> tuple[str, str, int | None]:
+    url = urlparse(str(base_url or "").strip())
+    try:
+        port = url.port
+    except ValueError:
+        port = None
+    default = {"https": 443, "http": 80}.get(url.scheme)
+    return url.scheme, (url.hostname or "").lower(), port or default
 
 
 def _api_key(value: str) -> str:
+    """Only key-like text: one token of ``[A-Za-z0-9._~+/=-]``, 16 to 4096 characters. A JSON
+    file (an OAuth client, a service-account key) is refused, so it is never sent as a key."""
     key = value.strip()
-    if not key or len(key) > MAX_API_KEY_CHARS or any(c.isspace() for c in key):
-        raise AdminRefused("the API key must be one line without spaces")
+    if not KEY_PATTERN.fullmatch(key):
+        raise AdminRefused(
+            "that is not an API key (expected one line of letters, digits and ._~+/=-)"
+        )
     return key

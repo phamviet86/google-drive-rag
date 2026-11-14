@@ -41,6 +41,7 @@ from .drive import (
     DriveSourceError,
     Listing,
     display_segment,
+    drive_link,
     folder_link,
     parse_drive_link,
     strip_data_images,
@@ -117,6 +118,7 @@ class Service:
         self.wake = threading.Event()
         self._request_lock = threading.Lock()
         self._requested: tuple[int | None] | None = None  # (source id or None for all)
+        self._request_gen = 0  # bumped by every new or widened request
         self._last_request: float | None = None
 
     # -- settings -----------------------------------------------------------------------------
@@ -161,11 +163,28 @@ class Service:
                 connection.execute(
                     "INSERT INTO sources(link,root_id,kind,drive_id,name,last_status,last_error) "
                     "VALUES(?,?,?,?,?,?,?)",
-                    (link.strip(), root.id, root.kind, root.drive_id, root.name, status, error),
+                    (
+                        drive_link(root.id, root.kind),
+                        root.id,
+                        root.kind,
+                        root.drive_id,
+                        root.name,
+                        status,
+                        error,
+                    ),
                 )
             row = self._source_row(root_id)
             results.append({"link": link, "ok": status != "error", **(row or {})})
         return results
+
+    def discard_source(self, source_id: int) -> None:
+        """Drop a just-added source that holds no documents yet (no sync lock needed)."""
+        with self.db.transaction() as connection:
+            connection.execute(
+                "DELETE FROM sources WHERE id=? AND NOT EXISTS "
+                "(SELECT 1 FROM document_sources WHERE source_id=?)",
+                (source_id, source_id),
+            )
 
     def remove_source(self, value: str) -> dict[str, Any]:
         row = self._find_source(value)
@@ -257,18 +276,25 @@ class Service:
             if self._requested is not None or self.sync_running():
                 return self._request_answer(False, "already_running")
             self._requested = (source_id,)
+            self._request_gen += 1
             self._last_request = now
         self.wake.set()
         return self._request_answer(True, None)
 
     def queue_sync(self, source_id: int | None = None) -> dict[str, Any]:
-        """Queue a sync for an admin change (a new source or new credentials), without the
-        ``sync_now`` rate limit. A sync that is running finishes first; the queued one follows."""
+        """Queue a sync for an admin change (a new source, a new embedding endpoint).
+
+        Not subject to the ``sync_now`` rate limit and does not use up its minute: admin changes
+        are rare and confirmed by the user. Calls coalesce, so at most one queued sync waits; a
+        sync that is running (requested or scheduled) finishes first and the queued one runs
+        once after it, because ``finish_request`` only clears a request that did not change
+        while it ran."""
         with self._request_lock:
             if self._requested is not None and self._requested[0] != source_id:
                 self._requested = (None,)  # two different requests: one sync of everything
             elif self._requested is None:
                 self._requested = (source_id,)
+            self._request_gen += 1
             running = self.sync_running()
         self.wake.set()
         return {"queued": True, "after_running_sync": running}
@@ -292,13 +318,23 @@ class Service:
         }
 
     def take_request(self) -> tuple[int | None] | None:
-        """The pending request, if any; the sync loop calls this and then runs it."""
+        """The pending request, if any (status uses it; the sync loop uses ``begin_request``)."""
         with self._request_lock:
             return self._requested
 
-    def finish_request(self) -> None:
+    def begin_request(self) -> tuple[int | None, int] | None:
+        """(source id, generation) of the pending request; pass the generation back to
+        ``finish_request`` after running it."""
         with self._request_lock:
-            self._requested = None
+            if self._requested is None:
+                return None
+            return self._requested[0], self._request_gen
+
+    def finish_request(self, generation: int | None = None) -> None:
+        """Clear the request just run, unless a newer one was queued meanwhile."""
+        with self._request_lock:
+            if generation is None or generation == self._request_gen:
+                self._requested = None
 
     def _request_answer(self, started: bool, reason: str | None, **extra: Any) -> dict[str, Any]:
         answer: dict[str, Any] = {"started": started}

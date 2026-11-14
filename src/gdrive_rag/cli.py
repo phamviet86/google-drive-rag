@@ -116,8 +116,10 @@ def cmd_source_remove(args: argparse.Namespace) -> int:
 
 
 def cmd_auth_google(args: argparse.Namespace) -> int:
+    from .admin import require_google_unlocked
     from .auth import import_client_secret, import_service_account, oauth_sign_in
 
+    require_google_unlocked()  # the same precedence rule as the admin tools
     settings = load_settings(args.data_dir)
     if args.service_account:
         result = import_service_account(settings, _read_payload(args.service_account))
@@ -154,6 +156,13 @@ def cmd_embedding_set(args: argparse.Namespace) -> int:
         args.base_url, args.model, api_key=key, dimensions=args.dimensions, confirm=args.yes
     )
     _print(result, args.json)
+    return 0
+
+
+def cmd_config_import_env(args: argparse.Namespace) -> int:
+    from .admin import import_environment
+
+    _print(import_environment(_service(args)), args.json)
     return 0
 
 
@@ -304,8 +313,8 @@ def build_parser() -> argparse.ArgumentParser:
         dest="embedding_command", required=True
     )
     set_embedding = embedding.add_parser("set", help="set the embedding API (preview first)")
-    set_embedding.add_argument("--base-url", default=DEFAULT_BASE_URL)
-    set_embedding.add_argument("--model", default=DEFAULT_MODEL)
+    set_embedding.add_argument("--base-url", help="omit to keep the current address")
+    set_embedding.add_argument("--model", help="omit to keep the current model")
     set_embedding.add_argument("--api-key-file", metavar="FILE", help="key file, or - for stdin")
     set_embedding.add_argument("--dimensions", type=int, default=None)
     set_embedding.add_argument("--yes", action="store_true", help="apply (otherwise preview)")
@@ -313,6 +322,14 @@ def build_parser() -> argparse.ArgumentParser:
     remove_embedding = embedding.add_parser("remove", help="back to full-text search only")
     remove_embedding.add_argument("--yes", action="store_true", help="apply (otherwise preview)")
     remove_embedding.set_defaults(func=cmd_embedding_remove)
+
+    config = commands.add_parser("config", help="stored settings").add_subparsers(
+        dest="config_command", required=True
+    )
+    config.add_parser(
+        "import-env",
+        help="store the GDRAG_* settings from the environment and list the .env lines to empty",
+    ).set_defaults(func=cmd_config_import_env)
     return parser
 
 

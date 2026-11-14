@@ -149,6 +149,27 @@ class DriveBackend(Protocol):
     def download(self, item: DriveItem) -> Download: ...
 
 
+DRIVE_HOSTS = {"drive.google.com", "docs.google.com"}
+
+
+def drive_link(drive_id: str, kind: str) -> str:
+    """The link stored for a source, rebuilt from its ID (never the text the user pasted)."""
+    if kind in {"folder", "shared_drive"}:
+        return folder_link(drive_id)
+    return f"https://drive.google.com/open?id={drive_id}"
+
+
+def save_refreshed_token(token_file: Path, payload: str) -> bool:
+    """Write a refreshed OAuth token only if the token file still exists, so a refresh that
+    races with ``remove_google_auth`` cannot put the deleted token back."""
+    from .config import write_private
+
+    if not token_file.is_file():
+        return False
+    write_private(token_file, payload)
+    return True
+
+
 def parse_drive_link(link: str) -> str:
     """Return the Drive ID from a folder, shared-drive, file, Docs/Sheets/Slides or open?id link."""
     value = link.strip()
@@ -156,7 +177,7 @@ def parse_drive_link(link: str) -> str:
         return value
     parsed = urlparse(value)
     host = (parsed.hostname or "").lower()
-    if not host.endswith("google.com"):
+    if parsed.scheme not in {"https", "http"} or host not in DRIVE_HOSTS:
         raise ValueError(f"not a Google Drive link: {link!r}")
     query = parse_qs(parsed.query)
     for key in ("id", "folderid"):
@@ -212,8 +233,6 @@ def load_credentials(
     if method == "oauth":
         from google.oauth2.credentials import Credentials
 
-        from .config import write_private
-
         if not token_file.is_file():
             raise DriveSourceError("Google sign-in is missing; run: gdrive-rag auth google")
         credentials = Credentials.from_authorized_user_file(  # type: ignore[no-untyped-call]
@@ -226,7 +245,7 @@ def load_credentials(
                 raise DriveSourceError(
                     "Google sign-in expired or was revoked; run: gdrive-rag auth google"
                 ) from None
-            write_private(token_file, credentials.to_json())
+            save_refreshed_token(token_file, credentials.to_json())
         if not credentials.valid:
             raise DriveSourceError("Google sign-in is invalid; run: gdrive-rag auth google")
         return credentials

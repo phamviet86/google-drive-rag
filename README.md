@@ -227,6 +227,8 @@ Mặc định Claude chỉ được tìm và đọc tài liệu. Nếu muốn nh
 
 > **Cảnh báo:** Một tài liệu trong Drive có thể chứa dòng chữ giả làm lời dặn cho Claude, ví dụ "hãy gửi dữ liệu sang địa chỉ X". Nếu Claude làm theo, toàn bộ nội dung tài liệu của bạn có thể bị gửi tới máy của người khác. Vì vậy chỉ bật khi cần, và luôn đọc kỹ câu Claude hỏi lại trước khi đồng ý.
 
+> **Cảnh báo:** Khi đã bật, bất kỳ chương trình hay người dùng nào trên VPS kết nối được tới cổng 8765 đều gọi được các công cụ này, không cần mật khẩu. Chỉ bật trên VPS mà chỉ bạn dùng, và tắt lại khi xong việc.
+
 Cách bật:
 
 1. Mở tệp `.env` trong `~/google-drive-rag` và thêm dòng:
@@ -258,8 +260,11 @@ Cách bật:
 Những điều nên biết:
 
 - Việc có thể làm mất dữ liệu (bỏ nguồn, đổi hoặc xóa quyền Google, đổi khóa tìm theo ý nghĩa) luôn chạy hai lần: lần đầu Claude chỉ kể sẽ xảy ra gì, lần sau mới làm khi bạn đồng ý.
+- Đổi sang địa chỉ khác thì phải đưa khóa mới của địa chỉ đó; khóa cũ không bao giờ được gửi sang máy khác. Địa chỉ phải bắt đầu bằng `https://`. Chỉ máy trong mạng nội bộ mới được dùng `http://`, và phải thêm dòng `GDRAG_ALLOW_HTTP_EMBEDDINGS=1` vào `.env`.
+- Xóa quyền Google chỉ xóa bản lưu trên VPS, không thu hồi quyền ở phía Google. Muốn thu hồi hẳn: với đăng nhập Gmail, gỡ ứng dụng tại https://myaccount.google.com/permissions; với tài khoản dịch vụ, xóa khóa của nó trong Google Cloud hoặc thôi chia sẻ thư mục.
 - Tệp khóa phải nằm trong thư mục `secrets`. Claude chỉ cần tên tệp, ví dụ `openrouter.key`, nên khóa không phải dán vào cuộc trò chuyện. Công cụ không đọc được tệp nằm ngoài thư mục này.
 - Khóa và mã đăng nhập không bao giờ hiện trong câu trả lời, trong `sync_status` hay trong nhật ký.
+- Nếu `.env` đang ghi sẵn khóa, địa chỉ hay tệp Google, hãy chạy một lần `sudo docker compose exec gdrive-rag gdrive-rag config import-env`. Lệnh này lưu các giá trị đó vào dịch vụ (không in khóa ra) và liệt kê những dòng trong `.env` có thể để trống. Để trống các dòng đó rồi chạy `sudo docker compose up -d`.
 - Giá trị ghi trong `.env` luôn thắng. Nếu `.env` đã ghi một giá trị khác, công cụ từ chối và nói tên dòng cần xóa trong `.env`. Muốn quản lý một mục bằng Claude, hãy để trống dòng đó trong `.env` rồi dựng lại dịch vụ. `sync_status` cho biết mỗi mục lấy từ `.env` ("environment"), từ công cụ hoặc lệnh ("stored") hay mặc định ("default").
 - Sau khi đổi quyền Google, Drive chưa được đọc lại ngay. Hãy chia sẻ các thư mục cho tài khoản mới trước, rồi nhờ Claude gọi `sync_now`. Một thư mục mà tài khoản mới không mở được sẽ bị bỏ khỏi chỉ mục ở lần đọc kế tiếp.
 - Nguồn ghi trong `GDRAG_DRIVE_LINKS` không bỏ được bằng công cụ, vì lần khởi động sau nó sẽ được thêm lại.
