@@ -278,3 +278,81 @@ def test_upgrade_from_a_d9e8061_data_dir(tmp_path: Path, monkeypatch: pytest.Mon
     assert drive.downloads == [] and embeddings.document_calls == 0
     assert found(service, folder=KE_TOAN) == {"q1.txt", "thue-2025.txt", "ke-toan.txt"}
     assert service.search("quý một")["results"][0]["parent_folder_id"] == QUY_1
+
+
+def test_unrelated_partial_source_does_not_pin_a_moved_folder(tmp_path: Path) -> None:
+    drive, service = indexed(tmp_path)
+    drive.add_root(KE_TOAN, "Kế toán")  # the folder is also its own source
+    drive.add_root("rootOther0000000", "Khác")
+    drive.put("rootOther0000000", "fileOther0000000", "khac.txt", "tài liệu khác".encode())
+    drive.incomplete.add("rootOther0000000")  # an unrelated source stays partial every cycle
+    service.add_sources([KE_TOAN, "rootOther0000000"])
+    service.sync()
+    drive.add_folder(KE_TOAN, "Kế toán", "folderOutside000")  # moved out of Công ty
+    service.sync()
+    assert found(service, folder=ROOT) == {"nhan-su.txt", "goc.txt"}
+    assert [f["folder_id"] for f in service.list_folders(parent=ROOT)["folders"]] == [NHAN_SU]
+    assert found(service, folder=KE_TOAN) == {"q1.txt", "thue-2025.txt", "ke-toan.txt"}
+
+
+def test_partial_source_that_held_the_folder_keeps_its_parent(tmp_path: Path) -> None:
+    drive, service = indexed(tmp_path)
+    drive.add_root(KE_TOAN, "Kế toán")
+    service.add_sources([KE_TOAN])
+    service.sync()
+    drive.incomplete.add(ROOT)  # the outer source cannot be listed fully: it may still hold it
+    service.sync()
+    with service.db.read() as connection:
+        parent = connection.execute(
+            "SELECT parent_id FROM folders WHERE folder_id=?", (KE_TOAN,)
+        ).fetchone()[0]
+    assert parent == ROOT
+
+
+def test_parent_folder_id_is_null_when_the_folder_is_not_indexed(tmp_path: Path) -> None:
+    drive, service = indexed(tmp_path)
+    drive.add_root("fileSingle000000", "le.txt", kind="file")
+    drive.put(
+        "fileSingle000000",
+        "fileSingle000000",
+        "le.txt",
+        "hợp đồng lẻ".encode(),
+        parent="folderNotShared0",
+    )
+    service.add_sources(["fileSingle000000"])
+    service.sync()
+    hit = service.search("hợp đồng lẻ")["results"][0]
+    assert hit["file_name"] == "le.txt" and hit["parent_folder_id"] is None
+    assert service.search("quý một")["results"][0]["parent_folder_id"] == QUY_1
+
+
+def test_aborted_pass_keeps_folder_membership_and_ancestry_consistent(tmp_path: Path) -> None:
+    from gdrive_rag.drive import DriveSourceError
+
+    drive, service = indexed(tmp_path)
+    # goc.txt changes and its download hits a sign-in failure, which stops the pass before
+    # q1.txt (moved out of Quý 1, which is then deleted) is processed
+    drive.put(ROOT, GOC, "goc.txt", "Báo cáo thuế mới".encode(), version="2")
+    drive.put(ROOT, Q1, "q1.txt", "Báo cáo thuế quý một".encode(), parent=NHAN_SU)
+    del drive.folders[QUY_1]
+    drive.download_errors[GOC] = DriveSourceError("Google sign-in was rejected (HTTP 401)")
+    assert "stopped" in service.sync()
+    assert found(service, folder=QUY_1) == {"q1.txt"}  # old state kept as a whole
+    assert "q1.txt" in found(service, folder=KE_TOAN)
+    del drive.download_errors[GOC]
+    service.sync()
+    assert "q1.txt" in found(service, folder=NHAN_SU)
+    with pytest.raises(ValueError, match=QUY_1):
+        service.search("thuế", folder=QUY_1)
+
+
+def test_list_folders_counts_follow_the_source_filter(tmp_path: Path) -> None:
+    drive, service = indexed(tmp_path)
+    drive.add_root(NAM_2025, "2025")
+    drive.incomplete.add(NAM_2025)  # this source only ever lists one of the two files
+    service.add_sources([NAM_2025])
+    service.sync()
+    everything = service.list_folders(parent=KE_TOAN)["folders"]
+    assert [(f["folder_id"], f["documents"]) for f in everything] == [(NAM_2025, 2)]
+    scoped = service.list_folders(source="2025", parent=KE_TOAN)["folders"]
+    assert [(f["folder_id"], f["documents"]) for f in scoped] == [(NAM_2025, 1)]

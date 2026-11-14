@@ -257,7 +257,7 @@ class Service:
                 report["sources"].append({"name": source["name"], "ok": False, "error": message})
             return report
         listings: dict[int, Listing | None] = {}  # None: root gone -> clear membership
-        degraded = False  # a source failed or was incomplete: keep stored folder parents
+        degraded: set[int] = set()  # failed or incomplete: keep the parents of its folders
         for source in sources:
             outcome = {"name": source["name"], "ok": True}
             try:
@@ -271,7 +271,8 @@ class Service:
                 listing = backend.list_files(root)
                 listings[source["id"]] = listing
                 status = "ok" if listing.complete else "partial"
-                degraded = degraded or not listing.complete
+                if not listing.complete:
+                    degraded.add(source["id"])
                 error = "; ".join(listing.errors[:3]) or None
                 self._set_source_status(source["id"], status, error, len(listing.items))
                 outcome.update(files=len(listing.items), complete=listing.complete)
@@ -280,7 +281,7 @@ class Service:
                 self._set_source_status(source["id"], "error", str(exc), 0)
                 outcome.update(ok=False, error=str(exc))
             except Exception as exc:  # auth/quota/network: keep everything as it is
-                degraded = True
+                degraded.add(source["id"])
                 self._set_source_status(source["id"], "error", _message(exc))
                 outcome.update(ok=False, error=_message(exc))
             report["sources"].append(outcome)
@@ -307,13 +308,18 @@ class Service:
                 if known is None or (folder.parent_id and not known.parent_id):
                     folders[folder.id] = folder
         with self.db.transaction() as connection:
+            # A folder no listing gives a parent keeps its stored parent only when a source that
+            # held it failed or was incomplete (or the pass stopped): that source may still have it.
+            held: dict[str, set[int]] = {}
+            for row in connection.execute("SELECT folder_id, source_id FROM folder_sources"):
+                held.setdefault(str(row[0]), set()).add(int(row[1]))
             connection.executemany(
                 """INSERT INTO folders(folder_id, name, parent_id) VALUES(?,?,?)
                    ON CONFLICT(folder_id) DO UPDATE SET name=excluded.name,
                      parent_id=CASE WHEN excluded.parent_id='' AND ? THEN folders.parent_id
                                     ELSE excluded.parent_id END""",
                 [
-                    (f.id, f.name, f.parent_id, int(degraded or bool(stop)))
+                    (f.id, f.name, f.parent_id, int(bool(stop or held.get(f.id, set()) & degraded)))
                     for f in folders.values()
                 ],
             )
@@ -322,7 +328,7 @@ class Service:
                 for row in connection.execute("SELECT file_id, id FROM documents")
             }
             for source_id, found in listings.items():
-                if found is None or found.complete:
+                if found is None or (found.complete and not stop):  # same rule as documents
                     connection.execute("DELETE FROM folder_sources WHERE source_id=?", (source_id,))
                 connection.executemany(
                     "INSERT OR IGNORE INTO folder_sources VALUES(?,?)",
@@ -623,15 +629,23 @@ class Service:
                     f"SELECT count(*) FROM folders f WHERE {where}", values
                 ).fetchone()[0]
             )
+            in_source = ""
+            count_values: list[Any] = []
+            if source_id is not None:
+                in_source = (
+                    " AND d.id IN (SELECT document_id FROM document_sources WHERE source_id=?)"
+                )
+                count_values.append(source_id)
             folders = connection.execute(
                 f"""SELECT f.folder_id, f.name, f.path,
                       (SELECT count(*) FROM document_folders df
                        JOIN documents d ON d.id=df.document_id
-                       WHERE df.folder_id=f.folder_id AND d.status='indexed') documents,
+                       WHERE df.folder_id=f.folder_id AND d.status='indexed'{in_source})
+                       documents,
                       (SELECT count(*) FROM folders c WHERE c.parent_id=f.folder_id) subfolders
                     FROM folders f WHERE {where} ORDER BY f.name, f.folder_id
                     LIMIT ? OFFSET ?""",
-                [*values, LIST_PAGE, offset],
+                [*count_values, *values, LIST_PAGE, offset],
             ).fetchall()
             documents: list[Any] = []
             document_total = 0

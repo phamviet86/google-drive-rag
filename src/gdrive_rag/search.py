@@ -207,7 +207,9 @@ class SearchEngine:
                 marks = ",".join("?" for _ in batch)
                 for row in connection.execute(
                     f"""SELECT c.id, c.ordinal, c.text, c.locator, c.document_id,
-                               d.file_id, d.name, d.path, d.web_url, d.chunk_count, d.parent_id,
+                               d.file_id, d.name, d.path, d.web_url, d.chunk_count,
+                               (SELECT folder_id FROM folders
+                                WHERE folder_id=d.parent_id) parent_id,
                                (SELECT group_concat(s.name, ', ') FROM document_sources ds
                                 JOIN sources s ON s.id=ds.source_id
                                 WHERE ds.document_id=d.id) source_names

@@ -123,3 +123,44 @@ def test_real_ocr_when_runtime_is_provisioned(tmp_path: Path) -> None:
     document = Extractor(runtime, ocr_enabled=True).extract(pdf)
     assert "INVOICE" in document.text and document.metadata["pages_needing_ocr"] == [1]
     assert "ocr_unavailable" not in document.metadata
+
+
+def test_missing_model_files_mean_ocr_unavailable(tmp_path: Path) -> None:
+    """Native libraries present but no pinned model files: unavailable, not a failed OCR run."""
+    from PIL import Image
+
+    class LibrariesOnly:
+        def configure(self) -> bool:
+            return True
+
+        def resolved_model_dir(self) -> None:
+            return None
+
+    image = tmp_path / "scan.png"
+    Image.new("RGB", (200, 100), "white").save(image)
+    document = Extractor(LibrariesOnly(), ocr_enabled=True).extract(image)  # type: ignore[arg-type]
+    assert document.metadata["ocr_unavailable"] is True
+    assert "ocr_failed" not in json.dumps(document.metadata)
+
+
+def test_runtime_downloads_have_a_timeout(tmp_path: Path, monkeypatch) -> None:
+    import io
+    import urllib.request
+
+    from gdrive_rag import ocr_runtime
+
+    seen: list[object] = []
+
+    def fake_urlopen(url: str, timeout: object = None) -> io.BytesIO:
+        seen.append(timeout)
+        return io.BytesIO(b"model bytes")
+
+    monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen)
+    target = tmp_path / "file.part"
+    ocr_runtime._download("https://example.invalid/x", target)
+    assert target.read_bytes() == b"model bytes"
+    assert seen == [ocr_runtime.DOWNLOAD_TIMEOUT_SECONDS]
+    manager = ocr_runtime.OCRRuntimeManager(tmp_path / "rt", tmp_path / "models")
+    with pytest.raises(RuntimeError, match="checksum mismatch"):
+        manager.fetch_models()  # goes through _download, so through the timeout
+    assert len(seen) == 2 and seen[-1] == ocr_runtime.DOWNLOAD_TIMEOUT_SECONDS

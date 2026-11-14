@@ -139,7 +139,14 @@ class Extractor:
         return ExtractedDocument(document.text, document.spans, media, metadata)
 
     def _ocr_ready(self) -> bool:
-        return bool(self.ocr_enabled and self.ocr_runtime and self.ocr_runtime.configure())
+        """Native libraries and the pinned model files are present (OCR runs offline)."""
+        runtime = self.ocr_runtime
+        return bool(
+            self.ocr_enabled
+            and runtime
+            and runtime.configure()
+            and runtime.resolved_model_dir() is not None
+        )
 
     def _ocr(
         self, run: Callable[[str | None], Any], routed: list[int]
@@ -152,8 +159,7 @@ class Extractor:
             problems.extend({"page": page, "reason": "ocr_unavailable"} for page in routed)
             return pages, problems
         try:
-            model_directory = runtime.resolved_model_dir()
-            result = run(str(model_directory) if model_directory else None)
+            result = run(str(runtime.resolved_model_dir()))
             for ocr_page in result.pages:
                 number = int(ocr_page.page_number)
                 markdown = (ocr_page.markdown or "").strip()

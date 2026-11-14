@@ -105,7 +105,7 @@ class OCRRuntimeManager:
             archive = downloads / url.rsplit("/", 1)[-1]
             if not archive.exists() or _sha256(archive) != expected:
                 temporary = archive.with_suffix(archive.suffix + ".part")
-                urllib.request.urlretrieve(url, temporary)
+                _download(url, temporary)
                 if _sha256(temporary) != expected:
                     temporary.unlink(missing_ok=True)
                     raise RuntimeError(f"checksum mismatch for {archive.name}")
@@ -171,7 +171,7 @@ class OCRRuntimeManager:
             if destination.is_file() and _sha256(destination) == expected:
                 continue
             temporary = destination.with_suffix(destination.suffix + ".part")
-            urllib.request.urlretrieve(OCR_MODEL_BASE_URL + name, temporary)
+            _download(OCR_MODEL_BASE_URL + name, temporary)
             if _sha256(temporary) != expected:
                 temporary.unlink(missing_ok=True)
                 raise RuntimeError(f"checksum mismatch for {name}")
@@ -203,6 +203,14 @@ class OCRRuntimeManager:
         os.environ["ORT_DYLIB_PATH"] = str(paths.ort)
         os.environ["PDF_INSPECTOR_MODEL_CACHE"] = str(self.model_dir)
         return True
+
+
+DOWNLOAD_TIMEOUT_SECONDS = 60  # per socket read; a stalled build fails instead of hanging
+
+
+def _download(url: str, destination: Path, timeout: float = DOWNLOAD_TIMEOUT_SECONDS) -> None:
+    with urllib.request.urlopen(url, timeout=timeout) as response, destination.open("wb") as out:
+        shutil.copyfileobj(response, out, 1024 * 1024)
 
 
 def _sha256(path: Path) -> str:

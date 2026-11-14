@@ -43,7 +43,9 @@ class SearchHit(BaseModel):
     document_id: str = Field(description="Drive file ID; pass to `read`.")
     file_name: str
     path: str = Field(description="Path inside the Drive source folder.")
-    parent_folder_id: str = Field(description="Drive ID of the folder that holds the file.")
+    parent_folder_id: str | None = Field(
+        description="Indexed folder holding the file (usable as `folder`); null if not indexed."
+    )
     locator: str = Field(description="Where in the file: page:N, slide:N, sheet:NAME/row:N, ...")
     chunk: int = Field(description="Chunk number; pass as start_chunk to `read`.")
     chunk_count: int
