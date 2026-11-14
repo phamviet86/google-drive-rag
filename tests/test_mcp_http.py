@@ -16,7 +16,7 @@ import anyio
 import pytest
 from helpers import FakeDrive, make_service
 
-from gdrive_rag.server import MAX_WIRE_CHARS, create_app
+from gdrive_rag.server import MAX_WIRE_CHARS, SyncLoop, create_app
 from gdrive_rag.service import Service
 
 ROOT = "folderAAAAAAAAAAAA"
@@ -52,11 +52,14 @@ def running(tmp_path: Path) -> Iterator[tuple[str, Service]]:
     )
     thread = threading.Thread(target=server.run, daemon=True)
     thread.start()
+    loop = SyncLoop(service, run_at_start=False)  # runs sync_now requests, as in `serve`
+    loop.start()
     deadline = time.time() + 10
     while not server.started and time.time() < deadline:
         time.sleep(0.05)
     assert server.started
     yield f"http://127.0.0.1:{port}", service
+    loop.close()
     server.should_exit = True
     thread.join(timeout=10)
 
@@ -82,12 +85,22 @@ def test_healthz(running: tuple[str, Service]) -> None:
 def test_tools_list(running: tuple[str, Service]) -> None:
     url, _ = running
     tools = {tool.name: tool for tool in call(url, "tools/list").tools}
-    assert set(tools) == {"search", "read", "list_sources", "list_folders", "sync_status"}
-    for tool in tools.values():
+    assert set(tools) == {
+        "search",
+        "read",
+        "list_sources",
+        "list_folders",
+        "sync_status",
+        "sync_now",
+    }
+    for name, tool in tools.items():
         assert tool.title
-        assert tool.annotations is not None and tool.annotations.read_only_hint is True
+        assert tool.annotations is not None
+        assert tool.annotations.read_only_hint is (name != "sync_now")
         assert tool.annotations.destructive_hint is False
+        assert tool.annotations.idempotent_hint is True
         assert tool.output_schema is not None
+    assert "sync_status" in (tools["sync_now"].description or "")
 
 
 def test_search_and_read(running: tuple[str, Service]) -> None:
@@ -197,3 +210,71 @@ def test_list_folders_pages_through_many_folders(running: tuple[str, Service]) -
         seen += [f["folder_id"] for f in page["folders"]]
         offset, pages = page["next_offset"], pages + 1
     assert pages >= 3 and len(seen) == 300 and len(set(seen)) == 300
+
+
+def wait_until(condition: Any, seconds: float = 10.0) -> None:
+    deadline = time.time() + seconds
+    while not condition():
+        assert time.time() < deadline, "timed out"
+        time.sleep(0.05)
+
+
+def test_sync_now_runs_in_background_and_is_rate_limited(running: tuple[str, Service]) -> None:
+    url, service = running
+    drive = service.backend_factory(service.settings)
+    drive.put(ROOT, "docNew0000000000", "moi.txt", "Biên bản bàn giao mới".encode())
+    first = call(url, "sync_now")
+    assert not first.is_error
+    assert first.structured_content["started"] is True
+    assert first.structured_content["running"] is True
+
+    def finished() -> bool:  # picked up, run and done (running alone is false before pick-up)
+        sync = call(url, "sync_status").structured_content["sync"]
+        return sync["trigger"] == "requested" and not sync["requested"] and not sync["running"]
+
+    wait_until(finished)
+    assert call(url, "search", {"query": "bàn giao"}).structured_content["results"]
+    again = call(url, "sync_now").structured_content
+    assert again["started"] is False and again["reason"] == "rate_limited"
+    assert 0 < again["retry_after_seconds"] <= 60
+    assert again["last_report"]["indexed"] == 1
+    assert call(url, "sync_now", {"source": "no such source"}).is_error
+
+
+def test_sync_now_never_runs_two_syncs(
+    running: tuple[str, Service], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import gdrive_rag.service as service_module
+    from gdrive_rag.service import SyncBusy
+
+    url, service = running
+    monkeypatch.setattr(service_module, "REQUEST_INTERVAL_SECONDS", 0)
+    drive = service.backend_factory(service.settings)
+    drive.put(ROOT, "docSlow000000000", "cham.txt", "Tệp tải chậm".encode())
+    release = threading.Event()
+    real_download = drive.download
+
+    def slow_download(item: Any) -> Any:
+        if item.id == "docSlow000000000":
+            release.wait(10)
+        return real_download(item)
+
+    monkeypatch.setattr(drive, "download", slow_download)
+    answers: list[dict[str, Any]] = []
+    callers = [
+        threading.Thread(target=lambda: answers.append(call(url, "sync_now").structured_content))
+        for _ in range(4)
+    ]
+    for caller in callers:
+        caller.start()
+    for caller in callers:
+        caller.join()
+    assert sorted(a["started"] for a in answers) == [False, False, False, True]
+    assert {a.get("reason") for a in answers if not a["started"]} == {"already_running"}
+    wait_until(service.sync_running)
+    with pytest.raises(SyncBusy):  # a CLI sync meanwhile is refused by the same lock
+        service.sync()
+    assert call(url, "sync_status").structured_content["sync"]["running"] is True
+    release.set()
+    wait_until(lambda: not service.sync_running() and service.take_request() is None)
+    assert call(url, "search", {"query": "tải chậm"}).structured_content["results"]

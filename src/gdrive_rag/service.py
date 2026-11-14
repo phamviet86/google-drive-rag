@@ -17,8 +17,11 @@ import datetime as dt
 import fcntl
 import json
 import logging
+import math
 import os
 import struct
+import threading
+import time
 from collections.abc import Callable, Iterator
 from pathlib import Path
 from typing import Any
@@ -53,6 +56,7 @@ EmbeddingFactory = Callable[[Settings], EmbeddingClient | None]
 ERROR_RETRY_HOURS = 24
 DOWNLOAD_ERROR_PREFIX = "download: "  # download errors are retried on every sync
 EMBED_BATCH = 64
+REQUEST_INTERVAL_SECONDS = 60  # sync_now: at most one accepted request per minute
 READ_LIMIT_CHARS = 40_000
 LIST_PAGE = 100  # folders + documents per list_folders page
 _PENDING_SQL = (
@@ -108,6 +112,11 @@ class Service:
         self.embedding_factory = embedding_factory
         self.extractor_factory = extractor_factory
         self.search_engine = SearchEngine(self.db, self._embeddings)
+        # On-demand sync requests (MCP ``sync_now``), run by ``server.SyncLoop`` in its thread.
+        self.wake = threading.Event()
+        self._request_lock = threading.Lock()
+        self._requested: tuple[int | None] | None = None  # (source id or None for all)
+        self._last_request: float | None = None
 
     # -- settings -----------------------------------------------------------------------------
     def reload(self) -> Settings:
@@ -233,19 +242,60 @@ class Service:
             return True
         return True
 
-    def sync(self) -> dict[str, Any]:
+    def request_sync(self, source: str | None = None) -> dict[str, Any]:
+        """Ask the sync loop for a sync now (all sources, or one). Returns at once."""
+        source_id = self.search_engine.source_id(source) if source else None
+        with self._request_lock:
+            now = time.monotonic()
+            if self._last_request is not None:
+                wait = REQUEST_INTERVAL_SECONDS - (now - self._last_request)
+                if wait > 0:
+                    return self._request_answer(
+                        False, "rate_limited", retry_after_seconds=math.ceil(wait)
+                    )
+            if self._requested is not None or self.sync_running():
+                return self._request_answer(False, "already_running")
+            self._requested = (source_id,)
+            self._last_request = now
+        self.wake.set()
+        return self._request_answer(True, None)
+
+    def take_request(self) -> tuple[int | None] | None:
+        """The pending request, if any; the sync loop calls this and then runs it."""
+        with self._request_lock:
+            return self._requested
+
+    def finish_request(self) -> None:
+        with self._request_lock:
+            self._requested = None
+
+    def _request_answer(self, started: bool, reason: str | None, **extra: Any) -> dict[str, Any]:
+        answer: dict[str, Any] = {"started": started}
+        if reason:
+            answer["reason"] = reason
+        answer.update(extra)
+        answer["running"] = started or self.sync_running()
+        answer["last_report"] = json.loads(self.db.get_meta("last_sync_report") or "null")
+        return answer
+
+    def sync(self, trigger: str = "manual", source_id: int | None = None) -> dict[str, Any]:
+        """Run one sync. ``trigger`` is ``scheduled``, ``requested`` (MCP sync_now) or ``manual``
+        (CLI); ``source_id`` limits it to one source."""
         self.reload()
         with self._sync_lock():
             started = _now()
             self.db.set_meta("last_sync_started", started)
-            report = self._sync()
+            self.db.set_meta("last_sync_trigger", trigger)
+            report = self._sync(source_id)
+            report["trigger"] = trigger
             report["embeddings"] = self.embed_pending()
             self.db.set_meta("last_sync_finished", _now())
             self.db.set_meta("last_sync_report", json.dumps(_summary(report)))
             return report
 
-    def _sync(self) -> dict[str, Any]:
-        sources = self.list_sources()
+    def _sync(self, source_id: int | None = None) -> dict[str, Any]:
+        every = self.list_sources()
+        sources = [s for s in every if source_id is None or s["id"] == source_id]
         report: dict[str, Any] = {"sources": [], "indexed": 0, "unchanged": 0, "failed": 0}
         if not sources:
             return report
@@ -258,7 +308,9 @@ class Service:
                 report["sources"].append({"name": source["name"], "ok": False, "error": message})
             return report
         listings: dict[int, Listing | None] = {}  # None: root gone -> clear membership
-        degraded: set[int] = set()  # failed or incomplete: keep the parents of its folders
+        # failed, incomplete or left out of this pass (a one-source sync): such a source may
+        # still hold a folder with its parent, so that parent is kept
+        degraded: set[int] = {s["id"] for s in every} - {s["id"] for s in sources}
         for source in sources:
             outcome = {"name": source["name"], "ok": True}
             try:
@@ -800,6 +852,8 @@ class Service:
             "google_auth": settings.google_auth,
             "sync": {
                 "running": self.sync_running(),
+                "requested": self.take_request() is not None,
+                "trigger": self.db.get_meta("last_sync_trigger"),
                 "interval_minutes": settings.sync_interval_minutes,
                 "last_started": self.db.get_meta("last_sync_started"),
                 "last_finished": self.db.get_meta("last_sync_finished"),

@@ -356,3 +356,20 @@ def test_list_folders_counts_follow_the_source_filter(tmp_path: Path) -> None:
     assert [(f["folder_id"], f["documents"]) for f in everything] == [(NAM_2025, 2)]
     scoped = service.list_folders(source="2025", parent=KE_TOAN)["folders"]
     assert [(f["folder_id"], f["documents"]) for f in scoped] == [(NAM_2025, 1)]
+
+
+def test_syncing_only_the_inner_source_keeps_the_outer_tree(tmp_path: Path) -> None:
+    drive, service = indexed(tmp_path)
+    drive.add_root(KE_TOAN, "Kế toán")  # the subfolder is also its own source
+    service.add_sources([KE_TOAN])
+    service.sync()
+    inner = next(s["id"] for s in service.list_sources() if s["root_id"] == KE_TOAN)
+    service.sync("requested", inner)  # its listing reports KE_TOAN with no parent
+    assert found(service, folder=ROOT) == {
+        "q1.txt",
+        "thue-2025.txt",
+        "ke-toan.txt",
+        "nhan-su.txt",
+        "goc.txt",
+    }
+    assert KE_TOAN in [f["folder_id"] for f in service.list_folders(parent=ROOT)["folders"]]

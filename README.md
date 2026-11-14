@@ -24,6 +24,7 @@ Dịch vụ chạy trong một Docker container trên chính VPS, chỉ nhận k
 - Hiểu Google Docs, Sheets, Slides, Word, Excel, PowerPoint (cả bản cũ `.doc`, `.xls`, `.ppt`), PDF (cả bản scan, nhờ nhận dạng chữ trong ảnh, gọi là OCR), ảnh chụp tài liệu (`.jpg`, `.png`, `.webp`), RTF, Markdown, văn bản, JSON, CSV và trang HTML.
 - Đọc được chữ tiếng Việt có dấu và tiếng Anh trong bản scan và ảnh chụp. Cách thêm ngôn ngữ khác ở phần "Việc thường ngày".
 - Cứ 15 phút kiểm tra Drive một lần: tệp mới được thêm, tệp sửa được đọc lại, tệp bị xóa hoặc thôi chia sẻ thì bị bỏ khỏi chỉ mục. Chỉ mục (index) là bản sao đã sắp xếp để tìm nhanh, nằm trên VPS.
+- Không muốn chờ 15 phút? Nói với Claude, ví dụ "Tôi vừa thêm tệp vào Drive, đọc lại Drive giúp tôi". Claude sẽ bảo dịch vụ đọc Drive ngay, rồi xem tiến độ. Mỗi phút chỉ nhận một yêu cầu như vậy, và lịch 15 phút vẫn chạy như cũ.
 - Chỉ đọc. Dịch vụ không bao giờ sửa hay xóa gì trên Drive.
 
 ## Chuẩn bị
@@ -169,7 +170,7 @@ Ví dụ câu hỏi trong Claude Code:
 
 Kết quả: Claude chỉ trả lời bằng tài liệu nằm trong thư mục hoặc tệp đó. Nếu thư mục hoặc tệp chưa được đọc vào chỉ mục, Claude báo rõ là không tìm thấy nó, thay vì trả về kết quả rỗng.
 
-> **Lưu ý:** Thư mục mới thêm hoặc mới đổi tên trên Drive được cập nhật ở lần đọc Drive kế tiếp (tối đa 15 phút). Đổi tên hay chuyển thư mục không làm dịch vụ đọc lại nội dung tệp.
+> **Lưu ý:** Thư mục mới thêm hoặc mới đổi tên trên Drive được cập nhật ở lần đọc Drive kế tiếp (tối đa 15 phút, hoặc ngay khi bạn nhờ Claude đọc lại Drive). Đổi tên hay chuyển thư mục không làm dịch vụ đọc lại nội dung tệp.
 
 Muốn tự thử trên VPS, chạy lệnh tìm kèm `--folder` (link thư mục) hoặc `--file` (link tệp, dùng nhiều lần được):
 

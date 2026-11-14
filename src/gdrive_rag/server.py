@@ -1,6 +1,7 @@
 """MCP server over Streamable HTTP (``/mcp``), ``/healthz``, and the background sync loop.
 
-All five tools are read-only. The same JSON is sent as structured content and, escaped again,
+Five tools are read-only; ``sync_now`` only asks the sync loop for an early sync.
+The same JSON is sent as structured content and, escaped again,
 as text content; ``wire_size`` measures both after encoding and results are trimmed until it is
 at most ``MAX_WIRE_CHARS``, so quote-heavy text cannot blow up the response.
 """
@@ -11,6 +12,7 @@ import json
 import logging
 import os
 import threading
+import time
 from typing import Annotated, Any
 
 from mcp.server.mcpserver import MCPServer
@@ -35,7 +37,8 @@ INSTRUCTIONS = (
     "browses the folder tree and gives folder IDs. Use `read` with a document_id or Drive file "
     "link to see more text around a hit (pass `chunk` from the search result as start_chunk, or "
     "a PDF page). `list_sources` shows which Drive sources are indexed and `sync_status` shows "
-    "indexing progress and errors."
+    "indexing progress and errors. When the user says a file was just added or changed in "
+    "Drive, call `sync_now`, then check `sync_status` until it is no longer running."
 )
 
 
@@ -130,6 +133,18 @@ class FoldersOutput(BaseModel):
     total: int = Field(description="Folders plus documents in this listing, over all pages.")
     next_offset: int | None = Field(description="Pass as offset for the next page.")
     truncated: bool
+
+
+class SyncNowOutput(BaseModel):
+    started: bool = Field(description="True when a sync was started now.")
+    reason: str | None = Field(
+        default=None, description="Why not started: rate_limited or already_running."
+    )
+    retry_after_seconds: int | None = Field(
+        default=None, description="When rate_limited: wait this long before asking again."
+    )
+    running: bool
+    last_report: dict[str, Any] | None
 
 
 class StatusOutput(BaseModel):
@@ -256,6 +271,30 @@ def create_server(service: Service) -> Any:
         capped["truncated"] = capped["next_offset"] is not None
         return ok(capped)
 
+    @server.tool(
+        title="Sync Google Drive now",
+        annotations=ToolAnnotations(
+            read_only_hint=False,
+            destructive_hint=False,
+            idempotent_hint=True,
+            open_world_hint=True,
+        ),
+    )
+    def sync_now(
+        source: Annotated[
+            str | None,
+            Field(description="Optional source name or id from list_sources; omit for all."),
+        ] = None,
+    ) -> Annotated[CallToolResult, SyncNowOutput]:
+        """Start reading Google Drive again now, in the background, instead of waiting for the
+        next scheduled sync. Use it when the user says a file was just added or changed. Returns
+        at once; then call `sync_status` until `running` is false and search again. At most one
+        request per minute; a refused call says when to retry."""
+        try:
+            return ok(service.request_sync(source))
+        except ValueError as exc:
+            return fail(exc)
+
     @server.tool(title="Indexing status", annotations=local)
     def sync_status() -> Annotated[CallToolResult, StatusOutput]:
         """Show indexing progress: document counts, failures, embedding progress, last sync."""
@@ -287,13 +326,22 @@ def create_app(service: Service) -> Any:
     )
 
 
-class SyncLoop:
-    """Runs ``service.sync()`` at start and then every ``sync_interval_minutes``."""
+BUSY_RETRY_SECONDS = 30  # a scheduled cycle that finds another sync running tries again soon
 
-    def __init__(self, service: Service):
+
+class SyncLoop:
+    """One thread runs every sync of this process: a scheduled one at start and every
+    ``sync_interval_minutes``, and on-demand ones that ``sync_now`` requests in between.
+
+    The schedule is a fixed deadline, so an on-demand run neither delays nor replaces the next
+    scheduled cycle; a scheduled cycle that finds the lock taken (a CLI sync) retries after
+    ``BUSY_RETRY_SECONDS`` instead of waiting a whole interval."""
+
+    def __init__(self, service: Service, run_at_start: bool = True):
         self.service = service
         self.stop = threading.Event()
-        self.wake = threading.Event()
+        self.wake = service.wake
+        self.run_at_start = run_at_start
         self.thread = threading.Thread(target=self._run, name="gdrive-rag-sync", daemon=True)
 
     def start(self) -> None:
@@ -304,22 +352,44 @@ class SyncLoop:
             apply_environment(self.service)
         except Exception as exc:  # a bad .env value must not stop the server
             log.error("could not apply environment settings: %s", type(exc).__name__)
+        due = time.monotonic() if self.run_at_start else self._next_due()
         while not self.stop.is_set():
-            try:
-                report = self.service.sync()
-                log.info(
-                    "sync done: %s indexed, %s unchanged, %s removed",
-                    report.get("indexed"),
-                    report.get("unchanged"),
-                    report.get("removed"),
-                )
-            except SyncBusy:
-                log.info("sync skipped: another sync is running")
-            except Exception as exc:  # the loop must survive anything
-                log.error("sync failed: %s", type(exc).__name__)
-            minutes = self.service.settings.sync_interval_minutes
-            self.wake.wait(minutes * 60)
+            self.wake.wait(max(0.0, due - time.monotonic()))
             self.wake.clear()
+            if self.stop.is_set():
+                break
+            request = self.service.take_request()
+            if request is not None:
+                try:
+                    self._sync("requested", request[0])
+                finally:
+                    self.service.finish_request()
+                continue  # the scheduled deadline stays where it was
+            if time.monotonic() >= due:
+                ran = self._sync("scheduled", None)
+                due = self._next_due() if ran else time.monotonic() + BUSY_RETRY_SECONDS
+
+    def _next_due(self) -> float:
+        return time.monotonic() + self.service.settings.sync_interval_minutes * 60
+
+    def _sync(self, trigger: str, source_id: int | None) -> bool:
+        """Run one sync; False only when another process holds the sync lock."""
+        try:
+            report = self.service.sync(trigger, source_id)
+        except SyncBusy:
+            log.info("%s sync waiting: another sync is running", trigger)
+            return False
+        except Exception as exc:  # the loop must survive anything
+            log.error("%s sync failed: %s", trigger, type(exc).__name__)
+            return True
+        log.info(
+            "%s sync done: %s indexed, %s unchanged, %s removed",
+            trigger,
+            report.get("indexed"),
+            report.get("unchanged"),
+            report.get("removed"),
+        )
+        return True
 
     def close(self) -> None:
         self.stop.set()

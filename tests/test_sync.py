@@ -217,3 +217,65 @@ def test_ocr_languages_setting(tmp_path: Path, monkeypatch) -> None:
     monkeypatch.setenv("GDRAG_OCR_LANGS", "vie; rm -rf /")
     with pytest.raises(ValueError, match="ocr_langs"):
         load_settings(tmp_path)
+
+
+def test_sync_of_one_source_leaves_the_others(tmp_path: Path) -> None:
+    drive, service = setup_two_sources(tmp_path)
+    service.sync()
+    before = {s["name"]: s["last_sync_at"] for s in service.list_sources()}
+    drive.put(ROOT_B, "fileB0000000000", "b.txt", b"hello from b")
+    import time
+
+    time.sleep(1.1)  # last_sync_at has one-second resolution
+    source_b = next(s["id"] for s in service.list_sources() if s["name"] == "Phòng B")
+    report = service.sync("requested", source_b)
+    assert report["trigger"] == "requested" and len(report["sources"]) == 1
+    after = {s["name"]: s["last_sync_at"] for s in service.list_sources()}
+    assert after["Phòng A"] == before["Phòng A"] and after["Phòng B"] != before["Phòng B"]
+    assert names(service, "from") == ["a.txt", "b.txt"]
+    assert service.status()["sync"]["trigger"] == "requested"
+
+
+def test_scheduled_cycle_is_retried_not_skipped_and_keeps_its_deadline(
+    tmp_path: Path, monkeypatch
+) -> None:
+    import time
+
+    import gdrive_rag.server as server_module
+    from gdrive_rag.server import SyncLoop
+
+    drive, service = setup_two_sources(tmp_path)
+    monkeypatch.setattr(server_module, "BUSY_RETRY_SECONDS", 0.05)
+    triggers: list[str] = []
+    real_sync = service.sync
+
+    def recording(trigger: str = "manual", source_id: int | None = None):
+        report = real_sync(trigger, source_id)  # SyncBusy propagates and is not recorded
+        triggers.append(trigger)
+        return report
+
+    monkeypatch.setattr(service, "sync", recording)
+    loop = SyncLoop(service, run_at_start=True)
+    monkeypatch.setattr(loop, "_next_due", lambda: time.monotonic() + 0.6)
+    lock = service._sync_lock()
+    lock.__enter__()  # another process (a CLI sync) holds the lock at start
+    loop.start()
+    try:
+        time.sleep(0.3)
+        assert service.db.get_meta("last_sync_trigger") is None  # nothing could run yet
+        lock.__exit__(None, None, None)
+        deadline = time.time() + 5
+        while triggers != ["scheduled"]:  # the busy cycle was retried, not skipped
+            assert time.time() < deadline, triggers
+            time.sleep(0.02)
+        first_done = time.monotonic()
+        assert service.request_sync()["started"] is True  # an on-demand run in between ...
+        while len(triggers) < 3:  # ... and the next scheduled cycle still comes on time
+            assert time.time() < deadline, triggers
+            time.sleep(0.02)
+        assert triggers[:3] == ["scheduled", "requested", "scheduled"]
+        assert time.monotonic() - first_done < 1.5
+    finally:
+        loop.close()
+        loop.thread.join(timeout=5)
+    assert not loop.thread.is_alive()
