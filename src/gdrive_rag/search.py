@@ -23,7 +23,7 @@ and the vector candidates before fusion, so a narrow scope still fills ``limit``
 
 Per-source path rules (``rules.py``) apply only when a source has some: ``exclude`` is one more
 scope condition (files named in ``files`` are never excluded) and ``demote`` multiplies the
-fused score by ``rules.DEMOTE_FACTOR``. With no rules the code path is the same as before.
+position by ``rules.DEMOTE_PLACES`` places. With no rules the code path is the same as before.
 A scope on a source still on its first sync gets a warning with its progress instead of a
 silent empty result.
 """
@@ -41,7 +41,7 @@ from .db import TERM, Database, fts_fold
 from .drive import parse_drive_link
 from .embeddings import EmbeddingClient
 from .ranking import contains_phrase, idf, lexical_score, title_score, tokens
-from .rules import DEMOTE_FACTOR, effects
+from .rules import demote, effects
 
 CANDIDATES = 200  # FTS candidates re-scored per query
 RRF_K = 60
@@ -113,13 +113,14 @@ class SearchEngine:
         scores = fuse(lexical, semantic, titles, phrases)
         fused = dict(scores)
         applied: dict[int, str] = {}
+        ordered = sorted(scores, key=lambda chunk_id: scores[chunk_id], reverse=True)
         if rules:
-            for chunk_id, document_id in self._documents_of(list(scores)).items():
+            for chunk_id, document_id in self._documents_of(ordered).items():
                 effect = rules.get(document_id)
                 if effect is not None and effect[0] == "demote":
-                    scores[chunk_id] *= DEMOTE_FACTOR
                     applied[chunk_id] = f"demote: {effect[1]}"
-        ordered = sorted(scores, key=lambda chunk_id: scores[chunk_id], reverse=True)
+            if applied:
+                ordered = demote(ordered, set(applied), scores)
         results = self._rows(ordered, scores, limit)
         if explain:
             fts = {c: (rank, score, bm25) for rank, (c, score, bm25) in enumerate(lexical, 1)}
@@ -244,7 +245,12 @@ class SearchEngine:
                 if not connection.execute(
                     "SELECT 1 FROM folders WHERE folder_id=?", (folder_id,)
                 ).fetchone():
-                    pending = [first_sync_note(r) for r in connection.execute(_PENDING_SOURCES)]
+                    pending = [  # a source stuck in error must not hide typos forever
+                        first_sync_note(r)
+                        for r in connection.execute(
+                            f"{_PENDING_SOURCES} AND s.last_status!='error'"
+                        )
+                    ]
                     if pending:
                         raise NotIndexedYet(
                             f"folder {folder} is not indexed yet: " + "; ".join(pending)

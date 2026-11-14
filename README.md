@@ -194,7 +194,7 @@ sudo docker compose exec gdrive-rag gdrive-rag search "báo cáo thuế" --folde
 
 Đôi khi một thư mục chứa bản cũ hay bản gốc đính kèm (ví dụ thư mục `attachments`) và các bản này cứ đứng trên bài viết chính trong kết quả tìm. Bạn có thể đặt quy tắc theo đường dẫn cho từng nguồn:
 
-- `demote` (hạ thấp): tệp khớp vẫn được tìm nhưng xếp thấp hơn.
+- `demote` (hạ thấp): tệp khớp vẫn được tìm nhưng tụt xuống 10 bậc trong danh sách kết quả, nên bài viết chính lên trước.
 - `exclude` (ẩn): tệp khớp không hiện trong kết quả tìm. Tệp vẫn nằm trong chỉ mục; Claude vẫn đọc được tệp đó khi bạn đưa link, hoặc khi bạn bảo chỉ tìm trong đúng tệp đó.
 
 Quy tắc là mẫu đường dẫn, so với cột `path` trong kết quả tìm, không phân biệt chữ hoa và dấu tiếng Việt:
@@ -203,6 +203,7 @@ Quy tắc là mẫu đường dẫn, so với cột `path` trong kết quả tì
 - `attachments/**` khớp mọi tệp trong mọi thư mục tên `attachments`, ở tầng nào cũng được.
 - `*.bak` khớp mọi tệp có đuôi `.bak`.
 - Mẫu bắt đầu bằng `/` chỉ khớp từ thư mục gốc của nguồn.
+- Mỗi nguồn có tối đa 20 mẫu hạ thấp và 20 mẫu ẩn, mỗi mẫu tối đa 100 ký tự.
 
 Các bước:
 

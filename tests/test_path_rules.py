@@ -78,8 +78,8 @@ def test_invalid_patterns_are_refused_without_echo() -> None:
         (["**"], "match-everything"),
         (["   "], "match-everything"),
         (["a\x00b"], "control character"),
-        (["x" * 201], "longer than"),
-        ([f"p{i}" for i in range(51)], "at most 50"),
+        (["x" * 101], "longer than"),
+        ([f"p{i}" for i in range(21)], "at most 20"),
     ):
         with pytest.raises(ValueError, match=message) as raised:
             clean(bad, "demote")
@@ -87,23 +87,76 @@ def test_invalid_patterns_are_refused_without_echo() -> None:
     assert clean([" a/** ", "a/**", "b"], "exclude") == ["a/**", "b"]
 
 
-def test_demote_moves_the_attachment_below_the_canonical_file(tmp_path: Path) -> None:
-    _, service = ledger(tmp_path)
-    query = "sổ cái doanh thu"
-    before = names(service.search(query, limit=3))
-    assert before[:2] == ["so-cai-doanh-thu.txt", "household-revenue-ledger-and-reconciliation.md"]
-    source_id = service.list_sources()[0]["id"]
-    service.set_path_rules(source_id, {"demote": ["attachments/**"], "exclude": []})
-    after = service.search(query, limit=3, explain=True)
-    assert names(after)[:2] == before[1::-1]
-    demoted = next(h for h in after["results"] if h["file_name"] == "so-cai-doanh-thu.txt")
-    assert demoted["explain"]["path_rule"] == "demote: attachments/**"
-    assert demoted["score"] == pytest.approx(
-        demoted["explain"]["fused_before_rules"] * 0.5, abs=1e-6
+def real_shape(tmp_path: Path, embeddings: FakeEmbeddings | None) -> Service:
+    """The reported case: six old originals under attachments/ whose names and text match the
+    Vietnamese query rank 1-6; the canonical article (English name, no whole-query phrase)
+    ranks below them and below two notes."""
+    drive = FakeDrive()
+    drive.add_root(SOURCE, "Kế toán")
+    drive.add_folder("folderAttach0001", "attachments", SOURCE)
+    for i in range(6):
+        drive.put(
+            SOURCE,
+            f"fileAttach{i:06d}",
+            f"so-cai-doanh-thu-ho-kinh-doanh-{i}.txt",
+            f"Sổ cái doanh thu hộ kinh doanh, bản gốc số {i}. Mẫu sổ cái doanh thu.".encode(),
+            parent="folderAttach0001",
+        )
+    drive.put(
+        SOURCE,
+        CANONICAL,
+        "household-revenue-ledger-and-reconciliation.md",
+        "Hướng dẫn ghi chép doanh thu của hộ kinh doanh vào sổ, đối soát cuối tháng "
+        "và lập sổ cái.".encode(),
     )
-    canonical = after["results"][0]["explain"]
-    assert canonical["path_rule"] is None
-    assert canonical["fused"] == canonical["fused_before_rules"]
+    for i in range(2):
+        drive.put(
+            SOURCE,
+            f"fileNote{i:08d}",
+            f"ghi-chu-{i}.txt",
+            f"Sổ cái: ghi chú doanh thu tháng {i}, hộ kinh doanh.".encode(),
+        )
+    service = make_service(tmp_path, drive, embeddings)
+    service.add_sources([SOURCE])
+    service.sync()
+    return service
+
+
+@pytest.mark.parametrize("hybrid", [False, True])
+def test_demote_lifts_the_canonical_file_above_every_attachment(
+    tmp_path: Path, hybrid: bool
+) -> None:
+    service = real_shape(tmp_path, FakeEmbeddings() if hybrid else None)
+    query = "sổ cái doanh thu hộ kinh doanh"
+    canonical = "household-revenue-ledger-and-reconciliation.md"
+    before = names(service.search(query, limit=10))
+    assert all(n.startswith("so-cai") for n in before[:6]) and before.index(canonical) >= 6
+    service.set_path_rules(1, {"demote": ["attachments/**"], "exclude": []})
+    result = service.search(query, limit=10, explain=True)
+    after = names(result)
+    assert after.index(canonical) <= 2  # only the two notes may stay above it
+    assert after.index(canonical) < min(i for i, n in enumerate(after) if n.startswith("so-cai"))
+    assert sum(n.startswith("so-cai") for n in after) >= 2  # still found, only lower
+    scores = [hit["score"] for hit in result["results"]]
+    assert scores == sorted(scores, reverse=True)  # scores stay in order
+    demoted = next(h for h in result["results"] if h["file_name"].startswith("so-cai"))
+    assert demoted["explain"]["path_rule"] == "demote: attachments/**"
+    assert demoted["score"] < demoted["explain"]["fused_before_rules"]
+    top = result["results"][after.index(canonical)]["explain"]
+    assert top["path_rule"] is None and top["fused"] == top["fused_before_rules"]
+
+
+def test_demote_shift_keeps_scores_ordered() -> None:
+    from gdrive_rag.rules import DEMOTE_PLACES, demote
+
+    order = list(range(20))
+    scores = {i: 1.0 - i / 100 for i in order}
+    assert demote(order, {0}, dict(scores)).index(0) == DEMOTE_PLACES
+    result = demote(order, {0, 1}, scores)
+    assert result[: DEMOTE_PLACES - 1] == list(range(2, DEMOTE_PLACES + 1))
+    assert result.index(0) < result.index(1)
+    assert [scores[i] for i in result] == sorted((scores[i] for i in result), reverse=True)
+    assert demote([5], {5}, {5: 1.0}) == [5]  # nothing to move below
 
 
 def test_exclude_hides_from_search_but_keeps_the_file(tmp_path: Path) -> None:
@@ -220,3 +273,29 @@ def test_mcp_status_and_sources_carry_the_new_fields(env: Env) -> None:
     ]
     source = env.tool("list_sources")["sources"][0]
     assert source["skipped"] == 1 and source["first_sync_done"] is True
+
+
+def test_largest_rules_still_fit_the_wire(env: Env) -> None:
+    from gdrive_rag.rules import MAX_PATTERN_CHARS, MAX_PATTERNS
+    from gdrive_rag.server import MAX_WIRE_CHARS, wire_size
+
+    def biggest(tag: str) -> list[str]:  # quotes and backslashes double when escaped twice
+        return [
+            f"{tag}{i:02d}" + '\\"' * ((MAX_PATTERN_CHARS - 6) // 2) for i in range(MAX_PATTERNS)
+        ]
+
+    for n in range(12):
+        root = f"rootWire{n:09d}"
+        env.drive.add_root(root, f"Nguồn {n}")
+        env.service.add_sources([root])
+    env.service.sync()
+    for source in env.service.list_sources():
+        env.service.set_path_rules(source["id"], {"demote": biggest("d"), "exclude": biggest("e")})
+    assert wire_size({"sources": env.service.list_sources()}) > MAX_WIRE_CHARS  # untrimmed
+    listed = env.tool("list_sources")
+    status = env.tool("sync_status", include_skipped=True)
+    preview = env.tool("set_path_rules", source=ROOT, demote=biggest("x"), exclude=biggest("y"))
+    for value in (listed, status, preview):
+        assert isinstance(value, dict) and wire_size(value) <= MAX_WIRE_CHARS
+    assert any(s["path_rules_truncated"] for s in listed["sources"])
+    assert len(listed["sources"]) == len(env.service.list_sources())  # sources are never dropped

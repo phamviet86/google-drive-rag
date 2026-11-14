@@ -1,6 +1,7 @@
-"""Per-source path rules for search: ``demote`` lowers a file's score, ``exclude`` leaves it out
-of search results. Rules are applied at query time only; the file stays indexed and readable by
-its ID, and changing rules never re-extracts or re-embeds anything.
+"""Per-source path rules for search: ``demote`` moves a file's hits ``DEMOTE_PLACES`` places
+down the ranked list (its score is lowered to just below the hit now above it), ``exclude``
+leaves it out of search results. Rules are applied at query time only; the file stays indexed
+and readable by its ID, and changing rules never re-extracts or re-embeds anything.
 
 A pattern is a glob over the file's ``path`` as search results show it (inside the source
 folder), compared without case or Vietnamese accents:
@@ -18,6 +19,7 @@ gets the rules of all of them; ``exclude`` wins over ``demote``. Files named in 
 
 from __future__ import annotations
 
+import math
 import re
 import unicodedata
 from collections.abc import Iterable
@@ -26,9 +28,9 @@ from typing import Any
 from .db import fts_fold
 
 EFFECTS = ("demote", "exclude")
-DEMOTE_FACTOR = 0.5  # fused score multiplier for a demoted file
-MAX_PATTERNS = 50  # per effect and source
-MAX_PATTERN_CHARS = 200
+DEMOTE_PLACES = 10  # a demoted hit moves this many places down the fused order
+MAX_PATTERNS = 20  # per effect and source (keeps list_sources under the wire cap)
+MAX_PATTERN_CHARS = 100
 
 
 def fold(text: str) -> str:
@@ -86,6 +88,21 @@ def compile_pattern(pattern: str) -> re.Pattern[str]:
             i += 1
     prefix = "" if anchored else "(?:.*/)?"
     return re.compile(prefix + "".join(out), re.DOTALL)
+
+
+def demote(order: list[int], demoted: set[int], scores: dict[int, float]) -> list[int]:
+    """Move each demoted id ``DEMOTE_PLACES`` places down ``order`` (best first) and lower its
+    score in ``scores`` to just below the id now above it, so scores stay in order. A fixed
+    shift, not a multiplier: an old copy whose name matches the query keeps far more signals
+    than the canonical file, and any factor that fixes one query is arbitrary for the next."""
+    shifted = sorted(
+        range(len(order)), key=lambda i: i + (DEMOTE_PLACES + 0.5 if order[i] in demoted else 0)
+    )
+    result = [order[i] for i in shifted]
+    for above, chunk_id in zip(result, result[1:], strict=False):
+        if chunk_id in demoted and scores[chunk_id] >= scores[above]:
+            scores[chunk_id] = math.nextafter(scores[above], 0.0)
+    return result
 
 
 def matches(pattern: str, path: str) -> bool:

@@ -284,7 +284,7 @@ class Service:
                 hit = effects([(source_id, effect, pattern)], documents)
                 per_pattern[pattern] = {
                     "documents": len(hit),
-                    "examples": [paths[d] for d in list(hit)[:5]],
+                    "examples": [paths[d] for d in list(hit)[:3]],
                 }
             output[effect] = per_pattern
         combined = effects(

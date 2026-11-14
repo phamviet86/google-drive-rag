@@ -94,6 +94,8 @@ def test_failed_first_sync_still_warns_and_unknown_folders_still_error(tmp_path:
         "source 'Kế toán' has not finished its first sync "
         "(the last attempt failed; see sync_status)"
     ]
+    with pytest.raises(ValueError, match="unknown or not indexed folder"):
+        service.search("doanh thu", folder="folderUnknown0001")  # failed source: a plain error
     del drive.root_errors[ROOT]
     service.sync()
     with pytest.raises(ValueError, match="unknown or not indexed folder"):

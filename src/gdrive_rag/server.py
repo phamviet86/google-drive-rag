@@ -108,6 +108,9 @@ class SourceInfo(BaseModel):
         default_factory=dict,
         description="Search path patterns: demote lowers the score, exclude hides from search.",
     )
+    path_rules_truncated: bool = Field(
+        default=False, description="Some patterns were left out to fit the response."
+    )
 
 
 class SourcesOutput(BaseModel):
@@ -209,6 +212,33 @@ def _cap_list(value: dict[str, Any], key: str) -> dict[str, Any]:
     return value
 
 
+def _fit_rules(value: dict[str, Any], sources: list[dict[str, Any]]) -> dict[str, Any]:
+    """Drop path-rule patterns (longest rule lists first) until ``wire_size`` fits; a source
+    that lost some gets ``path_rules_truncated`` (``source rules`` on the CLI shows them all)."""
+    while wire_size(value) > MAX_WIRE_CHARS:
+        candidates = [s for s in sources if any(s.get("path_rules", {}).values())]
+        if not candidates:
+            break
+        widest = max(candidates, key=lambda s: len(_dump(s["path_rules"])))
+        rules = widest["path_rules"]
+        longest = max(rules, key=lambda effect: len(rules[effect]))
+        rules[longest] = rules[longest][:-1]
+        widest["path_rules_truncated"] = True
+    return value
+
+
+def _fit_rule_preview(value: dict[str, Any]) -> dict[str, Any]:
+    """A set_path_rules result: drop example paths, then the old rules, to fit the wire."""
+    if wire_size(value) > MAX_WIRE_CHARS:
+        for effect in ("demote", "exclude"):
+            for entry in value.get("matches", {}).get(effect, {}).values():
+                entry["examples"] = []
+        value["truncated"] = True
+    if wire_size(value) > MAX_WIRE_CHARS:
+        value.pop("current", None)
+    return value
+
+
 ADMIN_INSTRUCTIONS = (
     " Admin tools are enabled (sources, search path rules, Google access, embedding endpoint). "
     "Call them only when "
@@ -291,7 +321,8 @@ def create_server(service: Service, admin: Admin | None = None) -> Any:
     @server.tool(title="List Drive sources", annotations=local)
     def list_sources() -> Annotated[CallToolResult, SourcesOutput]:
         """List the Google Drive folders/files that are indexed, with their sync state."""
-        return ok({"sources": service.list_sources()})
+        value = {"sources": service.list_sources()}
+        return ok(_fit_rules(value, value["sources"]))
 
     @server.tool(title="List Drive folders", annotations=local)
     def list_folders(
@@ -359,7 +390,7 @@ def create_server(service: Service, admin: Admin | None = None) -> Any:
             status["recent_failures"] = status["recent_failures"][:-1]
         while wire_size(status) > MAX_WIRE_CHARS and status.get("skipped_files"):
             status["skipped_files"] = status["skipped_files"][:-1]
-        return ok(status)
+        return ok(_fit_rules(status, status["sources"]))
 
     if admin is not None:
         register_admin_tools(server, admin, ok, fail)
@@ -482,11 +513,13 @@ def register_admin_tools(
         confirm: Annotated[Any, loose("boolean", CONFIRM_TEXT)] = False,
     ) -> Annotated[CallToolResult, AdminOutput]:
         return run(
-            lambda: admin.set_path_rules(
-                _text(source, "source"),
-                _patterns(demote, "demote"),
-                _patterns(exclude, "exclude"),
-                _flag(confirm),
+            lambda: _fit_rule_preview(
+                admin.set_path_rules(
+                    _text(source, "source"),
+                    _patterns(demote, "demote"),
+                    _patterns(exclude, "exclude"),
+                    _flag(confirm),
+                )
             )
         )
 
