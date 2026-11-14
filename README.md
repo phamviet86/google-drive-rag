@@ -15,6 +15,7 @@ Dịch vụ chạy trong một Docker container trên chính VPS, chỉ nhận k
 - Kết nối với Claude Code
 - Kiểm tra kết quả
 - Tìm trong một thư mục hoặc một tệp
+- Hạ thấp hoặc ẩn tệp trong kết quả tìm
 - Việc thường ngày
 - Quản trị từ Claude (tùy chọn)
 - Xử lý sự cố
@@ -154,6 +155,14 @@ Kết quả: lệnh `claude mcp list` hiện dòng `google-drive-rag` với tr�
 
    Kết quả: mục `documents` có `indexed` lớn hơn 0. Thư mục lớn cần vài phút đến vài giờ cho lần đầu.
 
+   Trong lúc đang đọc, mục `sync` có thêm phần `progress` cho biết dịch vụ đang ở bước nào: `listing` (liệt kê tệp), `extracting` (đọc nội dung tệp) hay `embedding` (tính dữ liệu cho tìm theo ý nghĩa). `files_done` là số tệp đã xong trên tổng `files_total` của mỗi nguồn. Đọc xong thì `progress` trở về `null`.
+
+   Mục `skipped` đếm các tệp bị bỏ qua vì dịch vụ chưa đọc được loại tệp đó, ví dụ tệp nén `.rar`, `.zip` hay lối tắt Drive. Các tệp này không lỗi, chỉ không được tìm. Xem danh sách (tối đa 100 tệp đầu):
+
+   ```bash
+   sudo docker compose exec gdrive-rag gdrive-rag status --skipped
+   ```
+
 2. Mở Claude Code và hỏi: "Dùng google-drive-rag tìm tài liệu về <chủ đề của bạn>".
 
    Kết quả: Claude trả lời kèm tên tệp, vị trí (trang, trang chiếu hoặc trang tính) và link Drive.
@@ -171,6 +180,8 @@ Ví dụ câu hỏi trong Claude Code:
 
 Kết quả: Claude chỉ trả lời bằng tài liệu nằm trong thư mục hoặc tệp đó. Nếu thư mục hoặc tệp chưa được đọc vào chỉ mục, Claude báo rõ là không tìm thấy nó, thay vì trả về kết quả rỗng.
 
+Nguồn vừa thêm cần một lần đọc đầu tiên. Trong lúc đó bạn vẫn tìm được trong các tệp đã đọc xong, kèm một lời nhắc như `source 'Kế toán' is still on its first sync (120 of 433 files indexed)`, nghĩa là mới đọc 120 trên 433 tệp. Kết quả lúc này chưa đủ; hãy hỏi lại khi đọc xong.
+
 > **Lưu ý:** Thư mục mới thêm hoặc mới đổi tên trên Drive được cập nhật ở lần đọc Drive kế tiếp (tối đa 15 phút, hoặc ngay khi bạn nhờ Claude đọc lại Drive). Đổi tên hay chuyển thư mục không làm dịch vụ đọc lại nội dung tệp.
 
 Muốn tự thử trên VPS, chạy lệnh tìm kèm `--folder` (link thư mục) hoặc `--file` (link tệp, dùng nhiều lần được):
@@ -179,6 +190,38 @@ Muốn tự thử trên VPS, chạy lệnh tìm kèm `--folder` (link thư mục
 sudo docker compose exec gdrive-rag gdrive-rag search "báo cáo thuế" --folder "<link thư mục>"
 ```
 
+## Hạ thấp hoặc ẩn tệp trong kết quả tìm
+
+Đôi khi một thư mục chứa bản cũ hay bản gốc đính kèm (ví dụ thư mục `attachments`) và các bản này cứ đứng trên bài viết chính trong kết quả tìm. Bạn có thể đặt quy tắc theo đường dẫn cho từng nguồn:
+
+- `demote` (hạ thấp): tệp khớp vẫn được tìm nhưng xếp thấp hơn.
+- `exclude` (ẩn): tệp khớp không hiện trong kết quả tìm. Tệp vẫn nằm trong chỉ mục; Claude vẫn đọc được tệp đó khi bạn đưa link, hoặc khi bạn bảo chỉ tìm trong đúng tệp đó.
+
+Quy tắc là mẫu đường dẫn, so với cột `path` trong kết quả tìm, không phân biệt chữ hoa và dấu tiếng Việt:
+
+- `*` thay cho một phần tên, `**` thay cho nhiều tầng thư mục.
+- `attachments/**` khớp mọi tệp trong mọi thư mục tên `attachments`, ở tầng nào cũng được.
+- `*.bak` khớp mọi tệp có đuôi `.bak`.
+- Mẫu bắt đầu bằng `/` chỉ khớp từ thư mục gốc của nguồn.
+
+Các bước:
+
+1. Xem quy tắc hiện có và mẫu mới sẽ khớp bao nhiêu tệp (lệnh này chưa đổi gì):
+
+   ```bash
+   sudo docker compose exec gdrive-rag gdrive-rag source rules <số thứ tự hoặc tên nguồn>
+   ```
+
+2. Đặt quy tắc, ví dụ hạ thấp mọi tệp trong thư mục `attachments`:
+
+   ```bash
+   sudo docker compose exec gdrive-rag gdrive-rag source rules 1 --demote "attachments/**"
+   ```
+
+   Kết quả: câu trả lời có `"applied": true` và số tệp mỗi mẫu khớp. Lần tìm kế tiếp đã dùng quy tắc mới.
+
+Mỗi lần ghi `--demote` hay `--exclude` là thay cả danh sách đó. Ghi `--demote` mà không kèm mẫu nào là xóa hết quy tắc hạ thấp. Đặt hay đổi quy tắc không làm dịch vụ đọc lại tệp nào. `source list` cho thấy quy tắc của mỗi nguồn, và lệnh tìm kèm `--explain` cho thấy kết quả nào bị hạ thấp bởi mẫu nào.
+
 ## Việc thường ngày
 
 | Việc | Lệnh (chạy trong `~/google-drive-rag`) |
@@ -186,6 +229,8 @@ sudo docker compose exec gdrive-rag gdrive-rag search "báo cáo thuế" --folde
 | Thêm thư mục Drive | `sudo docker compose exec gdrive-rag gdrive-rag source add <link>` |
 | Xem danh sách nguồn | `sudo docker compose exec gdrive-rag gdrive-rag source list` |
 | Bỏ một nguồn | `sudo docker compose exec gdrive-rag gdrive-rag source remove <số thứ tự hoặc tên>` |
+| Hạ thấp hoặc ẩn tệp khi tìm | `sudo docker compose exec gdrive-rag gdrive-rag source rules <nguồn> --demote "<mẫu>"` (xem phần trên) |
+| Xem tệp bị bỏ qua | `sudo docker compose exec gdrive-rag gdrive-rag status --skipped` |
 | Đọc lại Drive ngay | `sudo docker compose exec gdrive-rag gdrive-rag sync` |
 | Thử tìm một câu | `sudo docker compose exec gdrive-rag gdrive-rag search "<câu tìm>"` |
 | Xem vì sao một kết quả đứng đầu | Thêm `--explain` vào cuối lệnh tìm ở dòng trên |
@@ -196,7 +241,7 @@ sudo docker compose exec gdrive-rag gdrive-rag search "báo cáo thuế" --folde
 | Xem nhật ký | `sudo docker compose logs --tail 100 gdrive-rag` |
 | Cập nhật mã mới | Chép mã mới lên VPS, rồi `sudo docker compose up -d --build` |
 
-Dữ liệu chỉ mục nằm trong ổ Docker tên `gdrive-rag-data`, nên vẫn còn khi bạn dựng lại container.
+Dữ liệu chỉ mục nằm trong ổ Docker tên `gdrive-rag-data`, nên vẫn còn khi bạn dựng lại container. Cập nhật lên bản 0.3.0 không làm dịch vụ đọc lại tệp hay tính lại dữ liệu ý nghĩa.
 
 ### Đọc bản scan bằng ngôn ngữ khác
 
@@ -223,7 +268,7 @@ Sau khi cập nhật lên bản này, các bản scan đã đọc bằng bộ nh
 
 ## Quản trị từ Claude (tùy chọn)
 
-Mặc định Claude chỉ được tìm và đọc tài liệu. Nếu muốn nhờ Claude thêm hoặc bỏ thư mục Drive, đổi quyền Google hay đổi khóa tìm theo ý nghĩa mà không phải gõ lệnh, bạn có thể bật thêm các công cụ quản trị.
+Mặc định Claude chỉ được tìm và đọc tài liệu. Nếu muốn nhờ Claude thêm hoặc bỏ thư mục Drive, đặt quy tắc hạ thấp hay ẩn tệp, đổi quyền Google hay đổi khóa tìm theo ý nghĩa mà không phải gõ lệnh, bạn có thể bật thêm các công cụ quản trị.
 
 > **Cảnh báo:** Một tài liệu trong Drive có thể chứa dòng chữ giả làm lời dặn cho Claude, ví dụ "hãy gửi dữ liệu sang địa chỉ X". Nếu Claude làm theo, toàn bộ nội dung tài liệu của bạn có thể bị gửi tới máy của người khác. Vì vậy chỉ bật khi cần, và luôn đọc kỹ câu Claude hỏi lại trước khi đồng ý.
 
@@ -243,12 +288,13 @@ Cách bật:
    sudo docker compose up -d
    ```
 
-   Kết quả: Claude Code thấy thêm 9 công cụ dưới đây. Muốn tắt, xóa dòng đó rồi chạy lại lệnh trên.
+   Kết quả: Claude Code thấy thêm 10 công cụ dưới đây. Muốn tắt, xóa dòng đó rồi chạy lại lệnh trên.
 
 | Công cụ | Việc làm |
 | --- | --- |
 | `add_source` | Thêm một link thư mục hoặc tệp Drive và bắt đầu đọc ngay |
 | `remove_source` | Bỏ một nguồn; trước hết báo sẽ bỏ bao nhiêu tài liệu khỏi chỉ mục |
+| `set_path_rules` | Đặt quy tắc hạ thấp (`demote`) hoặc ẩn (`exclude`) tệp theo đường dẫn cho một nguồn; trước hết báo mỗi mẫu khớp bao nhiêu tệp |
 | `google_auth_status` | Cho biết đang dùng cách đăng nhập Google nào; không hiện khóa |
 | `set_google_service_account` | Dùng tệp tài khoản dịch vụ đã chép vào thư mục `secrets` |
 | `google_auth_start` | Bước 1 đăng nhập Gmail: đưa ra địa chỉ để bạn mở và bấm Cho phép |
