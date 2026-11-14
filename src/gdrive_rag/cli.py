@@ -93,7 +93,7 @@ def cmd_sync(args: argparse.Namespace) -> int:
 
 def cmd_search(args: argparse.Namespace) -> int:
     result = _service(args).search(
-        args.query, args.source, args.limit, args.folder, args.file or None
+        args.query, args.source, args.limit, args.folder, args.file or None, args.explain
     )
     _print(result, args.json)
     return 0
@@ -243,6 +243,11 @@ def build_parser() -> argparse.ArgumentParser:
         "--file", action="append", help="Drive file link or ID (repeat for several files)"
     )
     search.add_argument("--limit", type=int, default=8)
+    search.add_argument(
+        "--explain",
+        action="store_true",
+        help="show each hit's full-text and vector rank/score and the fused score",
+    )
     search.set_defaults(func=cmd_search)
 
     source = commands.add_parser("source", help="manage Drive sources").add_subparsers(

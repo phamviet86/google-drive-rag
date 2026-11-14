@@ -186,6 +186,7 @@ sudo docker compose exec gdrive-rag gdrive-rag search "báo cáo thuế" --folde
 | Bỏ một nguồn | `sudo docker compose exec gdrive-rag gdrive-rag source remove <số thứ tự hoặc tên>` |
 | Đọc lại Drive ngay | `sudo docker compose exec gdrive-rag gdrive-rag sync` |
 | Thử tìm một câu | `sudo docker compose exec gdrive-rag gdrive-rag search "<câu tìm>"` |
+| Xem vì sao một kết quả đứng đầu | Thêm `--explain` vào cuối lệnh tìm ở dòng trên |
 | Đăng nhập Gmail lại | `sudo docker compose exec gdrive-rag gdrive-rag auth google` |
 | Thêm hoặc đổi khóa OpenRouter | Chạy lại `setup`; tài liệu cũ được tính lại ý nghĩa ở lần đọc kế tiếp |
 | Xem nhật ký | `sudo docker compose logs --tail 100 gdrive-rag` |

@@ -591,9 +591,10 @@ class Service:
         limit: int = 8,
         folder: str | None = None,
         files: list[str] | None = None,
+        explain: bool = False,
     ) -> dict[str, Any]:
         self.reload()
-        return self.search_engine.search(query, source, limit, folder, files)
+        return self.search_engine.search(query, source, limit, folder, files, explain)
 
     def list_folders(
         self,

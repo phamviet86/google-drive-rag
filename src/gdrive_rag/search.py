@@ -1,6 +1,11 @@
-"""Hybrid retrieval: FTS5 (accent-folded) + numpy cosine over stored vectors, fused with RRF.
+"""Hybrid retrieval: FTS5 (accent-folded) + numpy cosine over stored vectors.
 
-Fusion and the vector-matrix cache follow local-rag-mcp ``search.py`` (Apache-2.0). Vectors are
+FTS finds candidates; they are re-scored by rarity-weighted coverage of the query terms plus
+adjacency (``ranking.py``). Fusion is score-aware: ``LEXICAL_WEIGHT`` x lexical score (0..1) plus
+the rest x cosine scaled within the vector list. Rank-only RRF let chunks that were mediocre in
+both lists beat one strong lexical match (see ``tests/test_ranking_eval.py``).
+
+The vector-matrix cache follows local-rag-mcp ``search.py`` (Apache-2.0). Vectors are
 used only when the stored embedding identity matches the configured client, so vectors from two
 models are never mixed; otherwise search is FTS only.
 
@@ -19,8 +24,10 @@ import numpy as np
 from .db import TERM, Database, fts_fold
 from .drive import parse_drive_link
 from .embeddings import EmbeddingClient
+from .ranking import idf, lexical_score, tokens
 
-RRF_K = 60
+CANDIDATES = 200  # FTS candidates re-scored per query
+LEXICAL_WEIGHT = 0.7  # chosen with tests/test_ranking_eval.py; the vectors keep 0.3
 SNIPPET_CHARS = 800
 PER_DOCUMENT = 3  # soft: lifted when fewer than ``limit`` hits would remain
 MAX_FILES = 50
@@ -42,6 +49,7 @@ class SearchEngine:
         limit: int = 8,
         folder: str | None = None,
         files: list[str] | None = None,
+        explain: bool = False,
     ) -> dict[str, Any]:
         if not 1 <= limit <= 50:
             raise ValueError("limit must be between 1 and 50")
@@ -64,13 +72,26 @@ class SearchEngine:
                     mode = "hybrid"
                 except Exception as exc:  # network/key problems must not break search
                     warnings.append(f"semantic search unavailable ({exc}); FTS only")
-        scores: dict[int, float] = {}
-        for rank, chunk_id in enumerate(lexical, 1):
-            scores[chunk_id] = scores.get(chunk_id, 0.0) + 1.0 / (RRF_K + rank)
-        for rank, (chunk_id, _) in enumerate(semantic, 1):
-            scores[chunk_id] = scores.get(chunk_id, 0.0) + 1.0 / (RRF_K + rank)
+        scores = fuse(lexical, semantic)
         ordered = sorted(scores, key=lambda chunk_id: scores[chunk_id], reverse=True)
         results = self._rows(ordered, scores, limit)
+        if explain:
+            fts = {c: (rank, score, bm25) for rank, (c, score, bm25) in enumerate(lexical, 1)}
+            vec = {c: (rank, score) for rank, (c, score) in enumerate(semantic, 1)}
+            for hit in results:
+                chunk_id = hit["chunk_id"]
+                lexical_hit = fts.get(chunk_id, (None, None, None))
+                vector_hit = vec.get(chunk_id, (None, None))
+                hit["explain"] = {
+                    "fts_rank": lexical_hit[0],
+                    "fts_score": _round(lexical_hit[1]),
+                    "bm25": _round(lexical_hit[2]),
+                    "vector_rank": vector_hit[0],
+                    "vector_score": _round(vector_hit[1]),
+                    "fused": hit["score"],
+                }
+        for hit in results:
+            del hit["chunk_id"]
         return {"mode": mode, "warnings": warnings, "results": results}
 
     def source_id(self, value: str) -> int:
@@ -125,13 +146,19 @@ class SearchEngine:
                 values.extend(ids)
         return " AND ".join(conditions), values
 
-    def _full_text(self, terms: list[str], scope: tuple[str, list[Any]], pool: int) -> list[int]:
+    def _full_text(
+        self, terms: list[str], scope: tuple[str, list[Any]], pool: int
+    ) -> list[tuple[int, float, float]]:
+        """``(chunk id, lexical score 0..1, bm25)``, best first. FTS (all terms, then any term)
+        finds up to ``CANDIDATES`` chunks; they are re-scored by rarity-weighted coverage of the
+        distinct query terms plus adjacency (``ranking.lexical_score``), bm25 breaking ties."""
         folded = [f'"{fts_fold(term)}"' for term in terms]
-        found: list[int] = []
+        found: dict[int, float] = {}
         with self.db.read() as connection:
             for joiner in (" AND ", " OR "):
                 sql = (
-                    "SELECT f.rowid FROM chunks_fts f JOIN chunks c ON c.id=f.rowid "
+                    "SELECT f.rowid, bm25(chunks_fts, 1.0, 0.5) FROM chunks_fts f "
+                    "JOIN chunks c ON c.id=f.rowid "
                     "WHERE chunks_fts MATCH ?"
                 )
                 values: list[Any] = [joiner.join(folded)]
@@ -139,13 +166,41 @@ class SearchEngine:
                     sql += f" AND {scope[0]}"
                     values.extend(scope[1])
                 sql += " ORDER BY bm25(chunks_fts, 1.0, 0.5) LIMIT ?"
-                values.append(pool)
+                values.append(CANDIDATES)
                 for row in connection.execute(sql, values):
-                    if int(row[0]) not in found:
-                        found.append(int(row[0]))
+                    found.setdefault(int(row[0]), float(row[1]))
                 if len(terms) == 1:
                     break
-        return found[:pool]
+            if not found:
+                return []
+            query = tokens(" ".join(terms))
+            total = int(connection.execute("SELECT count(*) FROM chunks").fetchone()[0])
+            weights = {
+                term: idf(
+                    int(
+                        connection.execute(
+                            "SELECT count(*) FROM chunks_fts WHERE chunks_fts MATCH ?",
+                            (f'"{term}"',),
+                        ).fetchone()[0]
+                    ),
+                    total,
+                )
+                for term in dict.fromkeys(query)
+            }
+            ids = list(found)
+            texts = {
+                int(row[0]): f"{row[1]}\n{row[2]}"
+                for start in range(0, len(ids), 500)
+                for row in connection.execute(
+                    "SELECT c.id, d.name, c.text FROM chunks c "
+                    "JOIN documents d ON d.id=c.document_id WHERE c.id IN "
+                    f"({','.join('?' for _ in ids[start : start + 500])})",
+                    ids[start : start + 500],
+                )
+            }
+        scored = [(c, lexical_score(query, weights, texts.get(c, "")), b) for c, b in found.items()]
+        scored.sort(key=lambda item: (-item[1], item[2]))
+        return scored[:pool]
 
     def _semantic(
         self, client: EmbeddingClient, query: str, scope: tuple[str, list[Any]], pool: int
@@ -236,6 +291,7 @@ class SearchEngine:
     def _hit(row: Any, score: float) -> dict[str, Any]:
         text = str(row["text"])
         return {
+            "chunk_id": int(row["id"]),
             "document_id": row["file_id"],
             "file_name": row["name"],
             "path": row["path"],
@@ -248,3 +304,22 @@ class SearchEngine:
             "score": round(score, 6),
             "snippet": text if len(text) <= SNIPPET_CHARS else text[:SNIPPET_CHARS].rstrip() + " …",
         }
+
+
+def _round(value: float | None) -> float | None:
+    return None if value is None else round(value, 4)
+
+
+def fuse(
+    lexical: list[tuple[int, float, float]], semantic: list[tuple[int, float]]
+) -> dict[int, float]:
+    """Relative score fusion of the lexical list ``(id, score 0..1, bm25)`` and the vector list
+    ``(id, cosine)``: the lexical score is used as is (it is comparable across queries), the
+    cosine as a share of the best cosine. Min-max scaling was tried and rejected: in a narrow
+    ``files``/``folder`` scope with a handful of chunks it turned small cosine gaps into 0 and 1."""
+    scores = {chunk_id: LEXICAL_WEIGHT * score for chunk_id, score, _ in lexical}
+    high = semantic[0][1] if semantic else 0.0
+    for chunk_id, cosine in semantic:
+        scaled = max(0.0, cosine) / high if high > 0 else 0.0
+        scores[chunk_id] = scores.get(chunk_id, 0.0) + (1 - LEXICAL_WEIGHT) * scaled
+    return scores
