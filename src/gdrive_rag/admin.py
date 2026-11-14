@@ -51,6 +51,7 @@ from .config import (
 )
 from .drive import parse_drive_link
 from .embeddings import OpenAICompatibleEmbeddings
+from .rules import clean
 from .search import EMBEDDING_IDENTITY_KEY
 from .service import Service, SyncBusy
 
@@ -179,6 +180,38 @@ class Admin:
                 "a sync is running; try again when sync_status shows running: false"
             ) from None
         return {"applied": True, "message": "Source removed.", **removed}
+
+    def set_path_rules(
+        self,
+        source: str,
+        demote: list[str] | None = None,
+        exclude: list[str] | None = None,
+        confirm: bool = False,
+    ) -> dict[str, Any]:
+        """Set a source's search path rules. An omitted list keeps the current patterns; an
+        empty list clears them. Without confirm it only previews how many documents each
+        pattern hits. Search-time only: nothing is re-extracted or re-embedded."""
+        preview = self.service.source_preview(source)
+        source_id = int(preview["id"])
+        current = self.service.path_rules(source_id)
+        wanted = {
+            "demote": current["demote"] if demote is None else clean(demote, "demote"),
+            "exclude": current["exclude"] if exclude is None else clean(exclude, "exclude"),
+        }
+        answer: dict[str, Any] = {
+            "source": {"id": source_id, "name": preview["name"]},
+            "current": current,
+            "rules": wanted,
+            "matches": self.service.rule_matches(source_id, wanted),
+        }
+        if not confirm:
+            answer["would"] = (
+                "Search would use these rules for this source: demote lowers a file's score, "
+                "exclude leaves it out of results (still readable by ID). Nothing is re-indexed."
+            )
+            return {"applied": False, "confirm_needed": True, **answer}
+        self.service.set_path_rules(source_id, wanted)
+        return {"applied": True, "message": "Path rules saved; search uses them now.", **answer}
 
     # -- Google access -------------------------------------------------------------------------
     def google_status(self) -> dict[str, Any]:

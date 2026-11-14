@@ -44,11 +44,13 @@ from .drive import (
     drive_link,
     folder_link,
     parse_drive_link,
+    split_supported,
     strip_data_images,
 )
 from .embeddings import EmbeddingClient, EmbeddingError
 from .extract import Extractor
 from .extraction_errors import ExtractionError
+from .rules import EFFECTS, clean, effects
 from .search import EMBEDDING_IDENTITY_KEY, REVISION_KEY, SearchEngine
 
 log = logging.getLogger("gdrive_rag")
@@ -61,6 +63,9 @@ EMBED_BATCH = 64
 REQUEST_INTERVAL_SECONDS = 60  # sync_now: at most one accepted request per minute
 READ_LIMIT_CHARS = 40_000
 LIST_PAGE = 100  # folders + documents per list_folders page
+SKIPPED_PAGE = 100  # skipped files listed by sync_status(include_skipped=true)
+PROGRESS_KEY = "sync_progress"
+PROGRESS_INTERVAL_SECONDS = 1.0  # at most one progress write per second (plus phase changes)
 _PENDING_SQL = (
     "NOT EXISTS (SELECT 1 FROM vectors v WHERE v.chunk_hash=c.chunk_hash) "
     "AND NOT EXISTS (SELECT 1 FROM embedding_failures f WHERE f.chunk_hash=c.chunk_hash)"
@@ -69,6 +74,45 @@ _PENDING_SQL = (
 
 class SyncBusy(RuntimeError):
     """Another process or thread is already syncing this data directory."""
+
+
+class Progress:
+    """Live state of the running sync, kept in ``meta`` so ``sync_status`` sees it from another
+    thread or process (a CLI sync). Written at phase changes and at most once per
+    ``PROGRESS_INTERVAL_SECONDS`` otherwise; removed when the sync ends."""
+
+    def __init__(self, db: Database, sources: list[dict[str, Any]]):
+        self.db = db
+        self.state: dict[str, Any] = {
+            "phase": "listing",
+            "started": _now(),
+            "sources": [
+                {"id": s["id"], "name": s["name"], "files_total": None, "files_done": 0}
+                for s in sources
+            ],
+            "embedding": None,
+        }
+        self._written = 0.0
+        self.write(force=True)
+
+    def source(self, source_id: int) -> dict[str, Any] | None:
+        return next((s for s in self.state["sources"] if s["id"] == source_id), None)
+
+    def phase(self, name: str) -> None:
+        self.state["phase"] = name
+        self.write(force=True)
+
+    def write(self, force: bool = False) -> None:
+        now = time.monotonic()
+        if not force and now - self._written < PROGRESS_INTERVAL_SECONDS:
+            return
+        self._written = now
+        self.state["updated"] = _now()
+        self.db.set_meta(PROGRESS_KEY, json.dumps(self.state, ensure_ascii=False))
+
+    def clear(self) -> None:
+        with self.db.transaction() as connection:
+            connection.execute("DELETE FROM meta WHERE key=?", (PROGRESS_KEY,))
 
 
 def default_backend(settings: Settings) -> DriveBackend:  # pragma: no cover - real Google API
@@ -160,7 +204,7 @@ class Service:
                 except DriveSourceError as exc:
                     error = str(exc)
             with self.db.transaction() as connection:
-                connection.execute(
+                cursor = connection.execute(
                     "INSERT INTO sources(link,root_id,kind,drive_id,name,last_status,last_error) "
                     "VALUES(?,?,?,?,?,?,?)",
                     (
@@ -173,6 +217,13 @@ class Service:
                         error,
                     ),
                 )
+                if root.kind in {"folder", "shared_drive"} and status != "error":
+                    # known at once, so search(folder=<root>) works during the first sync
+                    _register_folders(
+                        connection,
+                        int(cursor.lastrowid or 0),
+                        [DriveFolder(root.id, root.name, "")],
+                    )
             row = self._source_row(root_id)
             results.append({"link": link, "ok": status != "error", **(row or {})})
         return results
@@ -185,6 +236,7 @@ class Service:
                 "(SELECT 1 FROM document_sources WHERE source_id=?)",
                 (source_id, source_id),
             )
+            _refresh_ancestry(connection)  # drops the root folder registered by add_sources
 
     def remove_source(self, value: str) -> dict[str, Any]:
         row = self._find_source(value)
@@ -198,20 +250,71 @@ class Service:
 
     def list_sources(self) -> list[dict[str, Any]]:
         with self.db.read() as connection:
-            rows = connection.execute(
-                """SELECT s.*, (SELECT count(*) FROM document_sources d WHERE d.source_id=s.id)
-                          documents FROM sources s ORDER BY s.id"""
-            ).fetchall()
-        return [_source_json(row) for row in rows]
+            rows = connection.execute(f"{_SOURCE_SQL} ORDER BY s.id").fetchall()
+            rules = _rules_by_source(connection)
+        return [_source_json(row, rules.get(int(row["id"]))) for row in rows]
 
     def _source_row(self, root_id: str) -> dict[str, Any] | None:
         with self.db.read() as connection:
-            row = connection.execute(
-                """SELECT s.*, (SELECT count(*) FROM document_sources d WHERE d.source_id=s.id)
-                          documents FROM sources s WHERE root_id=?""",
-                (root_id,),
-            ).fetchone()
-        return None if row is None else _source_json(row)
+            row = connection.execute(f"{_SOURCE_SQL} WHERE root_id=?", (root_id,)).fetchone()
+            rules = _rules_by_source(connection)
+        return None if row is None else _source_json(row, rules.get(int(row["id"])))
+
+    # -- path rules ---------------------------------------------------------------------------
+    def path_rules(self, source_id: int) -> dict[str, list[str]]:
+        with self.db.read() as connection:
+            return _rules_by_source(connection).get(source_id) or {e: [] for e in EFFECTS}
+
+    def rule_matches(self, source_id: int, rules: dict[str, list[str]]) -> dict[str, Any]:
+        """How many of the source's documents each pattern hits, with a few example paths."""
+        with self.db.read() as connection:
+            documents = [
+                (int(row[0]), str(row[1]), source_id)
+                for row in connection.execute(
+                    "SELECT d.id, d.path FROM documents d JOIN document_sources ds "
+                    "ON ds.document_id=d.id WHERE ds.source_id=? ORDER BY d.path",
+                    (source_id,),
+                )
+            ]
+        paths = {document_id: path for document_id, path, _ in documents}
+        output: dict[str, Any] = {}
+        for effect in EFFECTS:
+            per_pattern: dict[str, Any] = {}
+            for pattern in rules.get(effect, []):
+                hit = effects([(source_id, effect, pattern)], documents)
+                per_pattern[pattern] = {
+                    "documents": len(hit),
+                    "examples": [paths[d] for d in list(hit)[:5]],
+                }
+            output[effect] = per_pattern
+        combined = effects(
+            [(source_id, e, p) for e in EFFECTS for p in rules.get(e, [])], documents
+        )
+        output["documents"] = len(documents)
+        output["demoted"] = sum(1 for e, _ in combined.values() if e == "demote")
+        output["excluded"] = sum(1 for e, _ in combined.values() if e == "exclude")
+        return output
+
+    def set_path_rules(self, source_id: int, rules: dict[str, list[str]]) -> None:
+        """Replace the source's rules. Search-time only: no document, chunk or vector changes."""
+        cleaned = {effect: clean(rules.get(effect, []), effect) for effect in EFFECTS}
+        with self.db.transaction() as connection:
+            connection.execute("DELETE FROM path_rules WHERE source_id=?", (source_id,))
+            connection.executemany(
+                "INSERT INTO path_rules(source_id, effect, pattern) VALUES(?,?,?)",
+                [(source_id, e, p) for e in EFFECTS for p in cleaned[e]],
+            )
+
+    def skipped_files(self, limit: int = SKIPPED_PAGE) -> dict[str, Any]:
+        with self.db.read() as connection:
+            total = int(connection.execute("SELECT count(*) FROM skipped_files").fetchone()[0])
+            rows = connection.execute(
+                "SELECT s.name source, k.path, k.mime_type, k.size, k.reason "
+                "FROM skipped_files k JOIN sources s ON s.id=k.source_id "
+                "ORDER BY s.id, k.path LIMIT ?",
+                (limit,),
+            ).fetchall()
+        return {"total": total, "files": [dict(row) for row in rows]}
 
     def _find_source(self, value: str) -> dict[str, Any]:
         with contextlib.suppress(ValueError):
@@ -353,19 +456,31 @@ class Service:
             started = _now()
             self.db.set_meta("last_sync_started", started)
             self.db.set_meta("last_sync_trigger", trigger)
-            report = self._sync(source_id)
-            report["trigger"] = trigger
-            report["embeddings"] = self.embed_pending()
-            self.db.set_meta("last_sync_finished", _now())
-            self.db.set_meta("last_sync_report", json.dumps(_summary(report)))
+            every = self.list_sources()
+            progress = Progress(
+                self.db, [s for s in every if source_id is None or s["id"] == source_id]
+            )
+            try:
+                report = self._sync(source_id, progress)
+                report["trigger"] = trigger
+                report["embeddings"] = self.embed_pending(progress)
+                self.db.set_meta("last_sync_finished", _now())
+                self.db.set_meta("last_sync_report", json.dumps(_summary(report)))
+            finally:
+                progress.clear()
             return report
 
-    def _sync(self, source_id: int | None = None) -> dict[str, Any]:
+    def _sync(
+        self, source_id: int | None = None, progress: Progress | None = None
+    ) -> dict[str, Any]:
         every = self.list_sources()
         sources = [s for s in every if source_id is None or s["id"] == source_id]
         report: dict[str, Any] = {"sources": [], "indexed": 0, "unchanged": 0, "failed": 0}
         if not sources:
             return report
+        # sources whose first sync has not finished: their documents and folders are linked
+        # while the pass runs, so search can scope to them before the pass ends
+        fresh = {s["id"] for s in sources if not s["first_sync_done"]}
         try:
             backend = self.backend_factory(self.settings)
         except Exception as exc:
@@ -389,7 +504,20 @@ class Service:
                     self._update_root(source["id"], root)
                     outcome["name"] = root.name
                 listing = backend.list_files(root)
+                kept, skipped = split_supported(listing.items)  # also for backends that list all
+                listing = Listing(
+                    kept,
+                    listing.complete,
+                    listing.errors,
+                    listing.folders,
+                    [*listing.skipped, *skipped],
+                )
                 listings[source["id"]] = listing
+                with self.db.transaction() as connection:
+                    _register_folders(connection, source["id"], listing.folders)
+                if progress is not None and (entry := progress.source(source["id"])):
+                    entry["files_total"] = len(listing.items)
+                    progress.write()
                 status = "ok" if listing.complete else "partial"
                 if not listing.complete:
                     degraded.add(source["id"])
@@ -406,11 +534,15 @@ class Service:
                 outcome.update(ok=False, error=_message(exc))
             report["sources"].append(outcome)
         unique: dict[str, DriveItem] = {}
-        for found in listings.values():
+        holders: dict[str, list[int]] = {}
+        for listed_by, found in listings.items():
             for item in found.items if found else ():
                 unique.setdefault(item.id, item)
+                holders.setdefault(item.id, []).append(listed_by)
         extractor = self.extractor_factory(self.settings)
         stop = ""
+        if progress is not None:
+            progress.phase("extracting")
         for item in unique.values():
             if stop:
                 break
@@ -419,6 +551,14 @@ class Service:
             except DriveSourceError as exc:  # sign-in or connection: stop, delete nothing
                 stop = str(exc)
                 report["failed"] += 1
+            early = [h for h in holders[item.id] if h in fresh]
+            if early and not stop:
+                self._link_early(item, early)
+            if progress is not None:
+                for holder in holders[item.id]:
+                    if entry := progress.source(holder):
+                        entry["files_done"] += 1
+                progress.write()
         if stop:
             report["stopped"] = stop
         folders: dict[str, DriveFolder] = {}
@@ -464,11 +604,49 @@ class Service:
                             "INSERT OR IGNORE INTO document_sources VALUES(?,?)",
                             (ids[item.id], source_id),
                         )
+                if found is None or found.complete:
+                    connection.execute("DELETE FROM skipped_files WHERE source_id=?", (source_id,))
+                connection.executemany(
+                    "INSERT OR REPLACE INTO skipped_files VALUES(?,?,?,?,?,?)",
+                    [
+                        (source_id, f.id, f.path, f.mime_type, f.size, f.reason)
+                        for f in (found.skipped if found else ())
+                    ],
+                )
+                if found is not None and not stop:
+                    connection.execute(
+                        "UPDATE sources SET first_synced_at=? "
+                        "WHERE id=? AND first_synced_at IS NULL",
+                        (_now(), source_id),
+                    )
             report["removed"] = _delete_orphans(connection)
             _refresh_ancestry(connection)
             _gc_vectors(connection)
             _bump(connection)
         return report
+
+    def _link_early(self, item: DriveItem, source_ids: list[int]) -> None:
+        """During a first sync: link a processed file to its sources and ancestor folders now
+        (additive; the end of the pass replaces membership from complete listings)."""
+        with self.db.transaction() as connection:
+            row = connection.execute(
+                "SELECT id FROM documents WHERE file_id=?", (item.id,)
+            ).fetchone()
+            if row is None:
+                return
+            connection.executemany(
+                "INSERT OR IGNORE INTO document_sources VALUES(?,?)",
+                [(int(row[0]), source_id) for source_id in source_ids],
+            )
+            connection.execute(
+                """WITH RECURSIVE up(id) AS (
+                     SELECT ? UNION
+                     SELECT f.parent_id FROM folders f JOIN up ON f.folder_id=up.id
+                     WHERE f.parent_id!='')
+                   INSERT OR IGNORE INTO document_folders
+                   SELECT ?, id FROM up WHERE id IN (SELECT folder_id FROM folders)""",
+                (item.parent_id, int(row[0])),
+            )
 
     def _index_item(self, backend: DriveBackend, extractor: Extractor, item: DriveItem) -> str:
         """Index one file; return the report counter: indexed, unchanged or failed."""
@@ -619,7 +797,7 @@ class Service:
             )
 
     # -- embeddings ---------------------------------------------------------------------------
-    def embed_pending(self) -> dict[str, Any]:
+    def embed_pending(self, progress: Progress | None = None) -> dict[str, Any]:
         """Embed chunks without a vector. An item the endpoint rejects is isolated by splitting
         its batch, recorded in ``embedding_failures`` and skipped; any other failure stops the
         pass (it resumes on the next sync)."""
@@ -637,6 +815,9 @@ class Service:
                 )
                 _bump(connection)
         embedded = 0
+        if progress is not None:
+            progress.state["embedding"] = {"done": 0, "pending": self._pending_vectors()}
+            progress.phase("embedding")
         while True:
             with self.db.read() as connection:
                 rows = connection.execute(
@@ -669,6 +850,9 @@ class Service:
                 )
                 _bump(connection)
             embedded += len(vectors)
+            if progress is not None:
+                progress.state["embedding"]["done"] = embedded + len(failures)
+                progress.write()
         with self.db.transaction() as connection:
             connection.execute("DELETE FROM meta WHERE key='last_embedding_error'")
         return {"enabled": True, "embedded": embedded, "pending": 0}
@@ -897,8 +1081,13 @@ class Service:
                     "ORDER BY indexed_at DESC LIMIT 20"
                 )
             ]
+        running = self.sync_running()
+        progress = json.loads(self.db.get_meta(PROGRESS_KEY) or "null") if running else None
+        with self.db.read() as connection:
+            skipped = int(connection.execute("SELECT count(*) FROM skipped_files").fetchone()[0])
         return {
             "sources": self.list_sources(),
+            "skipped": {"total": skipped},
             "documents": {
                 "total": int(counts["total"] or 0),
                 "indexed": int(counts["n_indexed"] or 0),
@@ -920,7 +1109,8 @@ class Service:
             "google_auth": settings.google_auth,
             "settings_from": setting_origins(settings.data_dir),
             "sync": {
-                "running": self.sync_running(),
+                "running": running,
+                "progress": progress,
                 "requested": self.take_request() is not None,
                 "trigger": self.db.get_meta("last_sync_trigger"),
                 "interval_minutes": settings.sync_interval_minutes,
@@ -931,7 +1121,36 @@ class Service:
         }
 
 
-def _source_json(row: Any) -> dict[str, Any]:
+_SOURCE_SQL = """SELECT s.*,
+    (SELECT count(*) FROM document_sources d WHERE d.source_id=s.id) documents,
+    (SELECT count(*) FROM skipped_files k WHERE k.source_id=s.id) skipped
+    FROM sources s"""
+
+
+def _rules_by_source(connection: Any) -> dict[int, dict[str, list[str]]]:
+    rules: dict[int, dict[str, list[str]]] = {}
+    for row in connection.execute(
+        "SELECT source_id, effect, pattern FROM path_rules ORDER BY rowid"
+    ):
+        entry = rules.setdefault(int(row[0]), {e: [] for e in EFFECTS})
+        entry[str(row[1])].append(str(row[2]))
+    return rules
+
+
+def _register_folders(connection: Any, source_id: int, folders: Any) -> None:
+    """Additive: make listed folders known (new ones only) with this source as a holder, and
+    recompute paths. The end of a sync replaces membership as usual."""
+    connection.executemany(
+        "INSERT OR IGNORE INTO folders(folder_id, name, parent_id) VALUES(?,?,?)",
+        [(f.id, f.name, f.parent_id) for f in folders],
+    )
+    connection.executemany(
+        "INSERT OR IGNORE INTO folder_sources VALUES(?,?)", [(f.id, source_id) for f in folders]
+    )
+    _refresh_ancestry(connection)
+
+
+def _source_json(row: Any, rules: dict[str, list[str]] | None = None) -> dict[str, Any]:
     keys = row.keys()
     return {
         "id": int(row["id"]),
@@ -945,6 +1164,9 @@ def _source_json(row: Any) -> dict[str, Any]:
         "files": int(row["file_count"]),
         "documents": int(row["documents"]) if "documents" in keys else None,
         "last_sync_at": row["last_sync_at"],
+        "first_sync_done": row["first_synced_at"] is not None,
+        "skipped": int(row["skipped"]) if "skipped" in keys else 0,
+        "path_rules": rules or {e: [] for e in EFFECTS},
     }
 
 

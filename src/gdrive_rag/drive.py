@@ -135,6 +135,45 @@ class Listing:
     complete: bool = True  # False: some folder failed; never delete based on this listing
     errors: Sequence[str] = field(default_factory=tuple)
     folders: Sequence[DriveFolder] = field(default_factory=tuple)  # includes a folder root
+    skipped: Sequence[SkippedFile] = field(default_factory=tuple)  # listed but not indexable
+
+
+@dataclass(frozen=True)
+class SkippedFile:
+    """A listed file that is not indexed because no extractor handles its type."""
+
+    id: str
+    path: str
+    mime_type: str
+    size: int | None
+    reason: str
+
+
+SHORTCUT_MIME = "application/vnd.google-apps.shortcut"
+
+
+def skip_reason(item: DriveItem) -> str:
+    """Why ``item`` cannot be indexed, or "" when an extractor handles it."""
+    if item.suffix:
+        return ""
+    if item.mime_type == SHORTCUT_MIME:
+        return "Drive shortcut (the target file is indexed where it lives)"
+    if item.mime_type.startswith("application/vnd.google-apps."):
+        return "Google file type that cannot be exported as text"
+    return "no extractor for this file type"
+
+
+def split_supported(items: Sequence[DriveItem]) -> tuple[list[DriveItem], list[SkippedFile]]:
+    """Indexable items and the skipped rest, with a reason for each."""
+    kept: list[DriveItem] = []
+    skipped: list[SkippedFile] = []
+    for item in items:
+        reason = skip_reason(item)
+        if reason:
+            skipped.append(SkippedFile(item.id, item.path, item.mime_type, item.size, reason))
+        else:
+            kept.append(item)
+    return kept, skipped
 
 
 def folder_link(folder_id: str) -> str:
@@ -311,7 +350,8 @@ class GoogleDriveBackend:
                 raise DriveItemError("Drive item is in the trash")
             parents = value.get("parents") or [""]
             item = _item(value, display_segment(str(value.get("name", ""))), str(parents[0]))
-            return Listing([item] if item and item.suffix else [])
+            kept, skipped = split_supported([item] if item else [])
+            return Listing(kept, skipped=skipped)
         # files.list on a folder we lost access to returns an empty page, not 404, so check the
         # root itself every cycle: a revoked share must raise DriveItemError, not look empty.
         resolved = self.resolve(root.id)
@@ -342,9 +382,10 @@ class GoogleDriveBackend:
                     folders.append(DriveFolder(str(value["id"]), name, folder_id))
                     continue
                 item = _item(value, path, folder_id)
-                if item is not None and item.suffix:
+                if item is not None:
                     items.append(item)
-        return Listing(items, complete=not errors, errors=errors, folders=folders)
+        kept, skipped = split_supported(items)
+        return Listing(kept, complete=not errors, errors=errors, folders=folders, skipped=skipped)
 
     def _children(self, folder_id: str, drive_id: str) -> list[dict[str, Any]]:
         result: list[dict[str, Any]] = []

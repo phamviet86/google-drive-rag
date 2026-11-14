@@ -108,6 +108,7 @@ class _Recorder(http.server.BaseHTTPRequestHandler):
     target = ""
 
     def do_POST(self) -> None:  # noqa: N802
+        self.rfile.read(int(self.headers.get("Content-Length") or 0))  # unread body: reset
         if self.path.startswith("/v1/"):
             self.send_response(302)
             self.send_header("Location", self.target)

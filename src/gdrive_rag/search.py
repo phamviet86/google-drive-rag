@@ -20,10 +20,17 @@ models are never mixed; otherwise search is FTS only.
 
 Scope filters (source, folder with all subfolders, specific files) are applied to both the FTS
 and the vector candidates before fusion, so a narrow scope still fills ``limit``.
+
+Per-source path rules (``rules.py``) apply only when a source has some: ``exclude`` is one more
+scope condition (files named in ``files`` are never excluded) and ``demote`` multiplies the
+fused score by ``rules.DEMOTE_FACTOR``. With no rules the code path is the same as before.
+A scope on a source still on its first sync gets a warning with its progress instead of a
+silent empty result.
 """
 
 from __future__ import annotations
 
+import json
 import threading
 from collections.abc import Callable
 from typing import Any
@@ -34,6 +41,7 @@ from .db import TERM, Database, fts_fold
 from .drive import parse_drive_link
 from .embeddings import EmbeddingClient
 from .ranking import contains_phrase, idf, lexical_score, title_score, tokens
+from .rules import DEMOTE_FACTOR, effects
 
 CANDIDATES = 200  # FTS candidates re-scored per query
 RRF_K = 60
@@ -45,12 +53,17 @@ EMBEDDING_IDENTITY_KEY = "embedding_identity"
 REVISION_KEY = "index_revision"
 
 
+class NotIndexedYet(ValueError):
+    """The scope names a folder a first sync has not reached yet (a warning, not an error)."""
+
+
 class SearchEngine:
     def __init__(self, db: Database, embeddings: Callable[[], EmbeddingClient | None]):
         self.db = db
         self.embeddings = embeddings
         self._lock = threading.Lock()
         self._matrix: tuple[str, list[int], Any] | None = None
+        self._rule_cache: tuple[Any, dict[int, tuple[str, str]]] | None = None
 
     def search(
         self,
@@ -67,7 +80,20 @@ class SearchEngine:
         if not terms:
             raise ValueError("query must contain at least one word")
         warnings: list[str] = []
-        scope = self._scope(source, folder, files)
+        try:
+            scope, named = self._scope(source, folder, files)
+        except NotIndexedYet as exc:
+            return {"mode": "full_text", "warnings": [str(exc)], "results": []}
+        warnings += self._first_sync_notes(source, folder)
+        rules = self._rule_effects()
+        if rules:
+            excluded = sorted(d for d, (e, _) in rules.items() if e == "exclude" and d not in named)
+            if excluded:
+                condition = "c.document_id NOT IN (SELECT value FROM json_each(?))"
+                scope = (
+                    f"{scope[0]} AND {condition}" if scope[0] else condition,
+                    [*scope[1], json.dumps(excluded)],
+                )
         pool = max(limit * 5, 40)
         lexical, phrases, query_terms, weights = self._full_text(terms, scope, pool)
         semantic: list[tuple[int, float]] = []
@@ -85,6 +111,14 @@ class SearchEngine:
         candidates = {c for c, _, _ in lexical} | {c for c, _ in semantic}
         titles = self._title_scores(candidates, query_terms, weights)
         scores = fuse(lexical, semantic, titles, phrases)
+        fused = dict(scores)
+        applied: dict[int, str] = {}
+        if rules:
+            for chunk_id, document_id in self._documents_of(list(scores)).items():
+                effect = rules.get(document_id)
+                if effect is not None and effect[0] == "demote":
+                    scores[chunk_id] *= DEMOTE_FACTOR
+                    applied[chunk_id] = f"demote: {effect[1]}"
         ordered = sorted(scores, key=lambda chunk_id: scores[chunk_id], reverse=True)
         results = self._rows(ordered, scores, limit)
         if explain:
@@ -104,6 +138,9 @@ class SearchEngine:
                     "phrase": chunk_id in phrases,
                     "fused": hit["score"],
                 }
+                if rules:
+                    hit["explain"]["path_rule"] = applied.get(chunk_id)
+                    hit["explain"]["fused_before_rules"] = round(fused[chunk_id], 6)
         for hit in results:
             del hit["chunk_id"]
         return {"mode": mode, "warnings": warnings, "results": results}
@@ -119,11 +156,81 @@ class SearchEngine:
             raise ValueError(f"unknown source: {value}")
         return int(row[0])
 
+    def _first_sync_notes(self, source: str | None, folder: str | None) -> list[str]:
+        """Warnings for scoped sources (or sources holding the folder) whose first sync has
+        not finished, with how far it got."""
+        if not source and not folder:
+            return []
+        with self.db.read() as connection:
+            ids: set[int] = set()
+            if source:
+                ids.add(self.source_id(source))
+            if folder:
+                ids |= {
+                    int(row[0])
+                    for row in connection.execute(
+                        "SELECT source_id FROM folder_sources WHERE folder_id=?",
+                        (parse_drive_link(folder),),
+                    )
+                }
+            return [
+                first_sync_note(row)
+                for row in connection.execute(
+                    f"{_PENDING_SOURCES} AND s.id IN ({','.join('?' for _ in ids)}) ORDER BY s.id",
+                    sorted(ids),
+                )
+            ]
+
+    def _rule_effects(self) -> dict[int, tuple[str, str]]:
+        """``{document id: (effect, pattern)}`` from all path rules; {} when there are none."""
+        with self.db.read() as connection:
+            rules = [
+                (int(row[0]), str(row[1]), str(row[2]))
+                for row in connection.execute(
+                    "SELECT source_id, effect, pattern FROM path_rules ORDER BY rowid"
+                )
+            ]
+            if not rules:
+                return {}
+            revision = connection.execute(
+                "SELECT value FROM meta WHERE key=?", (REVISION_KEY,)
+            ).fetchone()
+            key = (revision[0] if revision else "0", tuple(rules))
+            if self._rule_cache is not None and self._rule_cache[0] == key:
+                return self._rule_cache[1]
+            sources = sorted({rule[0] for rule in rules})
+            documents = [
+                (int(row[0]), str(row[1]), int(row[2]))
+                for row in connection.execute(
+                    "SELECT d.id, d.path, ds.source_id FROM documents d JOIN document_sources ds "
+                    "ON ds.document_id=d.id "
+                    f"WHERE ds.source_id IN ({','.join('?' for _ in sources)})",
+                    sources,
+                )
+            ]
+        result = effects(rules, documents)
+        self._rule_cache = (key, result)
+        return result
+
+    def _documents_of(self, chunk_ids: list[int]) -> dict[int, int]:
+        output: dict[int, int] = {}
+        with self.db.read() as connection:
+            for start in range(0, len(chunk_ids), 500):
+                batch = chunk_ids[start : start + 500]
+                for row in connection.execute(
+                    "SELECT id, document_id FROM chunks "
+                    f"WHERE id IN ({','.join('?' for _ in batch)})",
+                    batch,
+                ):
+                    output[int(row[0])] = int(row[1])
+        return output
+
     def _scope(
         self, source: str | None, folder: str | None, files: list[str] | None
-    ) -> tuple[str, list[Any]]:
-        """SQL condition on ``c.document_id`` (``""`` for no scope) and its parameters.
-        An unknown source, folder or file is an error naming it, never an empty result."""
+    ) -> tuple[tuple[str, list[Any]], set[int]]:
+        """SQL condition on ``c.document_id`` (``""`` for no scope) with its parameters, and the
+        document ids named in ``files``. An unknown source, folder or file is an error naming
+        it, never an empty result; a folder unknown while a first sync runs is ``NotIndexedYet``."""
         conditions: list[str] = []
         values: list[Any] = []
         if source:
@@ -137,6 +244,11 @@ class SearchEngine:
                 if not connection.execute(
                     "SELECT 1 FROM folders WHERE folder_id=?", (folder_id,)
                 ).fetchone():
+                    pending = [first_sync_note(r) for r in connection.execute(_PENDING_SOURCES)]
+                    if pending:
+                        raise NotIndexedYet(
+                            f"folder {folder} is not indexed yet: " + "; ".join(pending)
+                        )
                     raise ValueError(f"unknown or not indexed folder: {folder}")
                 conditions.append(
                     "c.document_id IN (SELECT document_id FROM document_folders WHERE folder_id=?)"
@@ -158,7 +270,8 @@ class SearchEngine:
                     ids.append(int(row["id"]))
                 conditions.append(f"c.document_id IN ({','.join('?' for _ in ids)})")
                 values.extend(ids)
-        return " AND ".join(conditions), values
+        named = set(ids) if files else set()
+        return (" AND ".join(conditions), values), named
 
     def _full_text(
         self, terms: list[str], scope: tuple[str, list[Any]], pool: int
@@ -340,6 +453,27 @@ class SearchEngine:
             "score": round(score, 6),
             "snippet": text if len(text) <= SNIPPET_CHARS else text[:SNIPPET_CHARS].rstrip() + " …",
         }
+
+
+_PENDING_SOURCES = """SELECT s.name, s.last_status, s.file_count,
+    (SELECT count(*) FROM document_sources d WHERE d.source_id=s.id) documents
+    FROM sources s WHERE s.first_synced_at IS NULL"""
+
+
+def first_sync_note(row: Any) -> str:
+    """ "source 'X' is still on its first sync (N of M files indexed)"."""
+    name = row["name"]
+    if row["last_status"] == "error":
+        return (
+            f"source '{name}' has not finished its first sync "
+            "(the last attempt failed; see sync_status)"
+        )
+    if row["last_status"] == "pending":
+        return f"source '{name}' is still on its first sync (listing files)"
+    return (
+        f"source '{name}' is still on its first sync "
+        f"({row['documents']} of {row['file_count']} files indexed)"
+    )
 
 
 def _round(value: float | None) -> float | None:

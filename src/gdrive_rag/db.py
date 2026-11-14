@@ -112,6 +112,30 @@ MIGRATIONS = [
     );
     CREATE INDEX document_folders_folder_idx ON document_folders(folder_id);
     """,
+    # v0.3.0: first-sync marker, per-source path rules for ranking, files skipped at listing.
+    # Additive only: no document, chunk or vector row is touched, so nothing is re-extracted or
+    # re-embedded. Sources that already synced (or hold documents) count as first-synced.
+    """
+    ALTER TABLE sources ADD COLUMN first_synced_at TEXT;
+    UPDATE sources SET first_synced_at=COALESCE(last_sync_at, CURRENT_TIMESTAMP)
+      WHERE last_status IN ('ok', 'partial')
+         OR EXISTS (SELECT 1 FROM document_sources d WHERE d.source_id=sources.id);
+    CREATE TABLE path_rules (
+      source_id INTEGER NOT NULL REFERENCES sources(id) ON DELETE CASCADE,
+      effect TEXT NOT NULL CHECK (effect IN ('demote', 'exclude')),
+      pattern TEXT NOT NULL,
+      PRIMARY KEY (source_id, effect, pattern)
+    );
+    CREATE TABLE skipped_files (
+      source_id INTEGER NOT NULL REFERENCES sources(id) ON DELETE CASCADE,
+      file_id TEXT NOT NULL,
+      path TEXT NOT NULL,
+      mime_type TEXT NOT NULL,
+      size INTEGER,
+      reason TEXT NOT NULL,
+      PRIMARY KEY (source_id, file_id)
+    );
+    """,
 ]
 
 

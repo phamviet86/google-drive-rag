@@ -72,7 +72,11 @@ def cmd_serve(args: argparse.Namespace) -> int:
 
 
 def cmd_status(args: argparse.Namespace) -> int:
-    _print(_service(args).status(), args.json)
+    service = _service(args)
+    status = service.status()
+    if args.skipped:
+        status["skipped_files"] = service.skipped_files()["files"]
+    _print(status, args.json)
     return 0
 
 
@@ -113,6 +117,13 @@ def cmd_source_list(args: argparse.Namespace) -> int:
 def cmd_source_remove(args: argparse.Namespace) -> int:
     # the same rules as the remove_source tool (GDRAG_DRIVE_LINKS, running sync)
     _print(_admin(args).remove_source(args.source, True), args.json)
+    return 0
+
+
+def cmd_source_rules(args: argparse.Namespace) -> int:
+    # the same rules and validation as the set_path_rules tool; without options it only shows
+    change = args.demote is not None or args.exclude is not None
+    _print(_admin(args).set_path_rules(args.source, args.demote, args.exclude, change), args.json)
     return 0
 
 
@@ -272,7 +283,11 @@ def build_parser() -> argparse.ArgumentParser:
     setup.add_argument("--yes", action="store_true", help="do not ask; use environment values")
     setup.set_defaults(func=cmd_setup)
 
-    commands.add_parser("status", help="show index and sync state").set_defaults(func=cmd_status)
+    status = commands.add_parser("status", help="show index and sync state")
+    status.add_argument(
+        "--skipped", action="store_true", help="list files skipped as unsupported (first 100)"
+    )
+    status.set_defaults(func=cmd_status)
     commands.add_parser("sync", help="sync all sources now").set_defaults(func=cmd_sync)
 
     search = commands.add_parser("search", help="search the index (for manual checks)")
@@ -300,6 +315,17 @@ def build_parser() -> argparse.ArgumentParser:
     remove = source.add_parser("remove", help="remove a source (id, name or link)")
     remove.add_argument("source")
     remove.set_defaults(func=cmd_source_remove)
+    rules = source.add_parser(
+        "rules",
+        help="show or set search path rules of a source (demote / exclude glob patterns)",
+        description="Without --demote/--exclude: show the rules and what they match. "
+        "Each option replaces that list; give it with no patterns to clear it. "
+        "Example: source rules 1 --demote 'attachments/**'",
+    )
+    rules.add_argument("source", help="source id, name or link")
+    rules.add_argument("--demote", nargs="*", metavar="PATTERN", help="files that rank lower")
+    rules.add_argument("--exclude", nargs="*", metavar="PATTERN", help="files left out of search")
+    rules.set_defaults(func=cmd_source_rules)
 
     auth = commands.add_parser("auth", help="Google credentials").add_subparsers(
         dest="auth_command", required=True

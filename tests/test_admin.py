@@ -45,6 +45,7 @@ ADMIN_TOOLS = {
     "remove_google_auth",
     "set_embedding",
     "remove_embedding",
+    "set_path_rules",
 }
 CLIENT_LOGGERS = ("mcp.client", "httpx", "httpcore")
 CLEARED = (*ENV_FIELDS, "GDRAG_DRIVE_LINKS", "GDRAG_GOOGLE_CREDENTIALS", ADMIN_ENV)
