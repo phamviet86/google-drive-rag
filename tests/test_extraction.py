@@ -170,7 +170,10 @@ def fake_tesseract(tmp_path: Path, langs: str, body: str = "print('Hợp đồng
     return str(script)
 
 
-def test_tesseract_subprocess_and_missing_pieces(tmp_path: Path) -> None:
+def test_tesseract_subprocess_and_missing_pieces(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from gdrive_rag import ocr as ocr_module
     from gdrive_rag.ocr import TesseractOCR
 
     image = tmp_path / "scan.png"
@@ -180,6 +183,8 @@ def test_tesseract_subprocess_and_missing_pieces(tmp_path: Path) -> None:
     working = TesseractOCR("vie+eng", binary=fake_tesseract(tmp_path, "eng osd vie"))
     document = Extractor(working, ocr_enabled=True).extract(image)
     assert document.text == "Hợp đồng"
+    # A real tesseract may be installed (CI, Docker); hide it for the missing-binary case.
+    monkeypatch.setattr(ocr_module.shutil, "which", lambda name: None)
     for engine in (
         TesseractOCR("vie+eng", binary=None),  # binary missing
         TesseractOCR("vie+eng", binary=str(tmp_path / "nope")),  # path does not exist
