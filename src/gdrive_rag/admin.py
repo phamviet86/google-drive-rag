@@ -112,9 +112,9 @@ class Admin:
         try:
             resolved = candidate.resolve(strict=True)
         except (OSError, RuntimeError):
-            raise AdminRefused(f"file not found in the secrets folder: {name}") from None
-        if not resolved.is_relative_to(root):
-            raise AdminRefused("only files inside the secrets folder can be used")
+            resolved = None
+        if resolved is None or not resolved.is_relative_to(root):  # one answer: no probing
+            raise AdminRefused(f"no such file inside the secrets folder: {name}")
         if not resolved.is_file():
             raise AdminRefused(f"not a regular file: {name}")
         if resolved.stat().st_size > MAX_SECRET_FILE_BYTES:
@@ -131,11 +131,17 @@ class Admin:
     # -- sources -------------------------------------------------------------------------------
     def add_source(self, link: str) -> dict[str, Any]:
         result = self.service.add_sources([link])[0]
-        if not result.get("ok"):
+        if "id" not in result:  # not a Drive link: nothing was stored
             raise AdminRefused(f"could not add {link}: {result.get('error')}")
         answer = {"applied": not result.get("already_added"), "source": _source(result)}
         if result.get("already_added"):
             answer["message"] = "This source was already added; nothing changed."
+            return answer
+        if not result.get("ok"):
+            answer["message"] = (
+                f"Source added, but Google cannot open it now ({result.get('error')}). Share it "
+                "with the Google account in use, then call sync_now; or remove it."
+            )
             return answer
         answer["sync"] = self.service.queue_sync(int(result["id"]))
         answer["message"] = "Source added; it is read in the background. Check sync_status."
@@ -215,8 +221,10 @@ class Admin:
             "applied": True,
             "method": "service_account",
             "client_email": result["client_email"],
-            "message": f"Saved. Share each Drive folder with {result['client_email']} (Viewer).",
-            "sync": self.service.queue_sync(None),
+            "message": (
+                f"Saved. Share each Drive folder with {result['client_email']} (Viewer), then "
+                "call sync_now. The next scheduled sync also uses it."
+            ),
         }
 
     def oauth_start(self, oauth_client_file: str) -> dict[str, Any]:
@@ -266,8 +274,7 @@ class Admin:
         return {
             "applied": True,
             "method": "oauth",
-            "message": "Signed in.",
-            "sync": self.service.queue_sync(None),
+            "message": "Signed in. Call sync_now to read Drive with this account.",
         }
 
     def remove_google(self, confirm: bool) -> dict[str, Any]:
@@ -351,7 +358,7 @@ class Admin:
         self.service.reload()
         return {
             "applied": True,
-            "message": warning + " Embedding runs with the next sync (queued now).",
+            "message": warning + " Embedding runs with the next sync.",
             **plan,
             "sync": self.service.queue_sync(None),
         }

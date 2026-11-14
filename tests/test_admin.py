@@ -213,12 +213,6 @@ def test_admin_listing_and_annotations(env: Env) -> None:
             assert "confirm" in tools[name].input_schema["properties"]
     assert tools["set_embedding"].annotations.open_world_hint is True
     assert tools["add_source"].annotations.open_world_hint is True
-    # secret-bearing arguments carry no constraints that could echo them in a validation error
-    assert set(tools["set_embedding"].input_schema["properties"]["api_key"]) <= {
-        "anyOf",
-        "default",
-        "title",
-    }
 
 
 # -- sources -----------------------------------------------------------------------------------
@@ -250,6 +244,10 @@ def test_add_and_remove_source(env: Env, monkeypatch: pytest.MonkeyPatch) -> Non
     assert [s["name"] for s in env.tool("list_sources")["sources"]] == ["Kế toán"]
     assert "unknown source" in env.tool("remove_source", source="nope")
     assert "could not add" in env.tool("add_source", link="not a link")
+    unknown = env.tool("add_source", link="folderZZZZZZZZZZZZ")  # stored, but Google says 404
+    assert unknown["applied"] is True and unknown["source"]["status"] == "error"
+    assert "cannot open it" in unknown["message"] and "sync" not in unknown
+    assert len(env.tool("list_sources")["sources"]) == 2
 
 
 # -- secrets folder ----------------------------------------------------------------------------
@@ -260,8 +258,8 @@ def test_file_arguments_are_confined_to_the_secrets_folder(env: Env, tmp_path: P
     (env.secrets / "sub").mkdir()
     for name in ("../outside.json", str(outside), "link.json", "sub/../../outside.json"):
         refused = env.tool("set_google_service_account", file=name, confirm=True)
-        assert "only files inside the secrets folder" in refused, name
-    assert "not found" in env.tool("set_google_service_account", file="missing.json")
+        assert "no such file inside the secrets folder" in refused, name
+    assert "no such file" in env.tool("set_google_service_account", file="missing.json")
     assert "not a regular file" in env.tool("set_google_service_account", file="sub")
     assert env.tool("google_auth_status")["method"] == "none"
     env.admin.secrets_dir = None
@@ -491,13 +489,28 @@ def test_settings_change_during_a_sync_applies_from_the_next_step(
     assert env.tool("sync_status")["embeddings"]["vectors"] > 0
 
 
-def test_validation_errors_do_not_echo_secrets(env: Env) -> None:
-    text = env.tool(
-        "set_embedding", base_url="https://x/v1", model="m", api_key=API_KEY, dimensions="many"
-    )
-    assert isinstance(text, str) and API_KEY not in text
-    text = env.tool("google_auth_finish", redirect_url=f"http://localhost/?code={CODE}", confirm=7)
-    assert isinstance(text, str)
+def test_bad_arguments_never_echo_secrets(env: Env) -> None:
+    """The SDK's own validation error prints every argument; these tools never trigger it."""
+    cases = [
+        {"model": "m", "api_key": API_KEY},  # missing base_url
+        {"base_url": "https://x/v1", "model": "m", "api_key": [API_KEY]},
+        {"base_url": "https://x/v1", "model": "m", "api_key": {"k": API_KEY}},
+        {"base_url": "https://x/v1", "model": "m", "api_key": API_KEY, "dimensions": "many"},
+        {"base_url": "https://x/v1", "model": "m", "api_key": API_KEY, "confirm": "yes"},
+        {"base_url": 5, "model": "m", "api_key": API_KEY},
+    ]
+    for arguments in cases:
+        text = env.tool("set_embedding", **arguments)
+        assert isinstance(text, str) and "validation error" not in text, arguments
+    redirect = f"http://localhost/?state=STATE42&code={CODE}"
+    for arguments in ({"redirect_url": redirect, "confirm": 7}, {"redirect_url": [redirect]}, {}):
+        text = env.tool("google_auth_finish", **arguments)
+        assert isinstance(text, str) and "validation error" not in text, arguments
+    tools = {tool.name: tool for tool in call(env.url, "tools/list").tools}
+    schema = tools["set_embedding"].input_schema
+    assert schema["properties"]["api_key"]["type"] == "string"
+    assert schema["properties"]["confirm"]["type"] == "boolean"
+    assert schema.get("required", []) == []
 
 
 def test_cli_shares_the_admin_functions(

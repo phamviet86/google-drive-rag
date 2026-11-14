@@ -261,6 +261,7 @@ Những điều nên biết:
 - Tệp khóa phải nằm trong thư mục `secrets`. Claude chỉ cần tên tệp, ví dụ `openrouter.key`, nên khóa không phải dán vào cuộc trò chuyện. Công cụ không đọc được tệp nằm ngoài thư mục này.
 - Khóa và mã đăng nhập không bao giờ hiện trong câu trả lời, trong `sync_status` hay trong nhật ký.
 - Giá trị ghi trong `.env` luôn thắng. Nếu `.env` đã ghi một giá trị khác, công cụ từ chối và nói tên dòng cần xóa trong `.env`. Muốn quản lý một mục bằng Claude, hãy để trống dòng đó trong `.env` rồi dựng lại dịch vụ. `sync_status` cho biết mỗi mục lấy từ `.env` ("environment"), từ công cụ hoặc lệnh ("stored") hay mặc định ("default").
+- Sau khi đổi quyền Google, Drive chưa được đọc lại ngay. Hãy chia sẻ các thư mục cho tài khoản mới trước, rồi nhờ Claude gọi `sync_now`. Một thư mục mà tài khoản mới không mở được sẽ bị bỏ khỏi chỉ mục ở lần đọc kế tiếp.
 - Nguồn ghi trong `GDRAG_DRIVE_LINKS` không bỏ được bằng công cụ, vì lần khởi động sau nó sẽ được thêm lại.
 - Khi Drive đang được đọc, việc bỏ nguồn bị từ chối; hãy thử lại khi `sync_status` báo đã xong. Các thay đổi khác được lưu ngay và dùng từ bước đọc kế tiếp.
 

@@ -343,15 +343,49 @@ def create_server(service: Service, admin: Admin | None = None) -> Any:
     return server
 
 
+CONFIRM_TEXT = "false (default) only previews; true applies it, after the user agreed."
+
+
+def loose(kind: str, description: str) -> Any:
+    """A parameter typed ``Any`` (so the SDK never rejects it with an error that repeats all
+    arguments, secrets included) that still advertises its JSON type to clients."""
+    return Field(description=description, json_schema_extra={"type": kind})
+
+
+def _text(value: Any, name: str, required: bool = True) -> str:
+    if value is None or value == "":
+        if required:
+            raise ValueError(f"{name} is required")
+        return ""
+    if not isinstance(value, str):
+        raise ValueError(f"{name} must be a string")
+    return value
+
+
+def _flag(value: Any) -> bool:
+    if not isinstance(value, bool):
+        raise ValueError("confirm must be true or false")
+    return value
+
+
+def _number(value: Any, name: str) -> int | None:
+    if value is None:
+        return None
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise ValueError(f"{name} must be a whole number")
+    return int(value)
+
+
 def register_admin_tools(
     server: MCPServer,
     admin: Admin,
     ok: Callable[[dict[str, Any]], CallToolResult],
     fail: Callable[[Exception], CallToolResult],
 ) -> None:
-    """Admin tools, registered only when ``GDRAG_ADMIN_TOOLS`` is on. Secret-bearing arguments
-    (``api_key``, ``redirect_url``) carry no schema constraints, so a validation error can never
-    repeat them; they are checked inside the handlers."""
+    """Admin tools, registered only when ``GDRAG_ADMIN_TOOLS`` is on. Every argument of the two
+    tools that take a secret (``set_embedding``, ``google_auth_finish``) is ``Any`` with a default:
+    the SDK's validation error prints the whole argument dict, so these are checked in the
+    handlers instead, with messages that never repeat a value."""
 
     def notes(*, destructive: bool, idempotent: bool, world: bool, ro: bool = False) -> Any:
         return ToolAnnotations(
@@ -438,10 +472,10 @@ def register_admin_tools(
         "checks the address and previews.",
     )
     def google_auth_finish(
-        redirect_url: str,
-        confirm: Annotated[bool, CONFIRM] = False,
+        redirect_url: Annotated[Any, loose("string", "Full address from the browser.")] = None,
+        confirm: Annotated[Any, loose("boolean", CONFIRM_TEXT)] = False,
     ) -> Annotated[CallToolResult, AdminOutput]:
-        return run(lambda: admin.oauth_finish(redirect_url, confirm))
+        return run(lambda: admin.oauth_finish(_text(redirect_url, "redirect_url"), _flag(confirm)))
 
     @server.tool(
         title="Remove Google access",
@@ -464,20 +498,25 @@ def register_admin_tools(
         "api_key. Without confirm it previews the host and how many chunks would be embedded.",
     )
     def set_embedding(
-        base_url: Annotated[str, Field(description="For example https://openrouter.ai/api/v1")],
-        model: Annotated[str, Field(description="Embedding model name.")],
+        base_url: Annotated[
+            Any, loose("string", "For example https://openrouter.ai/api/v1")
+        ] = None,
+        model: Annotated[Any, loose("string", "Embedding model name.")] = None,
         api_key_file: Annotated[
-            str | None, Field(description="File in the secrets folder holding the key.")
+            Any, loose("string", "File in the secrets folder holding the key.")
         ] = None,
-        api_key: str | None = None,
-        dimensions: Annotated[
-            int | None, Field(description="Vector size kept (default 1024).")
-        ] = None,
-        confirm: Annotated[bool, CONFIRM] = False,
+        api_key: Annotated[Any, loose("string", "The key itself (prefer api_key_file).")] = None,
+        dimensions: Annotated[Any, loose("integer", "Vector size kept (default 1024).")] = None,
+        confirm: Annotated[Any, loose("boolean", CONFIRM_TEXT)] = False,
     ) -> Annotated[CallToolResult, AdminOutput]:
         return run(
             lambda: admin.set_embedding(
-                base_url, model, api_key_file, api_key, dimensions, bool(confirm)
+                _text(base_url, "base_url"),
+                _text(model, "model"),
+                _text(api_key_file, "api_key_file", required=False) or None,
+                _text(api_key, "api_key", required=False) or None,
+                _number(dimensions, "dimensions"),
+                _flag(confirm),
             )
         )
 
