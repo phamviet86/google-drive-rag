@@ -21,7 +21,7 @@ Run all four before calling a change done:
 
 - One test: `.venv/bin/pytest tests/test_sync.py -k overlapping`.
 - Manual search: `.venv/bin/gdrive-rag --data-dir /tmp/gdr search "query" --folder <link> --file <link>`.
-- Real OCR test (skipped by default): `python -m gdrive_rag.ocr_runtime /tmp/ocr`, then `GDRAG_TEST_OCR_DIR=/tmp/ocr .venv/bin/pytest -k real_ocr`.
+- Real OCR test: runs only when `tesseract` with `vie` and `eng` data is on PATH (CI installs it), otherwise skipped: `.venv/bin/pytest -rs -k real_tesseract`. `python -m gdrive_rag.ocr` is the same check as a command; the Docker build runs it.
 - `mypy` is strict over `gdrive_rag`; ruff line length is 100.
 - Run the server locally against a throwaway data dir, never a real one: `.venv/bin/gdrive-rag --data-dir /tmp/gdr serve --port 18765`, then `curl http://127.0.0.1:18765/healthz`.
 - Docker: `docker compose up -d --build`; the CLI runs inside the container as `docker compose exec gdrive-rag gdrive-rag <command>`.
@@ -32,7 +32,7 @@ All code is in `src/gdrive_rag`. Console script `gdrive-rag` → `gdrive_rag.cli
 
 ```text
 cli.py / server.py  →  service.Service  →  drive.py (DriveBackend protocol, GoogleDriveBackend)
-                                        →  extract.py (+ formats.py, xlsx_compat.py, ocr_runtime.py)
+                                        →  extract.py (+ formats.py, xlsx_compat.py, ocr.py)
                                         →  chunking.py → db.py (SQLite WAL, FTS5, vectors)
                                         →  embeddings.py (OpenAI-compatible client)
                        search.SearchEngine reads the same database
@@ -45,7 +45,8 @@ cli.py / server.py  →  service.Service  →  drive.py (DriveBackend protocol, 
 - Deletion safety: membership is replaced only from a complete listing, or cleared when the source root raises `DriveItemError` (404 / not shared). `DriveSourceError` (auth, quota, network) and incomplete listings never delete. Keep this split when touching `drive.py` or `Service._sync`.
 - Download and export errors are per file: `GoogleDriveBackend.download` raises `DriveDownloadError` (stored with the `download: ` prefix and retried on every sync); only HTTP 401 and connection errors raise `DriveSourceError`, which stops the pass and skips deletions. Docs and Slides over the 10 MB export limit fall back to a `text/plain` export (`Download.suffix` becomes `.txt`).
 - A sync holds an `flock` on `<data_dir>/sync.lock` and writes its PID to `sync.running`; `sync_running()` reads only the PID file. A second sync raises `SyncBusy`.
-- Extraction failures are per file (stored as `status='error'`, retried after 24 hours or when the file changes). Missing LibreOffice raises `ExtractionError("converter_missing")`; missing OCR libraries or model files set `metadata.ocr_unavailable`. Neither may become a service error.
+- Extraction failures are per file (stored as `status='error'`, retried after 24 hours or when the file changes). Missing LibreOffice raises `ExtractionError("converter_missing")`; a missing `tesseract` binary or language data sets `metadata.ocr_unavailable`. Neither may become a service error.
+- OCR (`ocr.py`): `pdf-inspector` reads text PDFs and lists `pages_needing_ocr`; only those pages are rendered with `pypdfium2` at 300 dpi and sent as grayscale PNG on stdin to `tesseract stdin stdout -l <GDRAG_OCR_LANGS>` (default `vie+eng`) with a per-page timeout. Images go to Tesseract directly. Spans keep `page:N` locators with `source` `native` or `ocr`. `metadata.ocr_engine` records the engine; `service._stale_ocr` re-extracts a document with OCR pages once when that engine differs (the old PP-OCR text) or when it was `ocr_unavailable` and OCR now works. Documents without OCR pages are never re-extracted. Tests use `tests/helpers.py:FakeOCR` or a fake `tesseract` script.
 - Embeddings: vectors are truncated to `embedding_dimensions` (1024) and re-normalized client-side; no `dimensions` field is sent. Only queries get the `Instruct: ...\nQuery:` prefix. `meta.embedding_identity` records endpoint, model and dims; when it changes, `embed_pending` deletes all vectors and re-embeds, and search stays FTS-only until then. A chunk the endpoint rejects (`EmbeddingError.rejected`: HTTP 400/413/422) is isolated by splitting its batch and stored in `embedding_failures`; other embedding errors stop the pass.
 - FTS rows follow `chunks` through triggers; `fts_fold` (NFC + đ→d) plus `remove_diacritics 2` makes Vietnamese search accent-insensitive.
 - Folder ancestry (migration 3): `folders` (Drive ID, name, parent ID, display path), `folder_sources` membership (same replace/keep rules as `document_sources`), `documents.parent_id`, and `document_folders` holding every ancestor folder of each document. `_refresh_ancestry` recomputes paths and `document_folders` from parent IDs at the end of each sync and on `source remove`, so a folder rename or move never re-extracts or re-embeds. When two listings report one folder, the non-empty parent wins; the stored parent is kept only when a source that held the folder failed or was incomplete, or the pass stopped. A pass stopped by `DriveSourceError` replaces neither `document_sources` nor `folder_sources`. A hit's `parent_folder_id` is null when that folder is not indexed. A file-kind source's parent folder is not in `folders`, so it is not listable.

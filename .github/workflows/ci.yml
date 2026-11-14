@@ -25,15 +25,23 @@ jobs:
         with:
           python-version: ${{ matrix.python-version }}
           cache: pip
+      - name: Install Tesseract with Vietnamese and English data (for the real-OCR test)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            tesseract-ocr tesseract-ocr-vie tesseract-ocr-eng fonts-dejavu-core
       - run: pip install -e '.[dev]'
       - run: ruff format --check .
       - run: ruff check .
       - run: mypy
-      - run: pytest -q
+      - run: pytest -q -rs
+      - name: The real-OCR test must have run, not been skipped
+        shell: bash  # -eo pipefail, so a failing pytest is not hidden by tee
+        run: pytest -q -rs -k real_tesseract | tee ocr.log && ! grep -q SKIPPED ocr.log
       - run: python -m compileall -q src tests
 
   docker:
-    # Builds the image on x86_64. The build runs a real OCR pass, so it also checks the OCR runtime.
+    # Builds the image on x86_64. The build runs a real Tesseract pass on Vietnamese text.
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4

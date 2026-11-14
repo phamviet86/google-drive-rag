@@ -21,7 +21,8 @@ Dịch vụ chạy trong một Docker container trên chính VPS, chỉ nhận k
 ## Dịch vụ làm gì
 
 - Đọc các thư mục, tệp hoặc bộ nhớ dùng chung (shared drive) mà bạn đưa link.
-- Hiểu Google Docs, Sheets, Slides, Word, Excel, PowerPoint (cả bản cũ `.doc`, `.xls`, `.ppt`), PDF (cả bản scan, nhờ nhận dạng chữ trong ảnh, gọi là OCR), RTF, Markdown, văn bản, JSON, CSV và trang HTML.
+- Hiểu Google Docs, Sheets, Slides, Word, Excel, PowerPoint (cả bản cũ `.doc`, `.xls`, `.ppt`), PDF (cả bản scan, nhờ nhận dạng chữ trong ảnh, gọi là OCR), ảnh chụp tài liệu (`.jpg`, `.png`, `.webp`), RTF, Markdown, văn bản, JSON, CSV và trang HTML.
+- Đọc được chữ tiếng Việt có dấu và tiếng Anh trong bản scan và ảnh chụp. Cách thêm ngôn ngữ khác ở phần "Việc thường ngày".
 - Cứ 15 phút kiểm tra Drive một lần: tệp mới được thêm, tệp sửa được đọc lại, tệp bị xóa hoặc thôi chia sẻ thì bị bỏ khỏi chỉ mục. Chỉ mục (index) là bản sao đã sắp xếp để tìm nhanh, nằm trên VPS.
 - Chỉ đọc. Dịch vụ không bao giờ sửa hay xóa gì trên Drive.
 
@@ -192,6 +193,29 @@ sudo docker compose exec gdrive-rag gdrive-rag search "báo cáo thuế" --folde
 
 Dữ liệu chỉ mục nằm trong ổ Docker tên `gdrive-rag-data`, nên vẫn còn khi bạn dựng lại container.
 
+### Đọc bản scan bằng ngôn ngữ khác
+
+Mặc định dịch vụ đọc chữ trong bản scan bằng tiếng Việt và tiếng Anh. Muốn thêm một ngôn ngữ, ví dụ tiếng Pháp (mã `fra`):
+
+1. Mở tệp `Dockerfile`, tìm dòng `tesseract-ocr tesseract-ocr-vie tesseract-ocr-eng` và thêm `tesseract-ocr-fra` vào cuối dòng đó.
+2. Thêm dòng sau vào tệp `.env` (tạo tệp từ `.env.example` nếu chưa có):
+
+   ```text
+   GDRAG_OCR_LANGS=vie+eng+fra
+   ```
+
+3. Dựng lại dịch vụ:
+
+   ```bash
+   sudo docker compose up -d --build
+   ```
+
+   Kết quả: các bản scan mới hoặc vừa sửa được đọc bằng cả ba ngôn ngữ. Mã của mỗi ngôn ngữ là phần cuối tên gói, ví dụ `tesseract-ocr-jpn` là `jpn`.
+
+> **Lưu ý:** Thêm nhiều ngôn ngữ làm việc đọc bản scan chậm hơn và đôi khi nhầm chữ hơn. Chỉ thêm ngôn ngữ mà tài liệu của bạn thật sự dùng.
+
+Sau khi cập nhật lên bản này, các bản scan đã đọc bằng bộ nhận dạng cũ được đọc lại một lần ở lần đọc Drive kế tiếp. Các tệp khác không bị đọc lại.
+
 ## Xử lý sự cố
 
 | Hiện tượng | Nguyên nhân | Cách xử lý |
@@ -200,5 +224,5 @@ Dữ liệu chỉ mục nằm trong ổ Docker tên `gdrive-rag-data`, nên vẫ
 | Báo `Google sign-in expired` | Đăng nhập Gmail hết hạn sau 7 ngày (ứng dụng ở chế độ Testing) | Chạy `auth google`, hoặc chuyển sang tài khoản dịch vụ |
 | `Permission denied` khi đọc `/secrets/google.json` | Tệp chưa giao cho dịch vụ | Chạy lại bước 4 |
 | `status` báo tệp lỗi | Tệp hỏng, có mật khẩu hoặc quá 200 MB | Mở tệp trên Drive để kiểm tra; các tệp khác không bị ảnh hưởng |
-| `ocr_unavailable` lớn hơn 0 | Bộ nhận dạng chữ không chạy được, trang scan chưa có chữ | Dựng lại container bằng bước 5 và xem nhật ký |
+| `ocr_unavailable` lớn hơn 0 | Thiếu chương trình Tesseract hoặc dữ liệu của một ngôn ngữ trong `GDRAG_OCR_LANGS`, nên trang scan chưa có chữ | Kiểm tra mục "Đọc bản scan bằng ngôn ngữ khác", rồi dựng lại container bằng bước 5. Tệp sẽ được đọc lại khi OCR chạy được |
 | Claude Code không thấy công cụ | Dịch vụ chưa chạy hoặc chưa đăng ký | Chạy `sudo docker compose ps`, rồi lặp lại phần "Kết nối với Claude Code" |

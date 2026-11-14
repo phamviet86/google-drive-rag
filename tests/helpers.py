@@ -179,6 +179,23 @@ class FakeEmbeddings:
         return self._vector(body)
 
 
+class FakeOCR:
+    """Stands in for Tesseract: returns ``text`` for every page and records the PNGs it got."""
+
+    def __init__(self, text: str = "Hợp đồng quét", name: str = "tesseract-5"):
+        self.text = text
+        self.name = name
+        self.ready = True
+        self.images: list[bytes] = []
+
+    def available(self) -> bool:
+        return self.ready
+
+    def recognize(self, png: bytes) -> str:
+        self.images.append(png)
+        return self.text
+
+
 def fake_converter(source: Path, target: str, outdir: Path) -> Path:
     """Stands in for LibreOffice: the 'legacy' file holds plain text; build a real docx/pptx."""
     text = source.read_bytes().decode("utf-8")
@@ -192,9 +209,12 @@ def make_service(
     drive: FakeDrive | None = None,
     embeddings: FakeEmbeddings | None = None,
     converter: Callable[[Path, str, Path], Path] = fake_converter,
+    ocr: FakeOCR | None = None,
     **settings: Any,
 ) -> Service:
-    base = replace(Settings(data_dir=tmp, ocr_enabled=False, google_auth="service_account"))
+    base = replace(
+        Settings(data_dir=tmp, ocr_enabled=ocr is not None, google_auth="service_account")
+    )
     configured = replace(base, **settings)
     backend = drive or FakeDrive()
 
@@ -206,7 +226,7 @@ def make_service(
         backend_factory=(lambda _: backend) if drive is not None else no_backend,
         embedding_factory=lambda _: embeddings,
         extractor_factory=lambda s: Extractor(
-            None, ocr_enabled=False, converter=converter, work_dir=s.work_dir
+            ocr, ocr_enabled=ocr is not None, converter=converter, work_dir=s.work_dir
         ),
     )
 
@@ -263,6 +283,26 @@ def make_pptx(title: str = "Kế hoạch quý") -> bytes:
     notes.text = "Nhắc khách hàng về hạn chót"
     buffer = io.BytesIO()
     presentation.save(buffer)
+    return buffer.getvalue()
+
+
+def make_scanned_pdf(text_page: str | None = "Native text page") -> bytes:
+    """A PDF whose last page is only an image (no text layer); optionally a text page first."""
+    from PIL import Image, ImageDraw
+    from reportlab.lib.utils import ImageReader
+    from reportlab.pdfgen import canvas
+
+    picture = Image.new("RGB", (800, 300), "white")
+    ImageDraw.Draw(picture).rectangle((40, 40, 760, 260), outline="black", width=6)
+    buffer = io.BytesIO()
+    pdf = canvas.Canvas(buffer)
+    if text_page:
+        for row in range(30):  # a full text layer, so this page is not routed to OCR
+            pdf.drawString(72, 750 - row * 22, f"{text_page} line {row}: rent is due on day 5.")
+        pdf.showPage()
+    pdf.drawImage(ImageReader(picture), 72, 400, width=450, height=170)
+    pdf.showPage()
+    pdf.save()
     return buffer.getvalue()
 
 

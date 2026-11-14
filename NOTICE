@@ -6,10 +6,11 @@ This product is licensed under the Apache License, Version 2.0 (see LICENSE).
 Portions of this product are copied or adapted from local-rag-mcp
 (https://github.com/phamviet86/local-rag-mcp, Apache License 2.0, same author):
 
-- src/gdrive_rag/builder.py, formats.py, xlsx_compat.py, ocr_runtime.py,
-  extraction_errors.py, models.py: copied, with small trims (markitdown removed).
-- src/gdrive_rag/extract.py: PDF/OCR, DOCX and XLSX extractors and cell formatting
-  adapted from local_rag/extract.py; PPTX, XLS/XLSB and LibreOffice conversion are new.
+- src/gdrive_rag/builder.py, formats.py, xlsx_compat.py, extraction_errors.py,
+  models.py: copied, with small trims (markitdown removed).
+- src/gdrive_rag/extract.py: PDF, DOCX and XLSX extractors and cell formatting
+  adapted from local_rag/extract.py; PPTX, XLS/XLSB, LibreOffice conversion and
+  Tesseract OCR (src/gdrive_rag/ocr.py) are new.
 - src/gdrive_rag/drive.py: Drive listing, export and error classification adapted
   from local_rag/drive.py.
 - src/gdrive_rag/db.py: connection setup and accent folding (fts_fold) adapted
@@ -19,3 +20,10 @@ Portions of this product are copied or adapted from local-rag-mcp
   local_rag/search.py.
 - src/gdrive_rag/embeddings.py: OpenAI-compatible client adapted from
   local_rag/embeddings.py.
+
+Third-party software used at run time (not copied into this repository):
+
+- Tesseract OCR 5 and its language data (Apache License 2.0), installed from
+  Debian packages and run as a separate program.
+- pypdfium2 and the PDFium library it bundles (Apache License 2.0 / BSD-3-Clause),
+  installed from PyPI to render scanned PDF pages.

@@ -3,6 +3,7 @@ from pathlib import Path
 from helpers import FakeDrive, make_service
 
 from gdrive_rag.drive import DriveSourceError
+from gdrive_rag.extract import Extractor
 
 ROOT_A = "folderAAAAAAAAAAAA"
 ROOT_B = "folderBBBBBBBBBBBB"
@@ -148,3 +149,71 @@ def test_sync_running_never_takes_the_lock(tmp_path: Path, monkeypatch) -> None:
     assert service.sync_running() is False
     (tmp_path / "sync.running").write_text(str(2**22 + os.getpid()))  # no such process
     assert service.sync_running() is False
+
+
+def test_old_ocr_text_is_re_extracted_once_and_text_files_are_left_alone(tmp_path: Path) -> None:
+    from helpers import FakeEmbeddings, FakeOCR, make_scanned_pdf
+
+    drive = FakeDrive()
+    drive.add_root(ROOT_A, "Phòng A")
+    drive.put(ROOT_A, "fileText00000000", "a.txt", b"hello from a")
+    drive.put(
+        ROOT_A, "fileScan00000000", "scan.pdf", make_scanned_pdf(None), mime="application/pdf"
+    )
+    embeddings = FakeEmbeddings()
+    old_ocr = FakeOCR("HP DONG cu", name="pp-ocrv6")
+    service = make_service(tmp_path, drive, embeddings, ocr=old_ocr)
+    service.add_sources([ROOT_A])
+    service.sync()
+    with service.db.transaction() as connection:  # data written at ced9af1 has no ocr_engine
+        connection.execute(
+            "UPDATE documents SET metadata_json=json_remove(metadata_json, '$.ocr_engine')"
+        )
+    embedded = list(embeddings.embedded)
+    new_ocr = FakeOCR("Hợp đồng thuê mặt bằng")
+    service.extractor_factory = lambda s: Extractor(new_ocr, ocr_enabled=True, work_dir=s.work_dir)
+    drive.downloads.clear()
+    report = service.sync()
+    assert drive.downloads == ["fileScan00000000"]  # only the OCR'd file is fetched again
+    assert report["indexed"] == 1 and report["unchanged"] == 1
+    assert embeddings.embedded[len(embedded) :] == ["Hợp đồng thuê mặt bằng"]
+    assert service.search("hợp đồng")["results"][0]["file_name"] == "scan.pdf"
+    drive.downloads.clear()
+    assert service.sync()["unchanged"] == 2 and drive.downloads == []
+
+
+def test_scan_indexed_without_ocr_is_retried_when_ocr_becomes_available(tmp_path: Path) -> None:
+    from helpers import FakeOCR, make_scanned_pdf
+
+    drive = FakeDrive()
+    drive.add_root(ROOT_A, "Phòng A")
+    drive.put(
+        ROOT_A, "fileScan00000000", "scan.pdf", make_scanned_pdf(None), mime="application/pdf"
+    )
+    ocr = FakeOCR("Biên bản nghiệm thu")
+    ocr.ready = False  # tesseract not installed yet
+    service = make_service(tmp_path, drive, ocr=ocr)
+    service.add_sources([ROOT_A])
+    service.sync()
+    assert service.status()["documents"]["ocr_unavailable"] == 1
+    drive.downloads.clear()
+    service.sync()
+    assert drive.downloads == []  # still unavailable: no pointless re-extraction
+    ocr.ready = True
+    service.sync()
+    assert drive.downloads == ["fileScan00000000"]
+    assert service.status()["documents"]["ocr_unavailable"] == 0
+    assert names(service, "nghiệm thu") == ["scan.pdf"]
+
+
+def test_ocr_languages_setting(tmp_path: Path, monkeypatch) -> None:
+    import pytest
+
+    from gdrive_rag.config import load_settings
+
+    assert load_settings(tmp_path, use_env=False).ocr_langs == "vie+eng"
+    monkeypatch.setenv("GDRAG_OCR_LANGS", " vie + eng + fra ")
+    assert load_settings(tmp_path).ocr_langs == "vie+eng+fra"
+    monkeypatch.setenv("GDRAG_OCR_LANGS", "vie; rm -rf /")
+    with pytest.raises(ValueError, match="ocr_langs"):
+        load_settings(tmp_path)

@@ -81,12 +81,13 @@ def default_embeddings(settings: Settings) -> EmbeddingClient | None:
 
 
 def default_extractor(settings: Settings) -> Extractor:
-    from .ocr_runtime import OCRRuntimeManager
+    from .ocr import TesseractOCR
 
-    runtime = None
-    if settings.ocr_dir is not None:
-        runtime = OCRRuntimeManager(settings.ocr_dir / "runtime", settings.ocr_dir / "models")
-    return Extractor(runtime, ocr_enabled=settings.ocr_enabled, work_dir=settings.work_dir)
+    return Extractor(
+        TesseractOCR(settings.ocr_langs),
+        ocr_enabled=settings.ocr_enabled,
+        work_dir=settings.work_dir,
+    )
 
 
 class Service:
@@ -355,14 +356,17 @@ class Service:
         with self.db.read() as connection:
             current = connection.execute(
                 "SELECT id, fingerprint, status, error, indexed_at, name, path, web_url, "
-                "parent_id FROM documents WHERE file_id=?",
+                "parent_id, metadata_json FROM documents WHERE file_id=?",
                 (item.id,),
             ).fetchone()
         if current is not None and current["fingerprint"] == item.fingerprint:
-            retry = current["status"] == "error" and (
-                str(current["error"] or "").startswith(DOWNLOAD_ERROR_PREFIX)
-                or _older_than(current["indexed_at"], ERROR_RETRY_HOURS)
-            )
+            retry = (
+                current["status"] == "error"
+                and (
+                    str(current["error"] or "").startswith(DOWNLOAD_ERROR_PREFIX)
+                    or _older_than(current["indexed_at"], ERROR_RETRY_HOURS)
+                )
+            ) or _stale_ocr(current["metadata_json"], extractor)
             if not retry:
                 if (
                     current["name"],
@@ -818,6 +822,17 @@ def _source_json(row: Any) -> dict[str, Any]:
         "documents": int(row["documents"]) if "documents" in keys else None,
         "last_sync_at": row["last_sync_at"],
     }
+
+
+def _stale_ocr(metadata_json: str | None, extractor: Extractor) -> bool:
+    """A document with OCR'd pages is re-extracted once when its text came from another OCR
+    engine (the PP-OCR text before Tesseract), or when OCR was unavailable and now works.
+    Documents without OCR pages are never touched, so their vectors stay as they are."""
+    metadata = json.loads(metadata_json or "{}")
+    if not metadata.get("pages_needing_ocr") or not extractor.ocr_ready():
+        return False  # no OCR pages, or OCR cannot run now: keep the stored text
+    engine = extractor.ocr.name if extractor.ocr is not None else None
+    return metadata.get("ocr_engine") != engine or bool(metadata.get("ocr_unavailable"))
 
 
 def _folder_json(row: Any) -> dict[str, Any]:

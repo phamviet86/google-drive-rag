@@ -1,9 +1,12 @@
 """Turn a downloaded file into text with locators (page, slide, sheet/row, ...).
 
-Adapted from local-rag-mcp (Apache-2.0): the PDF/OCR, DOCX, XLSX and text extractors are copied;
+Adapted from local-rag-mcp (Apache-2.0): the PDF, DOCX, XLSX and text extractors are copied;
 PPTX now includes tables, grouped shapes and speaker notes; legacy XLS/XLSB are read with
 python-calamine; DOC/PPT/RTF are converted with headless LibreOffice first. A missing optional
 tool is always a per-file error or flag, never a service error.
+
+OCR: pdf-inspector reads text PDFs and names the pages without a usable text layer; only those
+pages are rendered and passed to Tesseract (``ocr.py``). Images go to Tesseract directly.
 """
 
 from __future__ import annotations
@@ -14,7 +17,7 @@ import re
 import shutil
 import subprocess
 import tempfile
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Iterable, Iterator
 from contextlib import ExitStack
 from pathlib import Path
 from typing import Any
@@ -23,7 +26,7 @@ from . import formats
 from .builder import Builder
 from .extraction_errors import ExtractionError
 from .models import ExtractedDocument
-from .ocr_runtime import OCRRuntimeManager
+from .ocr import OcrEngine, OcrFailed, render_pdf_pages, to_png
 from .xlsx_compat import (
     STYLES_PART,
     color_failure,
@@ -42,8 +45,6 @@ SUPPORTED_SUFFIXES = frozenset(
         ".odt", ".ods", ".odp", *IMAGE_SUFFIXES,
     }
 )  # fmt: skip
-IMAGE_MAX_SIDE = 4096
-IMAGE_PDF_DPI = 200
 CONVERT_TIMEOUT_SECONDS = 300
 
 # (source file, target extension, output directory) -> converted file
@@ -86,13 +87,13 @@ def libreoffice_convert(source: Path, target: str, outdir: Path) -> Path:
 class Extractor:
     def __init__(
         self,
-        ocr_runtime: OCRRuntimeManager | None,
+        ocr: OcrEngine | None,
         *,
         ocr_enabled: bool = True,
         converter: Converter = libreoffice_convert,
         work_dir: Path | None = None,
     ):
-        self.ocr_runtime = ocr_runtime
+        self.ocr = ocr
         self.ocr_enabled = ocr_enabled
         self.converter = converter
         self.work_dir = work_dir
@@ -138,70 +139,67 @@ class Extractor:
         media = mimetypes.guess_type(path.name)[0] or document.media_type
         return ExtractedDocument(document.text, document.spans, media, metadata)
 
-    def _ocr_ready(self) -> bool:
-        """Native libraries and the pinned model files are present (OCR runs offline)."""
-        runtime = self.ocr_runtime
-        return bool(
-            self.ocr_enabled
-            and runtime
-            and runtime.configure()
-            and runtime.resolved_model_dir() is not None
-        )
+    def ocr_ready(self) -> bool:
+        """OCR is on and Tesseract with its language data is installed."""
+        return bool(self.ocr_enabled and self.ocr is not None and self.ocr.available())
 
     def _ocr(
-        self, run: Callable[[str | None], Any], routed: list[int]
+        self, images: Callable[[], Iterable[tuple[int, bytes | None]]], routed: list[int]
     ) -> tuple[dict[int, dict[str, Any]], list[dict[str, Any]]]:
-        """Run local OCR for ``routed`` 1-based pages; return page texts and problems."""
+        """OCR the 1-based ``routed`` pages as ``images`` yields them, one at a time; return
+        page texts and per-page problems."""
         pages: dict[int, dict[str, Any]] = {}
         problems: list[dict[str, Any]] = []
-        runtime = self.ocr_runtime
-        if runtime is None or not self._ocr_ready():
+        if self.ocr is None or not self.ocr_ready():
             problems.extend({"page": page, "reason": "ocr_unavailable"} for page in routed)
             return pages, problems
+        seen: set[int] = set()
         try:
-            result = run(str(runtime.resolved_model_dir()))
-            for ocr_page in result.pages:
-                number = int(ocr_page.page_number)
-                markdown = (ocr_page.markdown or "").strip()
-                if markdown:
-                    pages[number] = {"text": markdown, "source": "ocr"}
+            for page, png in images():
+                seen.add(page)
+                if png is None:
+                    problems.append({"page": page, "reason": "ocr_failed", "error": "render"})
+                    continue
+                try:
+                    text = self.ocr.recognize(png)
+                except OcrFailed as exc:
+                    problems.append({"page": page, "reason": "ocr_failed", "error": str(exc)})
+                    continue
+                if text:
+                    pages[page] = {"text": text, "source": "ocr"}
                 else:
-                    problems.append({"page": number, "reason": "ocr_blank"})
-        except Exception as exc:
+                    problems.append({"page": page, "reason": "ocr_blank"})
+        except Exception as exc:  # the PDF could not be opened for rendering
+            error = f"render: {type(exc).__name__}"
             problems.extend(
-                {"page": page, "reason": "ocr_failed", "error": type(exc).__name__}
+                {"page": page, "reason": "ocr_failed", "error": error}
                 for page in routed
+                if page not in seen
             )
         return pages, problems
 
-    def _image(self, path: Path) -> ExtractedDocument:
-        """OCR a photo or scan as one page: wrap it in a PDF and reuse the PDF OCR path."""
-        import io
+    def _ocr_metadata(self, routed: list[int], problems: list[dict[str, Any]]) -> dict[str, Any]:
+        metadata = _ocr_metadata(routed, problems)
+        if routed and self.ocr is not None:
+            metadata["ocr_engine"] = self.ocr.name
+        return metadata
 
-        import pdf_inspector
+    def _image(self, path: Path) -> ExtractedDocument:
+        """OCR a photo or scan as one page."""
         from PIL import Image, ImageOps
 
         try:
             with Image.open(path) as source:
-                image = ImageOps.exif_transpose(source).convert("RGB")
+                image = ImageOps.exif_transpose(source)
+                image.load()
         except Exception as exc:
             raise ExtractionError("image_unreadable") from exc
-        if max(image.size) > IMAGE_MAX_SIDE:
-            image.thumbnail((IMAGE_MAX_SIDE, IMAGE_MAX_SIDE))
-        buffer = io.BytesIO()
-        image.save(buffer, "PDF", resolution=IMAGE_PDF_DPI)
-        pdf = buffer.getvalue()
-        pages, problems = self._ocr(
-            lambda model: pdf_inspector.process_pdf_with_ocr_bytes(
-                pdf, page_numbers=[1], model_directory=model, offline=True
-            ),
-            [1],
-        )
+        pages, problems = self._ocr(lambda: [(1, to_png(image))], [1])
         builder = Builder()
         for number, page in sorted(pages.items()):
             builder.add(page["text"], "pdf_page", f"page:{number}", {"source": page["source"]})
         return ExtractedDocument(
-            builder.text, builder.spans, _media(path), _ocr_metadata([1], problems)
+            builder.text, builder.spans, _media(path), self._ocr_metadata([1], problems)
         )
 
     def _pdf(self, path: Path) -> ExtractedDocument:
@@ -221,17 +219,15 @@ class Extractor:
                 pages[number] = {"text": markdown, "source": "native"}
         problems: list[dict[str, Any]] = []
         if routed:
-            ocr_pages, problems = self._ocr(
-                lambda model: pdf_inspector.process_pdf_with_ocr(
-                    str(path), page_numbers=routed, model_directory=model, offline=True
-                ),
-                routed,
-            )
-            pages.update(ocr_pages)
+            ocr_pages, problems = self._ocr(lambda: render_pdf_pages(path, routed), routed)
+            pages.update(ocr_pages)  # a routed page's thin text layer gives way to OCR text
         builder = Builder()
         for number, page in sorted(pages.items()):
             builder.add(page["text"], "pdf_page", f"page:{number}", {"source": page["source"]})
-        metadata = {"page_count": int(classification.page_count), **_ocr_metadata(routed, problems)}
+        metadata = {
+            "page_count": int(classification.page_count),
+            **self._ocr_metadata(routed, problems),
+        }
         return ExtractedDocument(builder.text, builder.spans, "application/pdf", metadata)
 
 

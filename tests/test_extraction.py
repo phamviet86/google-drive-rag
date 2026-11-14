@@ -2,7 +2,15 @@ import json
 from pathlib import Path
 
 import pytest
-from helpers import fake_converter, make_docx, make_pdf, make_pptx, make_xlsx
+from helpers import (
+    FakeOCR,
+    fake_converter,
+    make_docx,
+    make_pdf,
+    make_pptx,
+    make_scanned_pdf,
+    make_xlsx,
+)
 
 from gdrive_rag.chunking import make_chunks
 from gdrive_rag.extract import Extractor, _calamine, libreoffice_convert
@@ -102,65 +110,157 @@ def test_unsupported_type(tmp_path: Path) -> None:
         extract(tmp_path, "o.bin", b"x")
 
 
-def test_real_ocr_when_runtime_is_provisioned(tmp_path: Path) -> None:
-    """Runs only with GDRAG_TEST_OCR_DIR=<dir from `python -m gdrive_rag.ocr_runtime DIR`>."""
-    import os
+def test_mixed_pdf_keeps_text_pages_and_ocrs_scanned_pages(tmp_path: Path) -> None:
+    from PIL import Image
 
-    from PIL import Image, ImageDraw, ImageFont
+    path = tmp_path / "mixed.pdf"
+    path.write_bytes(make_scanned_pdf())
+    ocr = FakeOCR("Hợp đồng thuê mặt bằng")
+    document = Extractor(ocr, ocr_enabled=True).extract(path)
+    assert document.metadata["pages_needing_ocr"] == [2]
+    assert document.metadata["ocr_engine"] == "tesseract-5"
+    assert [(s.locator, s.metadata.get("source")) for s in document.spans] == [
+        ("page:1", "native"),
+        ("page:2", "ocr"),
+    ]
+    assert "Native text page" in document.text and "Hợp đồng thuê mặt bằng" in document.text
+    assert len(ocr.images) == 1  # only the scanned page is rendered and OCR'd
+    import io
 
-    from gdrive_rag.ocr_runtime import OCRRuntimeManager
+    rendered = Image.open(io.BytesIO(ocr.images[0]))
+    assert rendered.format == "PNG" and rendered.mode == "L"
+    assert abs(rendered.width - 595.28 * 300 / 72) <= 2  # reportlab's A4 at 300 dpi
 
-    root = os.environ.get("GDRAG_TEST_OCR_DIR")
-    if not root:
-        pytest.skip("set GDRAG_TEST_OCR_DIR to run real OCR")
-    image = Image.new("RGB", (1200, 400), "white")
-    ImageDraw.Draw(image).text(
-        (40, 120), "INVOICE NUMBER 2026", fill="black", font=ImageFont.load_default(64)
+
+def test_image_goes_straight_to_ocr(tmp_path: Path) -> None:
+    from PIL import Image
+
+    path = tmp_path / "scan.jpg"
+    Image.new("RGB", (300, 120), "white").save(path)
+    ocr = FakeOCR("Biên bản họp")
+    document = Extractor(ocr, ocr_enabled=True).extract(path)
+    assert [span.locator for span in document.spans] == ["page:1"]
+    assert document.text == "Biên bản họp" and "ocr_unavailable" not in document.metadata
+
+
+def test_blank_ocr_result_is_flagged(tmp_path: Path) -> None:
+    path = tmp_path / "scan.pdf"
+    path.write_bytes(make_scanned_pdf(None))
+    document = Extractor(FakeOCR(""), ocr_enabled=True).extract(path)
+    assert document.metadata["ocr_problems"] == [{"page": 1, "reason": "ocr_blank"}]
+
+
+def fake_tesseract(tmp_path: Path, langs: str, body: str = "print('Hợp đồng')") -> str:
+    """An executable that answers like ``tesseract``: --list-langs, then OCR from stdin."""
+    import sys
+
+    script = tmp_path / "tesseract"
+    script.write_text(
+        f"#!{sys.executable}\n"
+        "import sys, time\n"
+        "if sys.argv[1:] == ['--list-langs']:\n"
+        f"    print('List of available languages in \"/x\" ({len(langs.split())}):')\n"
+        f"    print({langs!r}.replace(' ', '\\n'))\n"
+        "    sys.exit(0)\n"
+        "assert sys.argv[1:3] == ['stdin', 'stdout'] and sys.stdin.buffer.read(8)\n"
+        f"{body}\n",
+        encoding="utf-8",
     )
-    pdf = tmp_path / "scan.pdf"
-    image.save(pdf, "PDF", resolution=150)
-    runtime = OCRRuntimeManager(Path(root) / "runtime", Path(root) / "models")
-    document = Extractor(runtime, ocr_enabled=True).extract(pdf)
-    assert "INVOICE" in document.text and document.metadata["pages_needing_ocr"] == [1]
+    script.chmod(0o755)
+    return str(script)
+
+
+def test_tesseract_subprocess_and_missing_pieces(tmp_path: Path) -> None:
+    from gdrive_rag.ocr import TesseractOCR
+
+    image = tmp_path / "scan.png"
+    from PIL import Image
+
+    Image.new("RGB", (200, 100), "white").save(image)
+    working = TesseractOCR("vie+eng", binary=fake_tesseract(tmp_path, "eng osd vie"))
+    document = Extractor(working, ocr_enabled=True).extract(image)
+    assert document.text == "Hợp đồng"
+    for engine in (
+        TesseractOCR("vie+eng", binary=None),  # binary missing
+        TesseractOCR("vie+eng", binary=str(tmp_path / "nope")),  # path does not exist
+        TesseractOCR("vie+eng", binary=fake_tesseract(tmp_path, "eng osd")),  # no vie data
+    ):
+        document = Extractor(engine, ocr_enabled=True).extract(image)
+        assert document.metadata["ocr_unavailable"] is True and document.text == ""
+
+
+def test_tesseract_timeout_is_a_page_problem(tmp_path: Path) -> None:
+    from gdrive_rag.ocr import TesseractOCR
+
+    path = tmp_path / "scan.pdf"
+    path.write_bytes(make_scanned_pdf(None))
+    slow = TesseractOCR("vie", binary=fake_tesseract(tmp_path, "vie", "time.sleep(5)"), timeout=0.5)
+    document = Extractor(slow, ocr_enabled=True).extract(path)
+    assert document.metadata["ocr_problems"] == [
+        {"page": 1, "reason": "ocr_failed", "error": "timeout"}
+    ]
     assert "ocr_unavailable" not in document.metadata
 
 
-def test_missing_model_files_mean_ocr_unavailable(tmp_path: Path) -> None:
-    """Native libraries present but no pinned model files: unavailable, not a failed OCR run."""
-    from PIL import Image
+def test_real_tesseract_keeps_vietnamese_diacritics(tmp_path: Path) -> None:
+    """Runs only when `tesseract` with Vietnamese and English data is on PATH (CI installs it)."""
+    from PIL import Image, ImageDraw, ImageFont
 
-    class LibrariesOnly:
-        def configure(self) -> bool:
-            return True
+    from gdrive_rag.ocr import FONT_CANDIDATES, SELF_TEST_TEXT, TesseractOCR, self_test
 
-        def resolved_model_dir(self) -> None:
-            return None
+    engine = TesseractOCR("vie+eng")
+    if not engine.available():
+        pytest.skip("tesseract with vie+eng data is not installed")
+    font = next((f for f in FONT_CANDIDATES if Path(f).is_file()), None)
+    if font is None:
+        pytest.skip("no font with Vietnamese letters")
+    assert "HỢP ĐỒNG" in self_test(engine, font)
+    picture = Image.new("RGB", (1800, 320), "white")
+    draw = ImageDraw.Draw(picture)
+    for row, line in enumerate(SELF_TEST_TEXT):
+        draw.text((40, 50 + row * 120), line, font=ImageFont.truetype(font, 44), fill="black")
+    path = tmp_path / "scan.pdf"
+    picture.save(path, resolution=300)  # an image-only PDF; renders back at the same size
+    document = Extractor(engine, ocr_enabled=True).extract(path)
+    assert document.metadata["pages_needing_ocr"] == [1]
+    assert "HỢP ĐỒNG" in document.text and "triệu đồng" in document.text
 
-    image = tmp_path / "scan.png"
-    Image.new("RGB", (200, 100), "white").save(image)
-    document = Extractor(LibrariesOnly(), ocr_enabled=True).extract(image)  # type: ignore[arg-type]
-    assert document.metadata["ocr_unavailable"] is True
-    assert "ocr_failed" not in json.dumps(document.metadata)
 
-
-def test_runtime_downloads_have_a_timeout(tmp_path: Path, monkeypatch) -> None:
+def test_pages_are_rendered_and_recognized_one_at_a_time(tmp_path: Path, monkeypatch) -> None:
     import io
-    import urllib.request
 
-    from gdrive_rag import ocr_runtime
+    from PIL import Image
+    from reportlab.lib.utils import ImageReader
+    from reportlab.pdfgen import canvas
 
-    seen: list[object] = []
+    from gdrive_rag import ocr as ocr_module
 
-    def fake_urlopen(url: str, timeout: object = None) -> io.BytesIO:
-        seen.append(timeout)
-        return io.BytesIO(b"model bytes")
+    picture = ImageReader(Image.new("RGB", (400, 200), "gray"))
+    buffer = io.BytesIO()
+    pdf = canvas.Canvas(buffer)
+    for _ in range(3):
+        pdf.drawImage(picture, 72, 400, width=300, height=150)
+        pdf.showPage()
+    pdf.setPageSize((5000, 3000))  # a poster-sized page: capped before rendering
+    pdf.drawImage(picture, 100, 100, width=4000, height=2000)
+    pdf.showPage()
+    pdf.save()
+    path = tmp_path / "scans.pdf"
+    path.write_bytes(buffer.getvalue())
+    events: list[str] = []
+    real_to_png = ocr_module.to_png
+    monkeypatch.setattr(
+        ocr_module, "to_png", lambda image: (events.append("render"), real_to_png(image))[1]
+    )
 
-    monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen)
-    target = tmp_path / "file.part"
-    ocr_runtime._download("https://example.invalid/x", target)
-    assert target.read_bytes() == b"model bytes"
-    assert seen == [ocr_runtime.DOWNLOAD_TIMEOUT_SECONDS]
-    manager = ocr_runtime.OCRRuntimeManager(tmp_path / "rt", tmp_path / "models")
-    with pytest.raises(RuntimeError, match="checksum mismatch"):
-        manager.fetch_models()  # goes through _download, so through the timeout
-    assert len(seen) == 2 and seen[-1] == ocr_runtime.DOWNLOAD_TIMEOUT_SECONDS
+    class Recording(FakeOCR):
+        def recognize(self, png: bytes) -> str:
+            events.append("ocr")
+            return super().recognize(png)
+
+    engine = Recording("chữ")
+    document = Extractor(engine, ocr_enabled=True).extract(path)
+    assert document.metadata["pages_needing_ocr"] == [1, 2, 3, 4]
+    assert events == ["render", "ocr"] * 4  # never more than one page bitmap at a time
+    poster = Image.open(io.BytesIO(engine.images[-1]))
+    assert max(poster.size) <= ocr_module.MAX_SIDE

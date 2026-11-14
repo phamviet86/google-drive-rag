@@ -7,29 +7,29 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     PIP_DISABLE_PIP_VERSION_CHECK=1
 
 # LibreOffice (headless) converts legacy .doc/.ppt/.rtf before extraction.
+# Tesseract 5 reads scanned pages and images (Vietnamese + English by default).
 RUN apt-get update \
  && apt-get install -y --no-install-recommends \
       libreoffice-writer-nogui libreoffice-calc-nogui libreoffice-impress-nogui \
+      tesseract-ocr tesseract-ocr-vie tesseract-ocr-eng \
       fonts-dejavu-core ca-certificates \
  && rm -rf /var/lib/apt/lists/* \
- && soffice --version
+ && soffice --version \
+ && tesseract --version
 
 WORKDIR /app
 COPY pyproject.toml README.md LICENSE NOTICE ./
 COPY src ./src
 RUN pip install .
 
-# Pinned OCR runtime (PDFium + ONNX Runtime) and PP-OCR models for this image's architecture.
-# provision_and_verify runs a real OCR pass, so a missing library fails the build here.
-RUN python -m gdrive_rag.ocr_runtime /opt/ocr \
- && rm -rf /opt/ocr/runtime/downloads
+# Real OCR pass on a generated Vietnamese line: the build fails if diacritics are lost.
+RUN python -m gdrive_rag.ocr
 
 RUN useradd --create-home --uid 10001 --shell /usr/sbin/nologin app \
  && mkdir -p /data \
- && chown -R app:app /data /opt/ocr
+ && chown -R app:app /data
 
 ENV GDRAG_DATA_DIR=/data \
-    GDRAG_OCR_DIR=/opt/ocr \
     GDRAG_HOST=0.0.0.0 \
     GDRAG_PORT=8765 \
     HOME=/home/app

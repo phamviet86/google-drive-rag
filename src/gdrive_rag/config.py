@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import tempfile
 from dataclasses import asdict, dataclass, replace
 from pathlib import Path
@@ -30,7 +31,9 @@ ENV_FIELDS = {
     "GDRAG_GOOGLE_AUTH": "google_auth",
     "GDRAG_SYNC_INTERVAL_MINUTES": "sync_interval_minutes",
     "GDRAG_OCR": "ocr_enabled",
+    "GDRAG_OCR_LANGS": "ocr_langs",
 }
+DEFAULT_OCR_LANGS = "vie+eng"  # Tesseract language codes joined with "+"
 
 
 @dataclass(frozen=True)
@@ -44,7 +47,7 @@ class Settings:
     google_auth: str = "none"
     sync_interval_minutes: int = 15
     ocr_enabled: bool = True
-    ocr_dir: Path | None = None
+    ocr_langs: str = DEFAULT_OCR_LANGS
     chunk_chars: int = 1500
     chunk_overlap: int = 200
 
@@ -91,6 +94,7 @@ class Settings:
             "google_auth": self.google_auth,
             "sync_interval_minutes": self.sync_interval_minutes,
             "ocr_enabled": self.ocr_enabled,
+            "ocr_langs": self.ocr_langs,
         }
 
 
@@ -116,9 +120,6 @@ def load_settings(data_dir: str | Path | None = None, *, use_env: bool = True) -
             raw = os.environ.get(env_name)
             if raw is not None and raw.strip():
                 values[key] = raw.strip()
-        ocr_dir = os.environ.get("GDRAG_OCR_DIR")
-        if ocr_dir:
-            values["ocr_dir"] = Path(ocr_dir)
     return _coerce(replace(settings, **values))
 
 
@@ -141,9 +142,18 @@ def _coerce(settings: Settings) -> Settings:
         google_auth=auth,
         sync_interval_minutes=max(1, int(settings.sync_interval_minutes)),
         ocr_enabled=bool(ocr),
+        ocr_langs=_ocr_langs(settings.ocr_langs),
         chunk_chars=int(settings.chunk_chars),
         chunk_overlap=int(settings.chunk_overlap),
     )
+
+
+def _ocr_langs(value: object) -> str:
+    langs = [part.strip() for part in str(value or "").replace(",", "+").split("+")]
+    langs = [part for part in langs if part]
+    if not langs or not all(re.fullmatch(r"[A-Za-z0-9_]+", part) for part in langs):
+        raise ValueError('ocr_langs must be Tesseract language codes such as "vie+eng"')
+    return "+".join(langs)
 
 
 def read_config(data_dir: Path) -> dict[str, Any]:
@@ -159,7 +169,7 @@ def read_config(data_dir: Path) -> dict[str, Any]:
 
 def save_config(data_dir: Path, changes: dict[str, Any]) -> Settings:
     """Merge ``changes`` into config.json (written atomically with mode 0600)."""
-    allowed = {f for f in asdict(Settings(data_dir=data_dir)) if f not in {"data_dir", "ocr_dir"}}
+    allowed = {f for f in asdict(Settings(data_dir=data_dir)) if f != "data_dir"}
     unknown = set(changes) - allowed
     if unknown:
         raise ValueError(f"unknown config keys: {', '.join(sorted(unknown))}")
