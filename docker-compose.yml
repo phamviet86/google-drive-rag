@@ -4,6 +4,10 @@ services:
     image: google-drive-rag:local
     restart: unless-stopped
     init: true  # reaps LibreOffice child processes and forwards stop signals
+    # Memory ceiling: an unusually large file can then only restart this service, not exhaust the
+    # host. Change it with GDRAG_MEMORY_LIMIT in .env (for example 4g).
+    mem_limit: ${GDRAG_MEMORY_LIMIT:-8g}
+    memswap_limit: ${GDRAG_MEMORY_LIMIT:-8g}
     env_file:
       - path: .env
         required: false
