@@ -16,16 +16,10 @@ class Chunk:
     ordinal: int
     text: str
     locator: str
-    chunk_hash: str  # hash of the embedding input (context line + text)
+    chunk_hash: str  # hash of the text only, so a rename or move keeps its vector
 
 
-def embedding_input(context: str, text: str) -> str:
-    return f"{context}\n{text}" if context else text
-
-
-def make_chunks(
-    document: ExtractedDocument, size: int, overlap: int, context: str = ""
-) -> list[Chunk]:
+def make_chunks(document: ExtractedDocument, size: int, overlap: int) -> list[Chunk]:
     """Split text into ~``size`` character windows on paragraph/line/word boundaries."""
     if size < 100 or not 0 <= overlap < size:
         raise ValueError("chunk size must be >= 100 and overlap smaller than the size")
@@ -48,7 +42,7 @@ def make_chunks(
         chunk_end = start + len(raw.rstrip())
         if body:
             spans = [s for s in document.spans if s.end > chunk_start and s.start < chunk_end]
-            digest = hashlib.sha256(embedding_input(context, body).encode()).hexdigest()
+            digest = hashlib.sha256(body.encode()).hexdigest()
             chunks.append(Chunk(len(chunks), body, summarize_locator(spans), digest))
         if end >= length:
             break

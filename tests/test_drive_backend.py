@@ -12,15 +12,25 @@ from googleapiclient.errors import HttpError
 from helpers import make_service
 
 from gdrive_rag.drive import (
+    EXPORTS,
     FOLDER_MIME,
     GOOGLE_DOC,
+    GOOGLE_SHEET,
+    GOOGLE_SLIDES,
+    Download,
+    DriveDownloadError,
+    DriveItem,
     DriveItemError,
     DriveRoot,
     DriveSourceError,
     GoogleDriveBackend,
     _api_error,
+    download_error,
     strip_data_images,
 )
+
+PPTX_MIME = EXPORTS[GOOGLE_SLIDES][0]
+XLSX_MIME = EXPORTS[GOOGLE_SHEET][0]
 
 ROOT = "rootFolder00000000"
 
@@ -176,7 +186,8 @@ def test_shared_drive_and_single_file_roots() -> None:
 def test_revoked_root_clears_documents_through_service(tmp_path: Path) -> None:
     stub = tree()
     backend = GoogleDriveBackend(service=stub)
-    backend.download = lambda item: b"noi dung bien ban"  # type: ignore[method-assign]
+    backend._export = lambda file_id, mime: b"noi dung bien ban"  # type: ignore[method-assign]
+    backend._media = lambda file_id: b"not a real file"  # type: ignore[method-assign]
     service = make_service(tmp_path)
     service.backend_factory = lambda _: backend
     service.add_sources([ROOT])
@@ -198,3 +209,96 @@ def test_docs_export_drops_embedded_images() -> None:
     )
     cleaned = strip_data_images(exported)
     assert b"base64" not in cleaned and b"# Title" in cleaned and b"end" in cleaned
+
+
+def _backend_with_failing_file(stub: StubDrive, error: Exception) -> GoogleDriveBackend:
+    backend = GoogleDriveBackend(service=stub)
+    attempts: list[str] = []
+
+    def media(file_id: str) -> bytes:
+        attempts.append(file_id)
+        if file_id == "pdf000000000000":
+            raise error
+        return b"hello"
+
+    backend._media = media  # type: ignore[method-assign]
+    backend._export = lambda file_id, mime: b"noi dung bien ban"  # type: ignore[method-assign]
+    backend.attempts = attempts  # type: ignore[attr-defined]
+    return backend
+
+
+@pytest.mark.parametrize(
+    "error",
+    [
+        http_error(500),
+        http_error(400),
+        http_error(403, ("downloadQuotaExceeded",)),
+        http_error(403, ("cannotDownloadAbusiveFile",)),
+    ],
+)
+def test_one_failing_download_does_not_stop_the_sync(tmp_path: Path, error: HttpError) -> None:
+    stub = tree()
+    stub.meta["xlsb00000000000"]["mimeType"] = "text/plain"  # make the other file indexable
+    stub.meta["xlsb00000000000"]["name"] = "so.txt"
+    backend = _backend_with_failing_file(stub, download_error(error))
+    service = make_service(tmp_path)
+    service.backend_factory = lambda _: backend
+    service.add_sources([ROOT])
+    report = service.sync()
+    assert "stopped" not in report and report["failed"] == 1 and report["indexed"] == 2
+    failure = service.status()["recent_failures"][0]
+    assert failure["file_name"] == "a/b.pdf" and failure["error"].startswith("download: ")
+    # next cycle: a new file is indexed, a deleted file disappears, the failure is retried
+    stub.add(ROOT, "new000000000000", "moi.txt", "text/plain")
+    stub.children[ROOT].remove("doc000000000000")
+    report = service.sync()
+    assert "stopped" not in report and report["removed"] == 1
+    names = {r["file_name"] for r in service.search("hello")["results"]}
+    assert names == {"so.txt", "moi.txt"}
+    assert backend.attempts.count("pdf000000000000") == 2  # type: ignore[attr-defined]
+
+
+def test_sign_in_failure_during_download_stops_without_deleting(tmp_path: Path) -> None:
+    stub = tree()
+    backend = _backend_with_failing_file(stub, download_error(http_error(401)))
+    service = make_service(tmp_path)
+    service.backend_factory = lambda _: backend
+    service.add_sources([ROOT])
+    service.sync()
+    stub.children[ROOT].remove("doc000000000000")
+    report = service.sync()
+    assert "stopped" in report and report["removed"] == 0
+
+
+def _export_backend(too_large: set[str]) -> tuple[GoogleDriveBackend, list[str]]:
+    backend = GoogleDriveBackend(service=tree())
+    asked: list[str] = []
+
+    def export(file_id: str, mime: str) -> bytes:
+        asked.append(mime)
+        if mime in too_large:
+            raise download_error(http_error(403, ("exportSizeLimitExceeded",)), export=True)
+        return b"plain text"
+
+    backend._export = export  # type: ignore[method-assign]
+    return backend, asked
+
+
+def _google_item(mime: str) -> DriveItem:
+    return DriveItem("big0000000000000", "Lớn", mime, "Lớn", "2026-01-01", "", None, "https://x")
+
+
+def test_export_over_10mb_falls_back_to_plain_text() -> None:
+    backend, asked = _export_backend({"text/markdown", PPTX_MIME})
+    for mime in (GOOGLE_DOC, GOOGLE_SLIDES):
+        result = backend.download(_google_item(mime))
+        assert result == Download(b"plain text", ".txt")
+    assert asked == ["text/markdown", "text/plain", PPTX_MIME, "text/plain"]
+
+
+def test_export_over_10mb_errors_are_clear() -> None:
+    backend, _ = _export_backend({XLSX_MIME, "text/markdown", "text/plain"})
+    with pytest.raises(DriveDownloadError, match="Google Sheet is larger"):
+        backend.download(_google_item(GOOGLE_SHEET))
+    with pytest.raises(DriveDownloadError, match="even as plain text"):
+        backend.download(_google_item(GOOGLE_DOC))

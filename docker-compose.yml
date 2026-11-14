@@ -3,6 +3,7 @@ services:
     build: .
     image: google-drive-rag:local
     restart: unless-stopped
+    init: true  # reaps LibreOffice child processes and forwards stop signals
     env_file:
       - path: .env
         required: false

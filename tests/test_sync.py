@@ -131,3 +131,20 @@ def test_extraction_failure_is_per_file(tmp_path: Path) -> None:
     assert status["documents"]["failed"] == 1
     assert status["recent_failures"][0]["file_name"] == "broken.xlsx"
     assert names(service) == ["a.txt", "shared.txt"]
+
+
+def test_sync_running_never_takes_the_lock(tmp_path: Path, monkeypatch) -> None:
+    import fcntl
+    import os
+
+    drive, service = setup_two_sources(tmp_path)
+    calls: list[int] = []
+    real = fcntl.flock
+    monkeypatch.setattr(fcntl, "flock", lambda fd, op: (calls.append(op), real(fd, op))[1])
+    assert service.sync_running() is False and service.status()["sync"]["running"] is False
+    assert calls == []
+    with service._sync_lock():
+        assert service.sync_running() is True
+    assert service.sync_running() is False
+    (tmp_path / "sync.running").write_text(str(2**22 + os.getpid()))  # no such process
+    assert service.sync_running() is False

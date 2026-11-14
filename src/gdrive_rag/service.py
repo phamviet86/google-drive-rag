@@ -20,12 +20,13 @@ from collections.abc import Callable, Iterator
 from pathlib import Path
 from typing import Any
 
-from .chunking import embedding_input, make_chunks
+from .chunking import make_chunks
 from .config import Settings, ensure_private_dir
 from .db import Database
 from .drive import (
     GOOGLE_DOC,
     DriveBackend,
+    DriveDownloadError,
     DriveItem,
     DriveItemError,
     DriveRoot,
@@ -44,8 +45,13 @@ log = logging.getLogger("gdrive_rag")
 BackendFactory = Callable[[Settings], DriveBackend]
 EmbeddingFactory = Callable[[Settings], EmbeddingClient | None]
 ERROR_RETRY_HOURS = 24
+DOWNLOAD_ERROR_PREFIX = "download: "  # download errors are retried on every sync
 EMBED_BATCH = 64
 READ_LIMIT_CHARS = 40_000
+_PENDING_SQL = (
+    "NOT EXISTS (SELECT 1 FROM vectors v WHERE v.chunk_hash=c.chunk_hash) "
+    "AND NOT EXISTS (SELECT 1 FROM embedding_failures f WHERE f.chunk_hash=c.chunk_hash)"
+)
 
 
 class SyncBusy(RuntimeError):
@@ -192,19 +198,31 @@ class Service:
                 fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
             except BlockingIOError:
                 raise SyncBusy("another sync is already running") from None
+            marker = self.settings.data_dir / "sync.running"
+            marker.write_text(str(os.getpid()))
             try:
                 yield
             finally:
+                marker.unlink(missing_ok=True)
                 fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
         finally:
             handle.close()
 
     def sync_running(self) -> bool:
+        """Read the PID marker written under the lock; never touch the lock itself, so a status
+        call cannot make a scheduled sync skip its cycle."""
+        marker = self.settings.data_dir / "sync.running"
         try:
-            with self._sync_lock():
-                return False
-        except SyncBusy:
+            pid = int(marker.read_text().strip())
+        except (OSError, ValueError):
+            return False
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            return False  # stale marker from a killed process
+        except PermissionError:
             return True
+        return True
 
     def sync(self) -> dict[str, Any]:
         self.reload()
@@ -266,7 +284,7 @@ class Service:
                 break
             try:
                 report[self._index_item(backend, extractor, item)] += 1
-            except DriveSourceError as exc:
+            except DriveSourceError as exc:  # sign-in or connection: stop, delete nothing
                 stop = str(exc)
                 report["failed"] += 1
         if stop:
@@ -296,38 +314,47 @@ class Service:
         """Index one file; return the report counter: indexed, unchanged or failed."""
         with self.db.read() as connection:
             current = connection.execute(
-                "SELECT fingerprint, status, indexed_at FROM documents WHERE file_id=?", (item.id,)
+                "SELECT id, fingerprint, status, error, indexed_at, name, path, web_url "
+                "FROM documents WHERE file_id=?",
+                (item.id,),
             ).fetchone()
-        if (
-            current is not None
-            and current["fingerprint"] == item.fingerprint
-            and (
-                current["status"] != "error"
-                or not _older_than(current["indexed_at"], ERROR_RETRY_HOURS)
+        if current is not None and current["fingerprint"] == item.fingerprint:
+            retry = current["status"] == "error" and (
+                str(current["error"] or "").startswith(DOWNLOAD_ERROR_PREFIX)
+                or _older_than(current["indexed_at"], ERROR_RETRY_HOURS)
             )
-        ):
-            return "unchanged"
+            if not retry:
+                if (current["name"], current["path"], current["web_url"]) != (
+                    item.name,
+                    item.path,
+                    item.web_url,
+                ):
+                    self._update_metadata(int(current["id"]), item)
+                return "unchanged"
         ensure_private_dir(self.settings.work_dir)
-        temporary = self.settings.work_dir / f"{item.id}{item.suffix}"
+        temporary: Path | None = None
         try:
             try:
-                data = backend.download(item)
+                download = backend.download(item)
+            except DriveDownloadError as exc:
+                self._store_failure(item, f"{DOWNLOAD_ERROR_PREFIX}{exc}")
+                log.warning("could not download %s: %s", item.path, exc)
+                return "failed"
+            try:
+                data = download.data
                 if item.mime_type == GOOGLE_DOC:
                     data = strip_data_images(data)
+                temporary = self.settings.work_dir / f"{item.id}{download.suffix}"
                 temporary.write_bytes(data)
                 document = extractor.extract(temporary)
-            except DriveSourceError:
-                raise
             except Exception as exc:
                 self._store_failure(item, _message(exc))
                 log.warning("could not index %s: %s", item.path, _message(exc))
                 return "failed"
         finally:
-            temporary.unlink(missing_ok=True)
-        context = " | ".join(part for part in (item.name, item.path) if part)
-        chunks = make_chunks(
-            document, self.settings.chunk_chars, self.settings.chunk_overlap, context
-        )
+            if temporary is not None:
+                temporary.unlink(missing_ok=True)
+        chunks = make_chunks(document, self.settings.chunk_chars, self.settings.chunk_overlap)
         metadata = dict(document.metadata)
         with self.db.transaction() as connection:
             document_id = self._upsert_document(
@@ -340,6 +367,19 @@ class Service:
             )
         log.info("indexed %s (%d chunks)", item.path, len(chunks))
         return "indexed"
+
+    def _update_metadata(self, document_id: int, item: DriveItem) -> None:
+        """Rename or move: refresh name/path/link and the FTS title, keep chunks and vectors."""
+        with self.db.transaction() as connection:
+            connection.execute(
+                "UPDATE documents SET name=?, path=?, web_url=?, modified_time=? WHERE id=?",
+                (item.name, item.path, item.web_url, item.modified_time, document_id),
+            )
+            connection.execute(
+                "UPDATE chunks_fts SET title=fts_fold(?) "
+                "WHERE rowid IN (SELECT id FROM chunks WHERE document_id=?)",
+                (item.name, document_id),
+            )
 
     def _store_failure(self, item: DriveItem, error: str) -> None:
         with self.db.transaction() as connection:
@@ -404,13 +444,16 @@ class Service:
 
     # -- embeddings ---------------------------------------------------------------------------
     def embed_pending(self) -> dict[str, Any]:
+        """Embed chunks without a vector. An item the endpoint rejects is isolated by splitting
+        its batch, recorded in ``embedding_failures`` and skipped; any other failure stops the
+        pass (it resumes on the next sync)."""
         client = self._embeddings()
-        pending = self._pending_vectors()
         if client is None:
-            return {"enabled": False, "embedded": 0, "pending": pending}
+            return {"enabled": False, "embedded": 0, "pending": self._pending_vectors()}
         if self.db.get_meta(EMBEDDING_IDENTITY_KEY) != client.identity:
             with self.db.transaction() as connection:
                 connection.execute("DELETE FROM vectors")
+                connection.execute("DELETE FROM embedding_failures")
                 connection.execute(
                     "INSERT INTO meta(key,value) VALUES(?,?) "
                     "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
@@ -421,21 +464,15 @@ class Service:
         while True:
             with self.db.read() as connection:
                 rows = connection.execute(
-                    """SELECT c.chunk_hash, c.text, d.name, d.path FROM chunks c
-                       JOIN documents d ON d.id=c.document_id
-                       WHERE NOT EXISTS (SELECT 1 FROM vectors v WHERE v.chunk_hash=c.chunk_hash)
-                       GROUP BY c.chunk_hash LIMIT ?""",
+                    f"""SELECT chunk_hash, text FROM chunks c WHERE {_PENDING_SQL}
+                        GROUP BY chunk_hash LIMIT ?""",
                     (EMBED_BATCH,),
                 ).fetchall()
             if not rows:
                 break
-            texts = [
-                embedding_input(" | ".join(p for p in (r["name"], r["path"]) if p), r["text"])
-                for r in rows
-            ]
             try:
-                vectors = client.embed_documents(texts)
-            except (EmbeddingError, Exception) as exc:
+                vectors, failures = self._embed_rows(client, rows)
+            except Exception as exc:
                 message = _message(exc)
                 self.db.set_meta("last_embedding_error", message)
                 log.warning("embedding stopped: %s", message)
@@ -448,25 +485,46 @@ class Service:
             with self.db.transaction() as connection:
                 connection.executemany(
                     "INSERT OR REPLACE INTO vectors(chunk_hash, vector) VALUES(?,?)",
-                    [
-                        (row["chunk_hash"], struct.pack(f"<{len(vector)}f", *vector))
-                        for row, vector in zip(rows, vectors, strict=True)
-                    ],
+                    [(key, struct.pack(f"<{len(v)}f", *v)) for key, v in vectors.items()],
+                )
+                connection.executemany(
+                    "INSERT OR REPLACE INTO embedding_failures(chunk_hash, error) VALUES(?,?)",
+                    list(failures.items()),
                 )
                 _bump(connection)
-            embedded += len(rows)
+            embedded += len(vectors)
         with self.db.transaction() as connection:
             connection.execute("DELETE FROM meta WHERE key='last_embedding_error'")
         return {"enabled": True, "embedded": embedded, "pending": 0}
+
+    def _embed_rows(
+        self, client: EmbeddingClient, rows: list[Any]
+    ) -> tuple[dict[str, list[float]], dict[str, str]]:
+        """Embed ``rows``; on a content rejection split the batch until the bad item is alone."""
+        try:
+            vectors = client.embed_documents([str(row["text"]) for row in rows])
+        except EmbeddingError as exc:
+            if not exc.rejected:
+                raise
+            if len(rows) == 1:
+                return {}, {str(rows[0]["chunk_hash"]): str(exc)}
+            middle = len(rows) // 2
+            left = self._embed_rows(client, rows[:middle])
+            right = self._embed_rows(client, rows[middle:])
+            return {**left[0], **right[0]}, {**left[1], **right[1]}
+        return {str(row["chunk_hash"]): v for row, v in zip(rows, vectors, strict=True)}, {}
 
     def _pending_vectors(self) -> int:
         with self.db.read() as connection:
             return int(
                 connection.execute(
-                    "SELECT count(DISTINCT chunk_hash) FROM chunks c WHERE NOT EXISTS "
-                    "(SELECT 1 FROM vectors v WHERE v.chunk_hash=c.chunk_hash)"
+                    f"SELECT count(DISTINCT chunk_hash) FROM chunks c WHERE {_PENDING_SQL}"
                 ).fetchone()[0]
             )
+
+    def _failed_vectors(self) -> int:
+        with self.db.read() as connection:
+            return int(connection.execute("SELECT count(*) FROM embedding_failures").fetchone()[0])
 
     # -- reads --------------------------------------------------------------------------------
     def search(self, query: str, source: str | None = None, limit: int = 8) -> dict[str, Any]:
@@ -566,6 +624,7 @@ class Service:
                 "dimensions": settings.embedding_dimensions,
                 "vectors": vectors,
                 "pending": self._pending_vectors(),
+                "rejected": self._failed_vectors(),
                 "last_error": self.db.get_meta("last_embedding_error"),
             },
             "google_auth": settings.google_auth,
@@ -604,9 +663,10 @@ def _delete_orphans(connection: Any) -> int:
 
 
 def _gc_vectors(connection: Any) -> None:
-    connection.execute(
-        "DELETE FROM vectors WHERE chunk_hash NOT IN (SELECT chunk_hash FROM chunks)"
-    )
+    for table in ("vectors", "embedding_failures"):
+        connection.execute(
+            f"DELETE FROM {table} WHERE chunk_hash NOT IN (SELECT chunk_hash FROM chunks)"
+        )
 
 
 def _bump(connection: Any) -> None:

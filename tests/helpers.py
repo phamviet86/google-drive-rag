@@ -13,7 +13,14 @@ from pathlib import Path
 from typing import Any
 
 from gdrive_rag.config import Settings
-from gdrive_rag.drive import DriveItem, DriveItemError, DriveRoot, DriveSourceError, Listing
+from gdrive_rag.drive import (
+    Download,
+    DriveItem,
+    DriveItemError,
+    DriveRoot,
+    DriveSourceError,
+    Listing,
+)
 from gdrive_rag.extract import Extractor
 from gdrive_rag.service import Service
 
@@ -30,6 +37,7 @@ class FakeDrive:
         self.root_errors: dict[str, Exception] = {}
         self.incomplete: set[str] = set()
         self.downloads: list[str] = []
+        self.download_errors: dict[str, Exception] = {}
 
     def add_root(self, root_id: str, name: str, kind: str = "folder") -> None:
         self.roots[root_id] = DriveRoot(root_id, name, kind)
@@ -43,12 +51,13 @@ class FakeDrive:
         data: bytes,
         mime: str = "text/plain",
         version: str = "1",
+        path: str | None = None,
     ) -> DriveItem:
         item = DriveItem(
             file_id,
             name,
             mime,
-            name,
+            path or name,
             f"2026-01-0{version}T00:00:00Z",
             hashlib.md5(data).hexdigest(),
             len(data),
@@ -75,9 +84,11 @@ class FakeDrive:
             return Listing(items[:1], complete=False, errors=["folder x: HTTP 404"])
         return Listing(items)
 
-    def download(self, item: DriveItem) -> bytes:
+    def download(self, item: DriveItem) -> Download:
         self.downloads.append(item.id)
-        return self.content[item.id]
+        if item.id in self.download_errors:
+            raise self.download_errors[item.id]
+        return Download(self.content[item.id], item.suffix)
 
 
 class FakeEmbeddings:
@@ -88,7 +99,9 @@ class FakeEmbeddings:
         self.dimensions = dimensions
         self.queries: list[str] = []
         self.document_calls = 0
+        self.embedded: list[str] = []
         self.fail = False
+        self.reject_marker = ""  # texts containing it are refused like an HTTP 400
 
     @property
     def identity(self) -> str:
@@ -102,9 +115,14 @@ class FakeEmbeddings:
         return [v / norm for v in values]
 
     def embed_documents(self, texts: Sequence[str]) -> list[list[float]]:
+        from gdrive_rag.embeddings import EmbeddingError
+
         if self.fail:
-            raise RuntimeError("embedding endpoint down")
+            raise EmbeddingError("embedding request failed (HTTP 503)")
+        if self.reject_marker and any(self.reject_marker in text for text in texts):
+            raise EmbeddingError("embedding request failed (HTTP 400)", rejected=True)
         self.document_calls += 1
+        self.embedded.extend(texts)
         return [self._vector(text) for text in texts]
 
     def embed_query(self, text: str) -> list[float]:

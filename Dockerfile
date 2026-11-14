@@ -11,7 +11,8 @@ RUN apt-get update \
  && apt-get install -y --no-install-recommends \
       libreoffice-writer-nogui libreoffice-calc-nogui libreoffice-impress-nogui \
       fonts-dejavu-core ca-certificates \
- && rm -rf /var/lib/apt/lists/*
+ && rm -rf /var/lib/apt/lists/* \
+ && soffice --version
 
 WORKDIR /app
 COPY pyproject.toml README.md LICENSE NOTICE ./

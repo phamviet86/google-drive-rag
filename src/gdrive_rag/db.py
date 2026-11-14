@@ -82,6 +82,12 @@ MIGRATIONS = [
       value TEXT NOT NULL
     );
     """,
+    """
+    CREATE TABLE embedding_failures (
+      chunk_hash TEXT PRIMARY KEY,
+      error TEXT NOT NULL
+    );
+    """,
 ]
 
 

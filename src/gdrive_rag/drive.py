@@ -81,6 +81,16 @@ class DriveSourceError(RuntimeError):
     """Authentication, quota, transport or configuration failure: retry later, delete nothing."""
 
 
+class DriveDownloadError(RuntimeError):
+    """Downloading or exporting one file failed; only that file is affected (retried next sync)."""
+
+
+@dataclass(frozen=True)
+class Download:
+    data: bytes
+    suffix: str  # extension the data should be extracted as (may differ after an export fallback)
+
+
 @dataclass(frozen=True)
 class DriveRoot:
     id: str
@@ -106,8 +116,9 @@ class DriveItem:
 
     @property
     def fingerprint(self) -> str:
+        """Content identity only: a rename or move updates metadata without re-downloading."""
         content = self.checksum or self.modified_time
-        return json.dumps(["v1", content, self.size, self.mime_type, self.name, self.path])
+        return json.dumps(["v2", content, self.size, self.mime_type])
 
 
 @dataclass(frozen=True)
@@ -122,7 +133,7 @@ class DriveBackend(Protocol):
 
     def list_files(self, root: DriveRoot) -> Listing: ...
 
-    def download(self, item: DriveItem) -> bytes: ...
+    def download(self, item: DriveItem) -> Download: ...
 
 
 def parse_drive_link(link: str) -> str:
@@ -322,26 +333,45 @@ class GoogleDriveBackend:
             if not token:
                 return result
 
-    def download(self, item: DriveItem) -> bytes:  # pragma: no cover - real media download
+    def download(self, item: DriveItem) -> Download:
+        """Fetch one file. Any failure that concerns only this file is a DriveDownloadError;
+        DriveSourceError is kept for sign-in and connection failures."""
         if item.size is not None and item.size > MAX_DOWNLOAD_BYTES:
-            raise DriveItemError("file is larger than the 200 MB download limit")
-        if item.mime_type in EXPORTS:
-            mime, _ = EXPORTS[item.mime_type]
-            try:
-                return self._download(
-                    self.service.files().export_media(fileId=item.id, mimeType=mime),
-                    markdown=mime == "text/markdown",
-                )
-            except _ExportRejected:
-                return self._download(
-                    self.service.files().export_media(fileId=item.id, mimeType="text/plain")
-                )
-        return self._download(
-            self.service.files().get_media(fileId=item.id, supportsAllDrives=True)
-        )
+            raise DriveDownloadError("file is larger than the 200 MB download limit")
+        if item.mime_type not in EXPORTS:
+            return Download(self._media(item.id), item.suffix)
+        mime, suffix = EXPORTS[item.mime_type]
+        try:
+            return Download(self._export(item.id, mime), suffix)
+        except _ExportRejected as exc:
+            if mime != "text/markdown":
+                raise DriveDownloadError(f"Google refused to export this file ({exc})") from None
+            fallback = "Markdown export refused"
+        except _ExportTooLarge:
+            if item.mime_type == GOOGLE_SHEET:
+                raise DriveDownloadError(
+                    "Google Sheet is larger than Google's 10 MB export limit"
+                ) from None
+            fallback = "over the 10 MB export limit"
+        try:  # Docs and Slides: plain text is much smaller than Markdown/PPTX
+            return Download(self._export(item.id, "text/plain"), ".txt")
+        except _ExportTooLarge:
+            raise DriveDownloadError(
+                "Google file is larger than Google's 10 MB export limit, even as plain text"
+            ) from None
+        except _ExportRejected as exc:
+            raise DriveDownloadError(f"{fallback}; plain-text export failed ({exc})") from None
+
+    def _export(self, file_id: str, mime: str) -> bytes:
+        request = self.service.files().export_media(fileId=file_id, mimeType=mime)
+        return self._download(request, export=True)
+
+    def _media(self, file_id: str) -> bytes:
+        request = self.service.files().get_media(fileId=file_id, supportsAllDrives=True)
+        return self._download(request)
 
     def _download(  # pragma: no cover - real media download
-        self, request: Any, markdown: bool = False
+        self, request: Any, export: bool = False
     ) -> bytes:
         from google.auth.exceptions import GoogleAuthError
         from googleapiclient.errors import HttpError
@@ -354,14 +384,50 @@ class GoogleDriveBackend:
             try:
                 _, done = downloader.next_chunk(num_retries=5)
             except HttpError as exc:
-                if markdown and int(exc.resp.status) in EXPORT_REJECTED_STATUSES:
-                    raise _ExportRejected from None
-                raise _api_error(exc) from None
+                raise download_error(exc, export) from None
             except (GoogleAuthError, HttpLib2Error, OSError) as exc:
                 raise DriveSourceError(f"Drive connection failed: {type(exc).__name__}") from None
             if output.tell() > MAX_DOWNLOAD_BYTES:
-                raise DriveItemError("file is larger than the 200 MB download limit")
+                raise DriveDownloadError("file is larger than the 200 MB download limit")
         return output.getvalue()
+
+
+class _ExportRejected(Exception):
+    """Drive refused this export format for this file (HTTP 400/415/501)."""
+
+
+class _ExportTooLarge(Exception):
+    """Drive refused the export because it exceeds the 10 MB export limit."""
+
+
+def download_error(exc: Any, export: bool = False) -> Exception:
+    """Classify an HttpError raised while downloading or exporting one file.
+
+    Only HTTP 401 (sign-in) stops the sync. Everything else, including 5xx after retries and
+    403 reasons such as downloadQuotaExceeded, is a failure of this file only.
+    """
+    status = int(exc.resp.status)
+    reasons = _reasons(exc)
+    if status == 401:
+        return DriveSourceError(
+            "Google sign-in was rejected (HTTP 401); run: gdrive-rag auth google"
+        )
+    if export and "exportSizeLimitExceeded" in reasons:
+        return _ExportTooLarge()
+    if export and status in EXPORT_REJECTED_STATUSES:
+        return _ExportRejected(f"HTTP {status}")
+    if status in {404, 410}:
+        return DriveDownloadError(f"file disappeared or is no longer shared (HTTP {status})")
+    detail = f": {', '.join(sorted(reasons))}" if reasons else ""
+    return DriveDownloadError(f"download failed (HTTP {status}{detail}); will retry")
+
+
+def _reasons(exc: Any) -> set[str]:
+    try:
+        rows = json.loads(exc.content).get("error", {}).get("errors", [])
+        return {str(row.get("reason")) for row in rows if row.get("reason")}
+    except (ValueError, TypeError, AttributeError):
+        return set()
 
 
 _DATA_IMAGE_DEFINITION = re.compile(rb"^\[[^\]]+\]:\s*<data:[^>]+>[ \t]*\r?$\n?", re.MULTILINE)
@@ -376,10 +442,6 @@ def strip_data_images(content: bytes) -> bytes:
     content = _DATA_IMAGE_DEFINITION.sub(b"", content)
     content = _DATA_IMAGE_INLINE.sub(b"", content)
     return _IMAGE_REFERENCE.sub(b"", content)
-
-
-class _ExportRejected(Exception):
-    """Drive refused the Markdown export of one Doc (fall back to plain text)."""
 
 
 def _item(value: dict[str, Any], path: str) -> DriveItem | None:
@@ -401,12 +463,7 @@ def _item(value: dict[str, Any], path: str) -> DriveItem | None:
 
 def _api_error(exc: Any) -> RuntimeError:
     status = int(exc.resp.status)
-    try:
-        reasons = {
-            row.get("reason") for row in json.loads(exc.content).get("error", {}).get("errors", [])
-        }
-    except (ValueError, TypeError, AttributeError):
-        reasons = set()
+    reasons = _reasons(exc)
     if status in {404, 410} or (status == 403 and reasons and reasons <= ITEM_REASONS):
         return DriveItemError(f"not found or not shared with this Google account (HTTP {status})")
     if status in {401, 403}:

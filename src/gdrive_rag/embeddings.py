@@ -22,8 +22,20 @@ BATCH_SIZE = 32
 RETRY_STATUSES = frozenset({408, 429, 500, 502, 503, 504})
 
 
+REJECTED_STATUSES = frozenset({400, 413, 422})
+
+
 class EmbeddingError(RuntimeError):
-    """Remote embedding call failed; the message never contains the API key."""
+    """Remote embedding call failed; the message never contains the API key.
+
+    ``rejected`` is True when the endpoint refused the input itself (HTTP 400/413/422 or an
+    empty vector): the batch should be split to find the bad item. Otherwise (network, sign-in,
+    quota, server errors) the whole pass should stop and retry on the next sync.
+    """
+
+    def __init__(self, message: str, rejected: bool = False):
+        super().__init__(message)
+        self.rejected = rejected
 
 
 class EmbeddingClient(Protocol):
@@ -45,7 +57,7 @@ def truncate_normalize(vector: Sequence[float], dimensions: int) -> list[float]:
         raise EmbeddingError(f"embedding has {len(values)} dimensions; {dimensions} are configured")
     norm = math.sqrt(sum(value * value for value in values))
     if not norm or not math.isfinite(norm):
-        raise EmbeddingError("embedding endpoint returned an empty or invalid vector")
+        raise EmbeddingError("embedding endpoint returned an empty or invalid vector", True)
     return [value / norm for value in values]
 
 
@@ -107,7 +119,9 @@ class OpenAICompatibleEmbeddings:
                 if exc.code in RETRY_STATUSES and attempt < retries:
                     time.sleep(2**attempt)
                     continue
-                raise EmbeddingError(f"embedding request failed (HTTP {exc.code})") from None
+                raise EmbeddingError(
+                    f"embedding request failed (HTTP {exc.code})", exc.code in REJECTED_STATUSES
+                ) from None
             except (URLError, TimeoutError, OSError, ValueError) as exc:
                 if attempt < retries:
                     time.sleep(2**attempt)

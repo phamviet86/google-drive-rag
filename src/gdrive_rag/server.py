@@ -1,8 +1,8 @@
 """MCP server over Streamable HTTP (``/mcp``), ``/healthz``, and the background sync loop.
 
-All four tools are read-only. Each tool result is capped at ``MAX_RESULT_CHARS`` of JSON; the
-same JSON is sent as text content and as structured content, so a full response stays well
-under 150,000 characters on the wire.
+All four tools are read-only. The same JSON is sent as structured content and, escaped again,
+as text content; ``wire_size`` measures both after encoding and results are trimmed until it is
+at most ``MAX_WIRE_CHARS``, so quote-heavy text cannot blow up the response.
 """
 
 from __future__ import annotations
@@ -26,7 +26,7 @@ from .service import Service, SyncBusy
 
 log = logging.getLogger("gdrive_rag")
 
-MAX_RESULT_CHARS = 45_000
+MAX_WIRE_CHARS = 56_000  # + JSON-RPC envelope stays under ~60,000 characters
 INSTRUCTIONS = (
     "Search the owner's Google Drive documents (Docs, Sheets, Slides, PDF, Office files). "
     "Use `search` first; cite the file name, locator and Drive link from each result. Use `read` "
@@ -106,9 +106,15 @@ def _dump(value: dict[str, Any]) -> str:
     return json.dumps(value, ensure_ascii=False, separators=(",", ":"))
 
 
+def wire_size(value: dict[str, Any]) -> int:
+    """Characters of structured content plus the text block (the JSON as an escaped string)."""
+    dumped = _dump(value)
+    return len(dumped) + len(json.dumps(dumped, ensure_ascii=False))
+
+
 def _cap_list(value: dict[str, Any], key: str) -> dict[str, Any]:
-    """Drop items from the end of ``value[key]`` until the JSON fits ``MAX_RESULT_CHARS``."""
-    while len(_dump(value)) > MAX_RESULT_CHARS and value[key]:
+    """Drop items from the end of ``value[key]`` until ``wire_size`` fits ``MAX_WIRE_CHARS``."""
+    while wire_size(value) > MAX_WIRE_CHARS and value[key]:
         value[key] = value[key][:-1]
         value["truncated"] = True
     return value
@@ -177,7 +183,7 @@ def create_server(service: Service) -> Any:
     def sync_status() -> Annotated[CallToolResult, StatusOutput]:
         """Show indexing progress: document counts, failures, embedding progress, last sync."""
         status = service.status()
-        while len(_dump(status)) > MAX_RESULT_CHARS and status["recent_failures"]:
+        while wire_size(status) > MAX_WIRE_CHARS and status["recent_failures"]:
             status["recent_failures"] = status["recent_failures"][:-1]
         return ok(status)
 

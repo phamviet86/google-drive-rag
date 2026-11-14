@@ -16,7 +16,7 @@ import anyio
 import pytest
 from helpers import FakeDrive, make_service
 
-from gdrive_rag.server import MAX_RESULT_CHARS, create_app
+from gdrive_rag.server import MAX_WIRE_CHARS, create_app
 from gdrive_rag.service import Service
 
 ROOT = "folderAAAAAAAAAAAA"
@@ -35,7 +35,10 @@ def running(tmp_path: Path) -> Iterator[tuple[str, Service]]:
     drive = FakeDrive()
     drive.add_root(ROOT, "Kế toán")
     drive.put(ROOT, "doc1111111111111", "hoa-don.txt", "Hóa đơn tiền điện tháng 3".encode())
-    big = "\n".join(f"Dòng {i}: nội dung tiếng Việt có dấu đầy đủ ở đây." for i in range(20000))
+    big = "\n".join(
+        f'Dòng {i}: "trích dẫn" \\ nội dung "tiếng Việt" có dấu "đầy đủ" ở đây.'
+        for i in range(20000)
+    )
     drive.put(ROOT, "big2222222222222", "lon.txt", big.encode())
     service = make_service(tmp_path, drive)
     service.add_sources([ROOT])
@@ -121,10 +124,9 @@ def test_results_are_capped(running: tuple[str, Service]) -> None:
     ):
         result = call(url, name, arguments)
         assert not result.is_error
-        wire = result.model_dump_json(by_alias=True)
-        assert len(result.content[0].text) <= MAX_RESULT_CHARS
-        assert len(wire) < 150_000, (name, len(wire))
-        print(name, "wire chars", len(wire))
+        wire = result.model_dump_json(by_alias=True)  # what the server encodes
+        assert len(wire) <= MAX_WIRE_CHARS, (name, len(wire))
+        assert len(wire) < 60_000
     read = call(url, "read", {"document_id": "big2222222222222", "max_chunks": 100})
     assert read.structured_content["truncated"] is True
     assert read.structured_content["next_chunk"] is not None

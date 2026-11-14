@@ -4,6 +4,8 @@ google-drive-rag giúp Claude Code tìm và đọc tài liệu trong Google Driv
 
 Dịch vụ chạy trong một Docker container trên chính VPS, chỉ nhận kết nối từ VPS đó (địa chỉ `127.0.0.1`), không mở ra Internet.
 
+> **Lưu ý:** Với Docker cũ hơn bản 28.0, cổng mở trên `127.0.0.1` vẫn có thể bị máy khác cùng mạng nội bộ truy cập; hãy dùng Docker 28.0 trở lên.
+
 ## Mục lục
 
 - Dịch vụ làm gì

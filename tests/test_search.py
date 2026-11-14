@@ -111,3 +111,41 @@ def test_read_by_chunk_and_page(tmp_path: Path) -> None:
     result = service.read("gdoc333333333333")
     assert result["chunks"][0]["text"].startswith("# Biên bản")
     assert result["next_chunk"] is None
+
+
+def test_rejected_chunk_is_isolated_and_skipped(tmp_path: Path) -> None:
+    embeddings = FakeEmbeddings()
+    embeddings.reject_marker = "Báo giá"
+    service = indexed(tmp_path, embeddings)
+    status = service.status()["embeddings"]
+    assert status["vectors"] == 2 and status["rejected"] == 1 and status["pending"] == 0
+    assert not any("Báo giá" in text for text in embeddings.embedded)
+    calls = embeddings.document_calls
+    assert service.embed_pending()["embedded"] == 0 and embeddings.document_calls == calls
+
+
+def test_transport_failure_still_stops_the_pass(tmp_path: Path) -> None:
+    embeddings = FakeEmbeddings()
+    embeddings.fail = True
+    service = indexed(tmp_path, embeddings)
+    status = service.status()["embeddings"]
+    assert status["rejected"] == 0 and status["pending"] == 3
+
+
+def test_rename_or_move_keeps_chunks_and_vectors(tmp_path: Path) -> None:
+    embeddings = FakeEmbeddings()
+    drive = FakeDrive()
+    drive.add_root(ROOT, "Tài liệu")
+    data = "Hợp đồng thuê văn phòng".encode()
+    drive.put(ROOT, "doc1111111111111", "hop-dong.txt", data, path="2025/hop-dong.txt")
+    service = make_service(tmp_path, drive, embeddings)
+    service.add_sources([ROOT])
+    service.sync()
+    drive.downloads.clear()
+    calls = embeddings.document_calls
+    drive.put(ROOT, "doc1111111111111", "thue-nha.txt", data, path="Lưu trữ/thue-nha.txt")
+    report = service.sync()
+    assert report["unchanged"] == 1 and drive.downloads == []
+    assert embeddings.document_calls == calls
+    hit = service.search("thue nha")["results"][0]  # FTS title follows the new name
+    assert (hit["file_name"], hit["path"]) == ("thue-nha.txt", "Lưu trữ/thue-nha.txt")
