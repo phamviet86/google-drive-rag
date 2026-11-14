@@ -223,7 +223,7 @@ class Service:
                 (value, value, value),
             ).fetchone()
         if row is None:
-            raise ValueError(f"unknown source: {value}")
+            raise ValueError("unknown source (list_sources shows the names and ids)")
         return dict(row)
 
     # -- sync ---------------------------------------------------------------------------------

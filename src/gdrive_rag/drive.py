@@ -162,12 +162,13 @@ def drive_link(drive_id: str, kind: str) -> str:
 def save_refreshed_token(token_file: Path, payload: str) -> bool:
     """Write a refreshed OAuth token only if the token file still exists, so a refresh that
     races with ``remove_google_auth`` cannot put the deleted token back."""
-    from .config import write_private
+    from .config import token_lock, write_private
 
-    if not token_file.is_file():
-        return False
-    write_private(token_file, payload)
-    return True
+    with token_lock(token_file):  # the same lock as the removal: check and write are one step
+        if not token_file.is_file():
+            return False
+        write_private(token_file, payload)
+        return True
 
 
 def parse_drive_link(link: str) -> str:

@@ -6,10 +6,13 @@ in the environment. Nothing here prints them; ``public()`` reports only whether 
 
 from __future__ import annotations
 
+import contextlib
+import fcntl
 import json
 import os
 import re
 import tempfile
+from collections.abc import Iterator
 from dataclasses import asdict, dataclass, replace
 from pathlib import Path
 from typing import Any
@@ -203,6 +206,18 @@ def save_config(data_dir: Path, changes: dict[str, Any]) -> Settings:
     current.update(changes)
     write_private(data_dir / "config.json", json.dumps(current, indent=2, ensure_ascii=False))
     return load_settings(data_dir, use_env=False)
+
+
+@contextlib.contextmanager
+def token_lock(token_file: Path) -> Iterator[None]:
+    """Exclusive lock shared by the OAuth token refresh-write and ``remove_google_auth``."""
+    ensure_private_dir(token_file.parent)
+    with (token_file.parent / ".token.lock").open("a+") as handle:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
 
 
 def ensure_private_dir(path: Path) -> None:

@@ -245,7 +245,7 @@ def test_add_and_remove_source(env: Env, monkeypatch: pytest.MonkeyPatch) -> Non
     assert "unknown source" in env.tool("remove_source", source="nope")
     assert "could not add" in env.tool("add_source", link="not a link")
     unknown = env.tool("add_source", link="folderZZZZZZZZZZZZ")  # Google says 404
-    assert "cannot open that link" in unknown and "folderZZZ" not in unknown
+    assert "did not confirm" in unknown and "folderZZZ" not in unknown
     assert len(env.tool("list_sources")["sources"]) == 1  # nothing kept
 
 
@@ -410,7 +410,7 @@ def test_set_embedding_preview_confirm_and_restart(env: Env) -> None:
 
 
 def test_api_key_file_and_remove_embedding(env: Env, monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setenv("GDRAG_ALLOW_HTTP_EMBEDDINGS", "1")
+    monkeypatch.setenv("GDRAG_ALLOW_LOCAL_EMBEDDINGS", "1")
     write_secret(env, "openrouter.key", API_KEY + "\n")
     done = env.tool(
         "set_embedding",

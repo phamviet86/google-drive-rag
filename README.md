@@ -260,8 +260,9 @@ Cách bật:
 Những điều nên biết:
 
 - Việc có thể làm mất dữ liệu (bỏ nguồn, đổi hoặc xóa quyền Google, đổi khóa tìm theo ý nghĩa) luôn chạy hai lần: lần đầu Claude chỉ kể sẽ xảy ra gì, lần sau mới làm khi bạn đồng ý.
-- Đổi sang địa chỉ khác thì phải đưa khóa mới của địa chỉ đó; khóa cũ không bao giờ được gửi sang máy khác. Địa chỉ phải bắt đầu bằng `https://`. Chỉ máy trong mạng nội bộ mới được dùng `http://`, và phải thêm dòng `GDRAG_ALLOW_HTTP_EMBEDDINGS=1` vào `.env`.
+- Đổi sang địa chỉ khác thì phải đưa khóa mới của địa chỉ đó; khóa cũ không bao giờ được gửi sang máy khác. Địa chỉ phải bắt đầu bằng `https://`. Máy trong mạng nội bộ (ghi bằng số, ví dụ `http://192.168.1.5:8080/v1`) chỉ dùng được khi đã thêm dòng `GDRAG_ALLOW_LOCAL_EMBEDDINGS=1` vào `.env`.
 - Xóa quyền Google chỉ xóa bản lưu trên VPS, không thu hồi quyền ở phía Google. Muốn thu hồi hẳn: với đăng nhập Gmail, gỡ ứng dụng tại https://myaccount.google.com/permissions; với tài khoản dịch vụ, xóa khóa của nó trong Google Cloud hoặc thôi chia sẻ thư mục.
+- Thư mục `secrets` chỉ nên chứa những tệp dịch vụ này cần (tệp quyền Google, tệp khóa tìm theo ý nghĩa). Đừng để ở đó khóa hay mật khẩu của việc khác.
 - Tệp khóa phải nằm trong thư mục `secrets`. Claude chỉ cần tên tệp, ví dụ `openrouter.key`, nên khóa không phải dán vào cuộc trò chuyện. Công cụ không đọc được tệp nằm ngoài thư mục này.
 - Khóa và mã đăng nhập không bao giờ hiện trong câu trả lời, trong `sync_status` hay trong nhật ký.
 - Nếu `.env` đang ghi sẵn khóa, địa chỉ hay tệp Google, hãy chạy một lần `sudo docker compose exec gdrive-rag gdrive-rag config import-env`. Lệnh này lưu các giá trị đó vào dịch vụ (không in khóa ra) và liệt kê những dòng trong `.env` có thể để trống. Để trống các dòng đó rồi chạy `sudo docker compose up -d`.

@@ -46,8 +46,9 @@ def test_setup_from_environment(
     report = json.loads(output)
     assert report["share_folders_with"] == FAKE_KEY["client_email"]
     assert report["sources"][0]["ok"] is True  # added; resolved on the first sync
+    assert report["embeddings"] == "on"
     settings = load_settings(data, use_env=False)
-    assert settings.embedding_api_key == "sk-test-secret-value"
+    assert settings.embedding_api_key == ""  # setup no longer copies .env; see config import-env
     assert settings.google_auth == "service_account"
     for path in (settings.config_path, settings.service_account_file):
         assert stat.S_IMODE(path.stat().st_mode) == 0o600
@@ -59,6 +60,10 @@ def test_setup_from_environment(
 
     assert main(["--data-dir", str(data), "source", "list"]) == 0
     assert "folderAAAAAAAAAAAA" in capsys.readouterr().out
+    # it comes from GDRAG_DRIVE_LINKS, so it would be added back at the next start: refused
+    assert main(["--data-dir", str(data), "--json", "source", "remove", "1"]) == 2
+    assert "GDRAG_DRIVE_LINKS" in capsys.readouterr().out
+    monkeypatch.delenv("GDRAG_DRIVE_LINKS")
     assert main(["--data-dir", str(data), "--json", "source", "remove", "1"]) == 0
     assert json.loads(capsys.readouterr().out)["documents_removed"] == 0
 

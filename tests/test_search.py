@@ -46,7 +46,12 @@ def test_hybrid_search_with_real_client_against_stub(tmp_path: Path) -> None:
     stub = EmbeddingStub()
     try:
         client = OpenAICompatibleEmbeddings(
-            stub.url, "test-key", "qwen/qwen3-embedding-8b", 1024, DEFAULT_QUERY_INSTRUCTION
+            stub.url,
+            "test-key",
+            "qwen/qwen3-embedding-8b",
+            1024,
+            DEFAULT_QUERY_INSTRUCTION,
+            allow_local=True,  # the stub listens on 127.0.0.1
         )
         service = indexed(tmp_path, client)  # type: ignore[arg-type]
         assert service.status()["embeddings"]["vectors"] == 3

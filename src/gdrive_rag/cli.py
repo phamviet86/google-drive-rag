@@ -14,7 +14,7 @@ from collections.abc import Callable, Sequence
 from pathlib import Path
 from typing import Any
 
-from .config import DEFAULT_BASE_URL, DEFAULT_MODEL, load_settings, save_config
+from .config import DEFAULT_BASE_URL, DEFAULT_MODEL, load_settings
 
 
 def _service(args: argparse.Namespace) -> Any:
@@ -111,7 +111,8 @@ def cmd_source_list(args: argparse.Namespace) -> int:
 
 
 def cmd_source_remove(args: argparse.Namespace) -> int:
-    _print(_service(args).remove_source(args.source), args.json)
+    # the same rules as the remove_source tool (GDRAG_DRIVE_LINKS, running sync)
+    _print(_admin(args).remove_source(args.source, True), args.json)
     return 0
 
 
@@ -189,22 +190,24 @@ def cmd_setup(args: argparse.Namespace) -> int:
     env = os.environ
     report: dict[str, Any] = {}
 
-    base_url = env.get("GDRAG_EMBEDDING_BASE_URL") or current.embedding_base_url or DEFAULT_BASE_URL
-    model = env.get("GDRAG_EMBEDDING_MODEL") or current.embedding_model or DEFAULT_MODEL
-    key = env.get("GDRAG_EMBEDDING_API_KEY") or current.embedding_api_key
+    # Embeddings go through Admin.set_embedding, the same rules as the tool: the environment
+    # wins, a new address needs a new key, and the address checks apply. Values that come from
+    # the environment are not copied to config.json (use `config import-env` for that).
     if interactive:
         print("== 1/3 Tìm kiếm theo ý nghĩa (embedding). Nhấn Enter để bỏ qua. ==")
-        key = _ask("API key (OpenRouter)", key, secret=True)
-        if key:
-            base_url = _ask("Địa chỉ API", base_url)
-            model = _ask("Model", model)
-    save_config(
-        current.data_dir,
-        {"embedding_base_url": base_url, "embedding_model": model, "embedding_api_key": key},
-    )
-    report["embeddings"] = "on" if key else "off (full-text search only)"
-
+        new_key = _ask("API key mới (Enter = giữ khóa hiện có)", "", secret=True)
+        base_url = _ask("Địa chỉ API", current.embedding_base_url or DEFAULT_BASE_URL)
+        model = _ask("Model", current.embedding_model or DEFAULT_MODEL)
+        changed = (
+            new_key
+            or base_url.rstrip("/") != current.embedding_base_url
+            or model != current.embedding_model
+        )
+        if changed and (new_key or current.embedding_api_key):
+            _admin(args).set_embedding(base_url, model, api_key=new_key or None, confirm=True)
     settings = load_settings(args.data_dir)
+    report["embeddings"] = "on" if settings.embeddings_enabled else "off (full-text search only)"
+
     method = env.get("GDRAG_GOOGLE_AUTH", "").strip().lower().replace("-", "_")
     path = env.get("GDRAG_GOOGLE_CREDENTIALS", "").strip()
     if interactive:
@@ -215,6 +218,9 @@ def cmd_setup(args: argparse.Namespace) -> int:
         choice = _ask("Chọn", {"service_account": "1", "oauth": "2"}.get(method, ""))
         method = {"1": "service_account", "2": "oauth"}.get(choice, "")
         if method:
+            from .admin import require_google_unlocked
+
+            require_google_unlocked()  # same rule as the tools: .env values win
             path = _ask("Đường dẫn tới file JSON", path)
     if method and path:
         from .auth import import_client_secret, import_service_account, oauth_sign_in

@@ -8,14 +8,16 @@ Adapted from local-rag-mcp ``OpenAIEmbeddings`` (Apache-2.0).
 
 from __future__ import annotations
 
+import http.client
 import json
 import math
+import socket
+import ssl
 import time
 from collections.abc import Sequence
 from typing import Protocol
-from urllib.error import HTTPError, URLError
-from urllib.request import HTTPRedirectHandler, Request, build_opener
 
+from . import netcheck
 from .config import Settings
 
 BATCH_SIZE = 32
@@ -25,15 +27,36 @@ RETRY_STATUSES = frozenset({408, 429, 500, 502, 503, 504})
 REJECTED_STATUSES = frozenset({400, 413, 422})
 
 
-class _NoRedirect(HTTPRedirectHandler):
-    """Never follow a redirect: it would carry the ``Authorization`` header to another host
-    (or from https to http). A 3xx answer becomes an error naming only its status."""
+class _PinnedHTTPS(http.client.HTTPSConnection):
+    """TLS to ``host`` (certificate and SNI) over a socket to the address that was checked, so
+    a DNS answer that changes after the check cannot redirect the request."""
 
-    def redirect_request(self, *args: object, **kwargs: object) -> None:
-        return None
+    def __init__(self, host: str, address: str, port: int, timeout: float):
+        super().__init__(host, port, timeout=timeout, context=ssl.create_default_context())
+        self._address = address
+
+    def connect(self) -> None:
+        sock = socket.create_connection((self._address, self.port), self.timeout)
+        self.sock = self._context.wrap_socket(sock, server_hostname=self.host)  # type: ignore[attr-defined]
 
 
-_OPENER = build_opener(_NoRedirect)
+def _post(
+    base_url: str, path: str, body: bytes, headers: dict[str, str], timeout: float, allow: bool
+) -> tuple[int, bytes]:
+    """POST without following redirects (``http.client`` never does), after the address check
+    in ``netcheck``; the connection goes to the very address that passed it."""
+    scheme, host, port, prefix, address = netcheck.check(base_url, allow)
+    target = prefix.rstrip("/") + path
+    if scheme == "https":
+        connection: http.client.HTTPConnection = _PinnedHTTPS(host, str(address), port, timeout)
+    else:
+        connection = http.client.HTTPConnection(str(address), port, timeout=timeout)
+    try:
+        connection.request("POST", target, body=body, headers={**headers, "Host": host})
+        response = connection.getresponse()
+        return response.status, response.read()
+    finally:
+        connection.close()
 
 
 class EmbeddingError(RuntimeError):
@@ -82,8 +105,11 @@ class OpenAICompatibleEmbeddings:
         instruction: str,
         timeout: float = 60,
         retries: int = 3,
+        allow_local: bool | None = None,
     ):
         self.base_url = base_url.rstrip("/")
+        # loopback/private endpoints only with GDRAG_ALLOW_LOCAL_EMBEDDINGS (read once here)
+        self.allow_local = netcheck.local_allowed() if allow_local is None else allow_local
         self._api_key = api_key
         self.model = model
         self.dimensions = dimensions
@@ -111,33 +137,36 @@ class OpenAICompatibleEmbeddings:
         timeout = self.timeout if timeout is None else timeout
         retries = self.retries if retries is None else retries
         body = json.dumps({"model": self.model, "input": texts}).encode()
-        request = Request(
-            f"{self.base_url}/embeddings",
-            data=body,
-            headers={
-                "Authorization": f"Bearer {self._api_key}",
-                "Content-Type": "application/json",
-            },
-            method="POST",
-        )
+        headers = {
+            "Authorization": f"Bearer {self._api_key}",
+            "Content-Type": "application/json",
+        }
         payload: dict[str, object] = {}
         for attempt in range(retries + 1):
             try:
-                with _OPENER.open(request, timeout=timeout) as response:
-                    payload = json.loads(response.read().decode())
-                break
-            except HTTPError as exc:
-                if exc.code in RETRY_STATUSES and attempt < retries:
-                    time.sleep(2**attempt)
-                    continue
-                raise EmbeddingError(
-                    f"embedding request failed (HTTP {exc.code})", exc.code in REJECTED_STATUSES
-                ) from None
-            except (URLError, TimeoutError, OSError, ValueError) as exc:
+                status, raw = _post(
+                    self.base_url, "/embeddings", body, headers, timeout, self.allow_local
+                )
+            except netcheck.DestinationRefused as exc:
+                raise EmbeddingError(f"embedding request refused: {exc}") from None
+            except (TimeoutError, OSError, http.client.HTTPException) as exc:
                 if attempt < retries:
                     time.sleep(2**attempt)
                     continue
                 raise EmbeddingError(f"embedding request failed ({type(exc).__name__})") from None
+            if status in RETRY_STATUSES and attempt < retries:
+                time.sleep(2**attempt)
+                continue
+            if not 200 <= status < 300:  # a redirect is an error too: it is never followed
+                raise EmbeddingError(
+                    f"embedding request failed (HTTP {status})", status in REJECTED_STATUSES
+                )
+            try:
+                value = json.loads(raw.decode())
+            except ValueError:
+                raise EmbeddingError("embedding endpoint returned an unexpected response") from None
+            payload = value if isinstance(value, dict) else {}
+            break
         data = payload.get("data")
         if not isinstance(data, list) or len(data) != len(texts):
             raise EmbeddingError("embedding endpoint returned an unexpected response")

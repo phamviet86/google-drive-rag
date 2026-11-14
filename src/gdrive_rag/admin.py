@@ -21,7 +21,6 @@ Rules every operation follows:
 from __future__ import annotations
 
 import contextlib
-import ipaddress
 import json
 import os
 import re
@@ -31,8 +30,8 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
-from urllib.parse import urlparse
 
+from . import netcheck
 from .auth import (
     GoogleOAuthFlow,
     OAuthFlow,
@@ -62,8 +61,7 @@ OAUTH_EXPIRY_SECONDS = 600
 MAX_SECRET_FILE_BYTES = 1_000_000
 MAX_API_KEY_CHARS = 4096
 KEY_PATTERN = re.compile(rf"[A-Za-z0-9._~+/=-]{{16,{MAX_API_KEY_CHARS}}}")
-HTTP_ENV = "GDRAG_ALLOW_HTTP_EMBEDDINGS"
-METADATA_HOSTS = {"metadata.google.internal", "metadata"}
+GOOGLE_SECRET_MARKERS = ("GOCSPX-", "ya29.", "1//", "-----BEGIN")
 TRUE = {"1", "true", "yes", "on"}
 REVOKE_HINT = (
     "Access is not revoked at Google. For a Gmail sign-in, remove this app at "
@@ -149,13 +147,13 @@ class Admin:
         if result.get("already_added"):
             answer["message"] = "This source was already added; nothing changed."
             return answer
-        if result.get("status") == "error":
-            # Google answered "not found or not shared": keep nothing (a bare ID that is really
-            # a mistyped key must not end up in list_sources)
+        if result.get("status") == "error" or result.get("kind") == "unknown":
+            # Google did not confirm it (404, not shared, or Google access not working): keep
+            # nothing, so a mistyped key that looks like an ID never reaches list_sources
             self.service.discard_source(int(result["id"]))
             raise AdminRefused(
-                "Google cannot open that link or ID (not found, or not shared with the Google "
-                "account in use); nothing was added"
+                "Google did not confirm that link or ID (not found, not shared with the Google "
+                "account in use, or Google access is not set up); nothing was added"
             )
         answer["sync"] = self.service.queue_sync(int(result["id"]))
         answer["message"] = "Source added; it is read in the background. Check sync_status."
@@ -360,16 +358,14 @@ class Admin:
                 connection.execute("SELECT count(DISTINCT chunk_hash) FROM chunks").fetchone()[0]
             )
         same = stored == identity
-        url = urlparse(base_url)
-        host = url.hostname or ""
-        port = url.port or (443 if url.scheme == "https" else 80)
+        scheme, host, port, path = netcheck.parse(base_url)
         plan: dict[str, Any] = {
             "sends_text_to": host,
             "endpoint": {
-                "scheme": url.scheme,
+                "scheme": scheme,
                 "host": host,
                 "port": port,
-                "path": url.path or "/",
+                "path": path,
             },
             "host_changes": moves,
             "model": model,
@@ -380,7 +376,7 @@ class Admin:
         }
         warning = (
             f"Your API key and the text of every indexed document will be sent to {host} "
-            f"({url.scheme}, port {port}, path {url.path or '/'}) to "
+            f"({scheme}, port {port}, path {path}) to "
             "compute embeddings."
         )
         if not same and vectors:
@@ -388,7 +384,7 @@ class Admin:
                 f" The {vectors} stored vectors are dropped and {chunks} chunks are embedded "
                 "again; search is full-text only until that finishes."
             )
-        if urlparse(base_url).scheme == "http":
+        if scheme == "http":
             warning += " The address uses http, so the text is not encrypted on the way."
         if not confirm:
             return {"applied": False, "confirm_needed": True, "would": warning, **plan}
@@ -433,6 +429,7 @@ def import_environment(service: Service) -> dict[str, Any]:
     if values:
         save_config(settings.data_dir, values)
         blank += [name for name, key in ENV_FIELDS.items() if key in values]
+    settings = service.reload()
     credentials = os.environ.get("GDRAG_GOOGLE_CREDENTIALS", "").strip()
     if credentials:
         try:
@@ -445,6 +442,7 @@ def import_environment(service: Service) -> dict[str, Any]:
             blank.append("GDRAG_GOOGLE_CREDENTIALS")
         except (OSError, ValueError, AttributeError):
             problems["GDRAG_GOOGLE_CREDENTIALS"] = "the file could not be read or imported"
+    service.reload()  # sources below are resolved with the credentials just stored
     links = os.environ.get("GDRAG_DRIVE_LINKS", "").replace(",", " ").split()
     if links:
         results = service.add_sources(links)
@@ -502,55 +500,26 @@ def _refuse_environment(changes: dict[str, Any]) -> dict[str, Any]:
 
 
 def _endpoint(value: str) -> str:
-    """https only; plain http only to a loopback or private address and only when
-    ``GDRAG_ALLOW_HTTP_EMBEDDINGS`` is on. Link-local (cloud metadata) addresses are refused."""
-    text = str(value).strip()
-    try:
-        url = urlparse(text)
-        url.port  # noqa: B018 - raises on a bad port
-    except ValueError:
-        raise AdminRefused("base_url is not a valid address") from None
-    host = (url.hostname or "").lower()
-    if url.scheme not in {"https", "http"} or not host:
-        raise AdminRefused("base_url must be an https address such as https://host/api/v1")
-    if url.username or url.password or url.query or url.fragment:
-        raise AdminRefused("base_url must not contain a user name, password or query")
-    address = _ip(host)
-    if host in METADATA_HOSTS or (address is not None and address.is_link_local):
-        raise AdminRefused("base_url points at a link-local or cloud metadata address")
-    if url.scheme == "http":
-        local = host == "localhost" or (
-            address is not None and (address.is_loopback or address.is_private)
-        )
-        if not local or os.environ.get(HTTP_ENV, "").strip().lower() not in TRUE:
-            raise AdminRefused(
-                f"base_url must use https (plain http is allowed only to a loopback or private "
-                f"address, with {HTTP_ENV}=1)"
-            )
-    return text.rstrip("/")
-
-
-def _ip(host: str) -> ipaddress.IPv4Address | ipaddress.IPv6Address | None:
-    try:
-        return ipaddress.ip_address(host.strip("[]"))
-    except ValueError:
-        return None
+    """The address rules of ``netcheck`` (shape, resolution, http only to literal local
+    addresses), applied when the address is set; the client applies them again per request."""
+    netcheck.check(value)
+    return str(value).strip().rstrip("/")
 
 
 def _origin(base_url: str) -> tuple[str, str, int | None]:
-    url = urlparse(str(base_url or "").strip())
     try:
-        port = url.port
+        scheme, host, port, _ = netcheck.parse(base_url)
     except ValueError:
-        port = None
-    default = {"https": 443, "http": 80}.get(url.scheme)
-    return url.scheme, (url.hostname or "").lower(), port or default
+        return "", str(base_url or ""), None  # unparsable: never the same origin
+    return scheme, host, port
 
 
 def _api_key(value: str) -> str:
     """Only key-like text: one token of ``[A-Za-z0-9._~+/=-]``, 16 to 4096 characters. A JSON
     file (an OAuth client, a service-account key) is refused, so it is never sent as a key."""
     key = value.strip()
+    if any(marker in key for marker in GOOGLE_SECRET_MARKERS):
+        raise AdminRefused("that looks like a Google credential, not an embedding API key")
     if not KEY_PATTERN.fullmatch(key):
         raise AdminRefused(
             "that is not an API key (expected one line of letters, digits and ._~+/=-)"

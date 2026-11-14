@@ -97,7 +97,7 @@ def test_api_key_file_must_look_like_a_key(env: Env) -> None:
             api_key_file=name,
             confirm=True,
         )
-        assert "not an API key" in refused, name
+        assert "not an API key" in refused or "Google credential" in refused, name
     assert env.service.settings.embedding_api_key == ""
     assert CLIENT_SECRET not in json.dumps(load_settings(env.data).public())
 
@@ -143,7 +143,9 @@ def redirecting() -> Iterator[str]:
 
 
 def test_embedding_requests_never_follow_redirects(redirecting: str) -> None:
-    client = OpenAICompatibleEmbeddings(redirecting, API_KEY, "m", 32, "", retries=0)
+    client = OpenAICompatibleEmbeddings(
+        redirecting, API_KEY, "m", 32, "", retries=0, allow_local=True
+    )
     with pytest.raises(EmbeddingError) as raised:
         client.embed_documents(["x"])
     assert "HTTP 302" in str(raised.value) and "stolen" not in str(raised.value)
@@ -292,7 +294,7 @@ def test_base_url_rules(env: Env, monkeypatch: pytest.MonkeyPatch) -> None:
         return env.tool("set_embedding", base_url=url, model="m", api_key=API_KEY)
 
     assert "https" in attempt("http://embed.example/v1")
-    assert "GDRAG_ALLOW_HTTP_EMBEDDINGS" in attempt("http://192.168.1.5:8080/v1")
+    assert "GDRAG_ALLOW_LOCAL_EMBEDDINGS" in attempt("http://192.168.1.5:8080/v1")
     for url in (
         "https://169.254.169.254/v1",
         "http://169.254.169.254/latest",
@@ -300,9 +302,10 @@ def test_base_url_rules(env: Env, monkeypatch: pytest.MonkeyPatch) -> None:
         "https://[fe80::1]/v1",
     ):
         assert "link-local" in attempt(url), url
-    monkeypatch.setenv("GDRAG_ALLOW_HTTP_EMBEDDINGS", "1")
+    monkeypatch.setenv("GDRAG_ALLOW_LOCAL_EMBEDDINGS", "1")
     assert "https" in attempt("http://embed.example/v1")  # public hosts still need https
-    for url in ("http://192.168.1.5:8080/v1", "http://127.0.0.1:11434/v1", "http://localhost/v1"):
+    assert "literal" in attempt("http://localhost/v1")  # http only to a literal address
+    for url in ("http://192.168.1.5:8080/v1", "http://127.0.0.1:11434/v1"):
         preview = attempt(url)
         assert preview["applied"] is False and "not encrypted" in preview["would"], url
 

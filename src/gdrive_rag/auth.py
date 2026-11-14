@@ -13,7 +13,7 @@ from collections.abc import Callable
 from typing import Any, Protocol
 from urllib.parse import parse_qs, urlparse
 
-from .config import Settings, save_config, write_private
+from .config import Settings, save_config, token_lock, write_private
 from .drive import SCOPES
 
 REDIRECT_URI = "http://localhost:53682/"
@@ -60,14 +60,15 @@ def store_oauth_token(settings: Settings, client: dict[str, Any], token_json: st
 def remove_google_files(settings: Settings) -> list[str]:
     """Delete the stored service-account key, OAuth client and token; return what was removed."""
     removed: list[str] = []
-    for label, path in (
-        ("service_account", settings.service_account_file),
-        ("oauth_client", settings.client_secret_file),
-        ("oauth_token", settings.token_file),
-    ):
-        if path.is_file():
-            path.unlink()
-            removed.append(label)
+    with token_lock(settings.token_file):  # a token refresh cannot write it back meanwhile
+        for label, path in (
+            ("service_account", settings.service_account_file),
+            ("oauth_client", settings.client_secret_file),
+            ("oauth_token", settings.token_file),
+        ):
+            if path.is_file():
+                path.unlink()
+                removed.append(label)
     save_config(settings.data_dir, {"google_auth": "none"})
     return removed
 
@@ -117,7 +118,9 @@ def parse_redirect(answer: str, expected_state: str, allow_bare_code: bool = Tru
         return answer
     query = parse_qs(urlparse(answer).query if "://" in answer else answer.lstrip("?"))
     if "error" in query:
-        raise ValueError(f"Google returned an error: {query['error'][0]}")
+        raise ValueError(
+            "Google returned an error instead of a code (sign-in cancelled or refused)"
+        )
     state = query.get("state", [""])[0]
     if (expected_state or not allow_bare_code) and state != expected_state:
         raise ValueError("the pasted address belongs to a different sign-in attempt")
