@@ -23,6 +23,14 @@ OCR_MODEL_FILES = (
     "pp-ocrv6_small_rec.onnx",
     "ppocrv6_dict.txt",
 )
+OCR_MODEL_BASE_URL = "https://github.com/GreatV/oar-ocr/releases/download/v0.7.0/"
+# Pinned SHA-256 of each model file. They are fetched with Python (system CA store) because the
+# extractor's own downloader fails TLS verification on some hosts (seen on linux/arm64).
+OCR_MODEL_SHA256 = {
+    "pp-ocrv6_small_det.onnx": "d73e0058b7a8086bbd57f3d10b8bcd4ff95363f67e06e2762b5e814fe9c9410e",
+    "pp-ocrv6_small_rec.onnx": "5435fd747c9e0efe15a96d0b378d5bd157e9492ed8fd80edf08f30d02fa24634",
+    "ppocrv6_dict.txt": "b5f2bfe2bdd9448429e3e82b51c789775d9b42f2403d082b00662eb77e401c5d",
+}
 
 ARTIFACTS: dict[tuple[str, str], dict[str, tuple[str, str]]] = {
     ("linux", "x86_64"): {
@@ -124,6 +132,7 @@ class OCRRuntimeManager:
         if not self.configure():
             raise RuntimeError("installed OCR runtime could not be configured")
         self.model_dir.mkdir(parents=True, exist_ok=True)
+        self.fetch_models()
         temporary: Path | None = None
         try:
             with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as handle:
@@ -131,14 +140,6 @@ class OCRRuntimeManager:
                 handle.write(_smoke_pdf())
             import pdf_inspector
 
-            first = pdf_inspector.process_pdf_with_ocr(
-                str(temporary),
-                mode="force",
-                page_numbers=[1],
-                offline=False,
-            )
-            if not first.pages:
-                raise RuntimeError("OCR verification produced no page result")
             resolved_model_dir = self.resolved_model_dir()
             if resolved_model_dir is None:
                 raise RuntimeError("OCR model cache was not populated with the pinned model files")
@@ -160,6 +161,22 @@ class OCRRuntimeManager:
             json.dumps(manifest, indent=2) + "\n", encoding="utf-8"
         )
         return manifest
+
+    def fetch_models(self) -> Path:
+        """Download the pinned OCR model files into the model cache, verified by SHA-256."""
+        target = self.model_dir / OCR_MODEL_REVISION
+        target.mkdir(parents=True, exist_ok=True)
+        for name, expected in OCR_MODEL_SHA256.items():
+            destination = target / name
+            if destination.is_file() and _sha256(destination) == expected:
+                continue
+            temporary = destination.with_suffix(destination.suffix + ".part")
+            urllib.request.urlretrieve(OCR_MODEL_BASE_URL + name, temporary)
+            if _sha256(temporary) != expected:
+                temporary.unlink(missing_ok=True)
+                raise RuntimeError(f"checksum mismatch for {name}")
+            temporary.replace(destination)
+        return target
 
     def resolved_model_dir(self) -> Path | None:
         candidates = [self.model_dir]
