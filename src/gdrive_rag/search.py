@@ -1,9 +1,18 @@
 """Hybrid retrieval: FTS5 (accent-folded) + numpy cosine over stored vectors.
 
-FTS finds candidates; they are re-scored by rarity-weighted coverage of the query terms plus
-adjacency (``ranking.py``). Fusion is score-aware: ``LEXICAL_WEIGHT`` x lexical score (0..1) plus
-the rest x cosine scaled within the vector list. Rank-only RRF let chunks that were mediocre in
-both lists beat one strong lexical match (see ``tests/test_ranking_eval.py``).
+Weighted reciprocal-rank fusion of four signals (``WEIGHTS``):
+
+- text: FTS candidates ordered by rarity-weighted coverage of the query terms plus adjacency
+  (``ranking.lexical_score``), so "tháng", "là", "bao nhiêu" and table repetition count little;
+- vector: cosine order of the stored embeddings;
+- title: the same coverage over the file name and folder path ("20.3.1_bao-cao-2026" gives
+  bao, cao, 2026), which names the topic of spreadsheets whose rows are only numbers; all
+  chunks of one file share one rank;
+- phrase: chunks that contain the whole query as a phrase (short keywords, codes).
+
+Tuned on a copy of a real index with live query vectors (``scripts/eval_ranking.py``); a
+lexical-heavy score fusion tried before lost there to plain RRF, because real embeddings are
+right more often than a bag-of-words fake suggests. ``tests/test_ranking_eval.py`` guards it.
 
 The vector-matrix cache follows local-rag-mcp ``search.py`` (Apache-2.0). Vectors are
 used only when the stored embedding identity matches the configured client, so vectors from two
@@ -24,10 +33,11 @@ import numpy as np
 from .db import TERM, Database, fts_fold
 from .drive import parse_drive_link
 from .embeddings import EmbeddingClient
-from .ranking import idf, lexical_score, tokens
+from .ranking import contains_phrase, idf, lexical_score, title_score, tokens
 
 CANDIDATES = 200  # FTS candidates re-scored per query
-LEXICAL_WEIGHT = 0.7  # chosen with tests/test_ranking_eval.py; the vectors keep 0.3
+RRF_K = 60
+WEIGHTS = {"text": 1.0, "vector": 1.0, "title": 2.0, "phrase": 2.0}
 SNIPPET_CHARS = 800
 PER_DOCUMENT = 3  # soft: lifted when fewer than ``limit`` hits would remain
 MAX_FILES = 50
@@ -59,7 +69,7 @@ class SearchEngine:
         warnings: list[str] = []
         scope = self._scope(source, folder, files)
         pool = max(limit * 5, 40)
-        lexical = self._full_text(terms, scope, pool)
+        lexical, phrases, query_terms, weights = self._full_text(terms, scope, pool)
         semantic: list[tuple[int, float]] = []
         client = self.embeddings()
         mode = "full_text"
@@ -72,7 +82,9 @@ class SearchEngine:
                     mode = "hybrid"
                 except Exception as exc:  # network/key problems must not break search
                     warnings.append(f"semantic search unavailable ({exc}); FTS only")
-        scores = fuse(lexical, semantic)
+        candidates = {c for c, _, _ in lexical} | {c for c, _ in semantic}
+        titles = self._title_scores(candidates, query_terms, weights)
+        scores = fuse(lexical, semantic, titles, phrases)
         ordered = sorted(scores, key=lambda chunk_id: scores[chunk_id], reverse=True)
         results = self._rows(ordered, scores, limit)
         if explain:
@@ -88,6 +100,8 @@ class SearchEngine:
                     "bm25": _round(lexical_hit[2]),
                     "vector_rank": vector_hit[0],
                     "vector_score": _round(vector_hit[1]),
+                    "title_score": _round(titles.get(chunk_id)),
+                    "phrase": chunk_id in phrases,
                     "fused": hit["score"],
                 }
         for hit in results:
@@ -148,10 +162,11 @@ class SearchEngine:
 
     def _full_text(
         self, terms: list[str], scope: tuple[str, list[Any]], pool: int
-    ) -> list[tuple[int, float, float]]:
-        """``(chunk id, lexical score 0..1, bm25)``, best first. FTS (all terms, then any term)
-        finds up to ``CANDIDATES`` chunks; they are re-scored by rarity-weighted coverage of the
-        distinct query terms plus adjacency (``ranking.lexical_score``), bm25 breaking ties."""
+    ) -> tuple[list[tuple[int, float, float]], set[int], list[str], dict[str, float]]:
+        """FTS (all terms, then any term) finds up to ``CANDIDATES`` chunks, re-scored by
+        ``ranking.lexical_score`` with bm25 breaking ties. Returns ``(chunk id, lexical score,
+        bm25)`` best first, the chunks containing the query as a phrase, the folded query terms
+        and their rarity weights."""
         folded = [f'"{fts_fold(term)}"' for term in terms]
         found: dict[int, float] = {}
         with self.db.read() as connection:
@@ -171,9 +186,9 @@ class SearchEngine:
                     found.setdefault(int(row[0]), float(row[1]))
                 if len(terms) == 1:
                     break
-            if not found:
-                return []
             query = tokens(" ".join(terms))
+            if not found:
+                return [], set(), query, {}
             total = int(connection.execute("SELECT count(*) FROM chunks").fetchone()[0])
             weights = {
                 term: idf(
@@ -199,8 +214,29 @@ class SearchEngine:
                 )
             }
         scored = [(c, lexical_score(query, weights, texts.get(c, "")), b) for c, b in found.items()]
+        phrases = {c for c in found if contains_phrase(query, texts.get(c, ""))}
         scored.sort(key=lambda item: (-item[1], item[2]))
-        return scored[:pool]
+        return scored[:pool], phrases, query, weights
+
+    def _title_scores(
+        self, chunk_ids: set[int], query: list[str], weights: dict[str, float]
+    ) -> dict[int, float]:
+        """Rarity-weighted share of the query terms found in each chunk's file name and folder
+        path ("20.3.1_bao-cao-2026" -> bao, cao, 2026)."""
+        if not chunk_ids or not weights:
+            return {}
+        ids = list(chunk_ids)
+        output: dict[int, float] = {}
+        with self.db.read() as connection:
+            for start in range(0, len(ids), 500):
+                batch = ids[start : start + 500]
+                for row in connection.execute(
+                    "SELECT c.id, d.name, d.path FROM chunks c JOIN documents d "
+                    f"ON d.id=c.document_id WHERE c.id IN ({','.join('?' for _ in batch)})",
+                    batch,
+                ):
+                    output[int(row[0])] = title_score(query, weights, f"{row[1]} {row[2]}")
+        return output
 
     def _semantic(
         self, client: EmbeddingClient, query: str, scope: tuple[str, list[Any]], pool: int
@@ -311,15 +347,26 @@ def _round(value: float | None) -> float | None:
 
 
 def fuse(
-    lexical: list[tuple[int, float, float]], semantic: list[tuple[int, float]]
+    lexical: list[tuple[int, float, float]],
+    semantic: list[tuple[int, float]],
+    titles: dict[int, float],
+    phrases: set[int],
 ) -> dict[int, float]:
-    """Relative score fusion of the lexical list ``(id, score 0..1, bm25)`` and the vector list
-    ``(id, cosine)``: the lexical score is used as is (it is comparable across queries), the
-    cosine as a share of the best cosine. Min-max scaling was tried and rejected: in a narrow
-    ``files``/``folder`` scope with a handful of chunks it turned small cosine gaps into 0 and 1."""
-    scores = {chunk_id: LEXICAL_WEIGHT * score for chunk_id, score, _ in lexical}
-    high = semantic[0][1] if semantic else 0.0
-    for chunk_id, cosine in semantic:
-        scaled = max(0.0, cosine) / high if high > 0 else 0.0
-        scores[chunk_id] = scores.get(chunk_id, 0.0) + (1 - LEXICAL_WEIGHT) * scaled
+    """Weighted reciprocal-rank fusion: each signal adds ``WEIGHTS[signal] / (RRF_K + rank)``.
+    Title ranks tie for equal title scores; every phrase chunk counts as rank 1."""
+    scores: dict[int, float] = {}
+
+    def add(chunk_id: int, signal: str, rank: int) -> None:
+        scores[chunk_id] = scores.get(chunk_id, 0.0) + WEIGHTS[signal] / (RRF_K + rank)
+
+    for rank, (chunk_id, _, _) in enumerate(lexical, 1):
+        add(chunk_id, "text", rank)
+    for rank, (chunk_id, _) in enumerate(semantic, 1):
+        add(chunk_id, "vector", rank)
+    positive = [value for value in titles.values() if value > 0]
+    for chunk_id, value in titles.items():
+        if value > 0:
+            add(chunk_id, "title", 1 + sum(1 for other in positive if other > value))
+    for chunk_id in phrases:
+        add(chunk_id, "phrase", 1)
     return scores

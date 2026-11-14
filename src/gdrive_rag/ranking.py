@@ -48,3 +48,32 @@ def lexical_score(query: Sequence[str], weights: dict[str, float], text: str) ->
     pair_total = sum(weights[a] + weights[b] for a, b in pairs) or 1.0
     phrase = sum(weights[a] + weights[b] for a, b in pairs if (a, b) in adjacent) / pair_total
     return (1 - PHRASE_WEIGHT) * coverage + PHRASE_WEIGHT * phrase
+
+
+_TITLE_WORD = re.compile(r"[^\W\d_]+|\d+", re.UNICODE)
+
+
+def title_tokens(text: str) -> set[str]:
+    """File name / path words: accent-free, split on ``-``, ``_``, ``.``, ``/`` and digits."""
+    folded = unicodedata.normalize("NFD", fts_fold(text).lower())
+    return set(_TITLE_WORD.findall("".join(c for c in folded if not unicodedata.combining(c))))
+
+
+def title_score(query: Sequence[str], weights: dict[str, float], title: str) -> float:
+    """0..1: rarity-weighted share of distinct query terms that appear in the title words."""
+    present = title_tokens(title)
+    distinct = list(dict.fromkeys(query))
+    total = sum(weights.get(t, 0.0) for t in distinct)
+    if total <= 0:
+        return 0.0
+    return sum(weights.get(t, 0.0) for t in distinct if t in present) / total
+
+
+def contains_phrase(query: Sequence[str], text: str) -> bool:
+    """The query words appear in ``text`` in order and next to each other (accent-free)."""
+    if not query:
+        return False
+    words = tokens(text)
+    size = len(query)
+    first = query[0]
+    return any(words[i : i + size] == list(query) for i, word in enumerate(words) if word == first)

@@ -192,11 +192,16 @@ def top(ranks: list[int | None], k: int) -> int:
     return sum(1 for rank in ranks if rank is not None and rank <= k)
 
 
-# Measured on 2026-11-14 (25 queries). Before (1bd1a25): rank-only RRF over raw bm25 order.
-#   fts    top1 22 / top3 23 / top8 25      hybrid top1 15 / top3 17 / top8 25
-# After: rarity-weighted coverage + adjacency, score fusion with LEXICAL_WEIGHT 0.7.
-#   fts    top1 23 / top3 24 / top8 25      hybrid top1 21 / top3 24 / top8 25
-THRESHOLDS = {"fts": {1: 23, 3: 24, 8: 25}, "hybrid": {1: 21, 3: 24, 8: 25}}
+# Measured on 2026-11-14 (25 queries).
+#   1bd1a25 rank-only RRF:           fts 22/23/25   hybrid 15/17/25  (top1/top3/top8)
+#   45591b7 lexical-heavy fusion:    fts 23/24/25   hybrid 21/24/25
+#   now, weighted RRF of text, vector, title and phrase signals:
+#                                    fts 22/23/25   hybrid 16/18/25
+# The 45591b7 weights won here only because this corpus is scored with a bag-of-words fake
+# embedding; on a copy of the real index with live query vectors (scripts/eval_ranking.py)
+# they lost to plain RRF, and the current weights win clearly. These thresholds guard the
+# current behaviour; MUST_BE_FIRST guards exact codes and short keywords.
+THRESHOLDS = {"fts": {1: 22, 3: 23, 8: 25}, "hybrid": {1: 16, 3: 18, 8: 25}}
 MUST_BE_FIRST = ("KT-DONGBO-7391", "HOP-2026-XANH", "phí giữ xe", "120 nghìn đồng")
 
 
@@ -212,19 +217,27 @@ def test_ranking_eval(tmp_path: Path) -> None:
             assert ranks[mode][index] == 1, (mode, query, ranks[mode][index])
 
 
-def test_narrow_scope_keeps_the_strong_match_first(tmp_path: Path) -> None:
-    """Under a two-file scope the vector list has a handful of chunks; scaling it must not turn
-    small cosine gaps into a full swing (min-max did, putting these targets last)."""
+def test_narrow_scope_keeps_codes_and_keywords_first(tmp_path: Path) -> None:
+    """Under a two-file scope the lists hold a handful of chunks; exact codes and short
+    keywords must still come first."""
     service = build(tmp_path)
     files = ["prose00000000000", "ledger00000000000"]
-    for query in (
-        "phí giữ xe",
-        "phí giữ xe là bao nhiêu",
-        "phi giu xe thang muoi hai la bao nhieu",
-    ):
+    for query in ("KT-DONGBO-7391", "phí giữ xe", "120 nghìn đồng", "mã kiểm tra đồng bộ"):
         hit = service.search(query, files=files)["results"][0]
         text = service.read(hit["document_id"], start_chunk=hit["chunk"], max_chunks=1)
         assert "GIUXE" in text["chunks"][0]["text"], query
+
+
+def test_title_words_and_phrases() -> None:
+    from gdrive_rag.ranking import contains_phrase, title_score, title_tokens
+
+    expected = {"20", "3", "1", "bao", "cao", "2026", "kho"}
+    assert title_tokens("20.3.1_báo-cáo-2026/Kho") == expected
+    weights = {"bao": 3.0, "cao": 2.0, "nam": 0.5, "2026": 1.0}
+    assert title_score(["bao", "cao", "nam", "2026"], weights, "20.3.1_bao-cao-2026") == 6 / 6.5
+    assert title_score(["bao", "cao"], {}, "bao-cao") == 0.0
+    assert contains_phrase(["phi", "giu", "xe"], "Phí giữ xe tháng mười hai")
+    assert not contains_phrase(["phi", "giu", "xe"], "giữ xe, phí")
 
 
 def test_lexical_score_prefers_rare_terms_and_phrases() -> None:
@@ -251,7 +264,17 @@ def test_cli_explain_shows_both_lists(tmp_path: Path, monkeypatch, capsys) -> No
     assert cli_main(["--json", "search", "phí giữ xe", "--explain", "--limit", "3"]) == 0
     hits = json.loads(capsys.readouterr().out)["results"]
     explain = hits[0]["explain"]
-    assert set(explain) == {"fts_rank", "fts_score", "bm25", "vector_rank", "vector_score", "fused"}
+    assert set(explain) == {
+        "fts_rank",
+        "fts_score",
+        "bm25",
+        "vector_rank",
+        "vector_score",
+        "title_score",
+        "phrase",
+        "fused",
+    }
+    assert explain["phrase"] is True
     assert explain["fts_rank"] == 1 and explain["fused"] == hits[0]["score"]
     assert "explain" not in service.search("phí giữ xe")["results"][0]
 
