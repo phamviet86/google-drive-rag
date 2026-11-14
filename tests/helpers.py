@@ -15,11 +15,13 @@ from typing import Any
 from gdrive_rag.config import Settings
 from gdrive_rag.drive import (
     Download,
+    DriveFolder,
     DriveItem,
     DriveItemError,
     DriveRoot,
     DriveSourceError,
     Listing,
+    display_segment,
 )
 from gdrive_rag.extract import Extractor
 from gdrive_rag.service import Service
@@ -28,20 +30,33 @@ DOCX = "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
 
 
 class FakeDrive:
-    """In-memory Drive: roots, files per root, and file bytes. Errors can be injected."""
+    """In-memory Drive: one folder tree (ID -> name, parent), files per root, file bytes.
+
+    A file is put under a root and, optionally, a subfolder (``parent``). A root lists every
+    file whose parent chain passes through it, so a subfolder added as a second source sees the
+    same files. Paths follow the folder tree unless ``path`` is given. Errors can be injected.
+    """
 
     def __init__(self) -> None:
         self.roots: dict[str, DriveRoot] = {}
+        self.folders: dict[str, tuple[str, str]] = {}  # id -> (name, parent id)
         self.files: dict[str, list[DriveItem]] = {}
         self.content: dict[str, bytes] = {}
         self.root_errors: dict[str, Exception] = {}
         self.incomplete: set[str] = set()
         self.downloads: list[str] = []
         self.download_errors: dict[str, Exception] = {}
+        self.explicit_paths: set[str] = set()
 
     def add_root(self, root_id: str, name: str, kind: str = "folder") -> None:
         self.roots[root_id] = DriveRoot(root_id, name, kind)
         self.files.setdefault(root_id, [])
+        if kind != "file":
+            self.folders[root_id] = (name, self.folders.get(root_id, ("", ""))[1])
+
+    def add_folder(self, folder_id: str, name: str, parent: str) -> None:
+        """Add, rename (same parent) or move (new parent) a folder."""
+        self.folders[folder_id] = (name, parent)
 
     def put(
         self,
@@ -52,6 +67,7 @@ class FakeDrive:
         mime: str = "text/plain",
         version: str = "1",
         path: str | None = None,
+        parent: str | None = None,
     ) -> DriveItem:
         item = DriveItem(
             file_id,
@@ -62,7 +78,12 @@ class FakeDrive:
             hashlib.md5(data).hexdigest(),
             len(data),
             f"https://drive.google.com/file/d/{file_id}/view",
+            parent or root_id,
         )
+        if path:
+            self.explicit_paths.add(file_id)
+        else:
+            self.explicit_paths.discard(file_id)
         self.files[root_id] = [i for i in self.files[root_id] if i.id != file_id] + [item]
         self.content[file_id] = data
         return item
@@ -77,12 +98,39 @@ class FakeDrive:
             raise DriveItemError("not found or not shared with this Google account (HTTP 404)")
         return self.roots[root_id]
 
+    def _chain(self, folder_id: str) -> list[str]:
+        chain: list[str] = []
+        while folder_id in self.folders and folder_id not in chain:
+            chain.append(folder_id)
+            folder_id = self.folders[folder_id][1]
+        return chain
+
     def list_files(self, root: DriveRoot) -> Listing:
         self.resolve(root.id)
-        items = list(self.files.get(root.id, []))
+        if root.kind == "file":
+            return Listing(list(self.files.get(root.id, [])))
+        inside = {f for f in self.folders if root.id in self._chain(f)}
+        folders = [DriveFolder(root.id, root.name, "")] + [
+            DriveFolder(f, self.folders[f][0], self.folders[f][1])
+            for f in sorted(inside - {root.id})
+        ]
+        items: dict[str, DriveItem] = {}
+        for listed in self.files.values():
+            for item in listed:
+                if item.parent_id not in inside or item.id in items:
+                    continue
+                if item.id not in self.explicit_paths:
+                    chain = self._chain(item.parent_id)
+                    names = [self.folders[f][0] for f in chain[: chain.index(root.id)]]
+                    path = "/".join(display_segment(n) for n in [*reversed(names), item.name])
+                    item = replace(item, path=path)
+                items[item.id] = item
+        found = list(items.values())
         if root.id in self.incomplete:
-            return Listing(items[:1], complete=False, errors=["folder x: HTTP 404"])
-        return Listing(items)
+            return Listing(
+                found[:1], complete=False, errors=["folder x: HTTP 404"], folders=folders
+            )
+        return Listing(found, folders=folders)
 
     def download(self, item: DriveItem) -> Download:
         self.downloads.append(item.id)

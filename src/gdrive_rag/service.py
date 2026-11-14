@@ -1,7 +1,10 @@
 """The one facade used by both the CLI and the MCP server: sources, sync, embeddings, reads.
 
 Sync is a full listing of every source compared with stored fingerprints (MD5 checksum or
-modifiedTime plus name/path), which is what local-rag-mcp effectively did after ``changes.list``.
+modifiedTime, size and MIME type), which is what local-rag-mcp effectively did after
+``changes.list``. Name, path and parent folder are metadata: changing them never re-extracts.
+Folders are stored by Drive ID with their parent, and ``document_folders`` holds every ancestor
+folder of each document, so "inside folder X or below" is an ID lookup.
 Deletion is conservative: a document leaves the index only when every source that held it was
 listed completely, or its source root is explicitly gone (404 / not shared). Auth, quota and
 network failures never delete anything.
@@ -27,11 +30,14 @@ from .drive import (
     GOOGLE_DOC,
     DriveBackend,
     DriveDownloadError,
+    DriveFolder,
     DriveItem,
     DriveItemError,
     DriveRoot,
     DriveSourceError,
     Listing,
+    display_segment,
+    folder_link,
     parse_drive_link,
     strip_data_images,
 )
@@ -48,6 +54,7 @@ ERROR_RETRY_HOURS = 24
 DOWNLOAD_ERROR_PREFIX = "download: "  # download errors are retried on every sync
 EMBED_BATCH = 64
 READ_LIMIT_CHARS = 40_000
+LIST_PAGE = 100  # folders + documents per list_folders page
 _PENDING_SQL = (
     "NOT EXISTS (SELECT 1 FROM vectors v WHERE v.chunk_hash=c.chunk_hash) "
     "AND NOT EXISTS (SELECT 1 FROM embedding_failures f WHERE f.chunk_hash=c.chunk_hash)"
@@ -154,6 +161,7 @@ class Service:
         with self._sync_lock(), self.db.transaction() as connection:
             connection.execute("DELETE FROM sources WHERE id=?", (row["id"],))
             removed = _delete_orphans(connection)
+            _refresh_ancestry(connection)
             _gc_vectors(connection)
             _bump(connection)
         return {"removed": row["name"], "documents_removed": removed}
@@ -249,6 +257,7 @@ class Service:
                 report["sources"].append({"name": source["name"], "ok": False, "error": message})
             return report
         listings: dict[int, Listing | None] = {}  # None: root gone -> clear membership
+        degraded = False  # a source failed or was incomplete: keep stored folder parents
         for source in sources:
             outcome = {"name": source["name"], "ok": True}
             try:
@@ -262,6 +271,7 @@ class Service:
                 listing = backend.list_files(root)
                 listings[source["id"]] = listing
                 status = "ok" if listing.complete else "partial"
+                degraded = degraded or not listing.complete
                 error = "; ".join(listing.errors[:3]) or None
                 self._set_source_status(source["id"], status, error, len(listing.items))
                 outcome.update(files=len(listing.items), complete=listing.complete)
@@ -270,6 +280,7 @@ class Service:
                 self._set_source_status(source["id"], "error", str(exc), 0)
                 outcome.update(ok=False, error=str(exc))
             except Exception as exc:  # auth/quota/network: keep everything as it is
+                degraded = True
                 self._set_source_status(source["id"], "error", _message(exc))
                 outcome.update(ok=False, error=_message(exc))
             report["sources"].append(outcome)
@@ -289,12 +300,34 @@ class Service:
                 report["failed"] += 1
         if stop:
             report["stopped"] = stop
+        folders: dict[str, DriveFolder] = {}
+        for found in listings.values():  # a folder seen as a root and as a child: keep the parent
+            for folder in found.folders if found else ():
+                known = folders.get(folder.id)
+                if known is None or (folder.parent_id and not known.parent_id):
+                    folders[folder.id] = folder
         with self.db.transaction() as connection:
+            connection.executemany(
+                """INSERT INTO folders(folder_id, name, parent_id) VALUES(?,?,?)
+                   ON CONFLICT(folder_id) DO UPDATE SET name=excluded.name,
+                     parent_id=CASE WHEN excluded.parent_id='' AND ? THEN folders.parent_id
+                                    ELSE excluded.parent_id END""",
+                [
+                    (f.id, f.name, f.parent_id, int(degraded or bool(stop)))
+                    for f in folders.values()
+                ],
+            )
             ids = {
                 str(row[0]): int(row[1])
                 for row in connection.execute("SELECT file_id, id FROM documents")
             }
             for source_id, found in listings.items():
+                if found is None or found.complete:
+                    connection.execute("DELETE FROM folder_sources WHERE source_id=?", (source_id,))
+                connection.executemany(
+                    "INSERT OR IGNORE INTO folder_sources VALUES(?,?)",
+                    [(folder.id, source_id) for folder in (found.folders if found else ())],
+                )
                 if found is None or (found.complete and not stop):
                     connection.execute(
                         "DELETE FROM document_sources WHERE source_id=?", (source_id,)
@@ -306,6 +339,7 @@ class Service:
                             (ids[item.id], source_id),
                         )
             report["removed"] = _delete_orphans(connection)
+            _refresh_ancestry(connection)
             _gc_vectors(connection)
             _bump(connection)
         return report
@@ -314,8 +348,8 @@ class Service:
         """Index one file; return the report counter: indexed, unchanged or failed."""
         with self.db.read() as connection:
             current = connection.execute(
-                "SELECT id, fingerprint, status, error, indexed_at, name, path, web_url "
-                "FROM documents WHERE file_id=?",
+                "SELECT id, fingerprint, status, error, indexed_at, name, path, web_url, "
+                "parent_id FROM documents WHERE file_id=?",
                 (item.id,),
             ).fetchone()
         if current is not None and current["fingerprint"] == item.fingerprint:
@@ -324,11 +358,12 @@ class Service:
                 or _older_than(current["indexed_at"], ERROR_RETRY_HOURS)
             )
             if not retry:
-                if (current["name"], current["path"], current["web_url"]) != (
-                    item.name,
-                    item.path,
-                    item.web_url,
-                ):
+                if (
+                    current["name"],
+                    current["path"],
+                    current["web_url"],
+                    current["parent_id"],
+                ) != (item.name, item.path, item.web_url, item.parent_id):
                     self._update_metadata(int(current["id"]), item)
                 return "unchanged"
         ensure_private_dir(self.settings.work_dir)
@@ -369,11 +404,20 @@ class Service:
         return "indexed"
 
     def _update_metadata(self, document_id: int, item: DriveItem) -> None:
-        """Rename or move: refresh name/path/link and the FTS title, keep chunks and vectors."""
+        """Rename or move: refresh name/path/link/parent and the FTS title, keep chunks and
+        vectors. Ancestry follows from ``parent_id`` at the end of the sync."""
         with self.db.transaction() as connection:
             connection.execute(
-                "UPDATE documents SET name=?, path=?, web_url=?, modified_time=? WHERE id=?",
-                (item.name, item.path, item.web_url, item.modified_time, document_id),
+                "UPDATE documents SET name=?, path=?, web_url=?, modified_time=?, parent_id=? "
+                "WHERE id=?",
+                (
+                    item.name,
+                    item.path,
+                    item.web_url,
+                    item.modified_time,
+                    item.parent_id,
+                    document_id,
+                ),
             )
             connection.execute(
                 "UPDATE chunks_fts SET title=fts_fold(?) "
@@ -398,9 +442,11 @@ class Service:
     ) -> int:
         connection.execute(
             """INSERT INTO documents(file_id,name,path,mime_type,web_url,modified_time,fingerprint,
-                                     media_type,metadata_json,status,error,chunk_count,indexed_at)
-               VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)
+                                     media_type,metadata_json,status,error,chunk_count,indexed_at,
+                                     parent_id)
+               VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)
                ON CONFLICT(file_id) DO UPDATE SET name=excluded.name, path=excluded.path,
+                 parent_id=excluded.parent_id,
                  mime_type=excluded.mime_type, web_url=excluded.web_url,
                  modified_time=excluded.modified_time, fingerprint=excluded.fingerprint,
                  media_type=excluded.media_type, metadata_json=excluded.metadata_json,
@@ -420,6 +466,7 @@ class Service:
                 error,
                 chunk_count,
                 _now(),
+                item.parent_id,
             ),
         )
         row = connection.execute("SELECT id FROM documents WHERE file_id=?", (item.id,)).fetchone()
@@ -527,9 +574,110 @@ class Service:
             return int(connection.execute("SELECT count(*) FROM embedding_failures").fetchone()[0])
 
     # -- reads --------------------------------------------------------------------------------
-    def search(self, query: str, source: str | None = None, limit: int = 8) -> dict[str, Any]:
+    def search(
+        self,
+        query: str,
+        source: str | None = None,
+        limit: int = 8,
+        folder: str | None = None,
+        files: list[str] | None = None,
+    ) -> dict[str, Any]:
         self.reload()
-        return self.search_engine.search(query, source, limit)
+        return self.search_engine.search(query, source, limit, folder, files)
+
+    def list_folders(
+        self,
+        source: str | None = None,
+        parent: str | None = None,
+        include_documents: bool = False,
+        offset: int = 0,
+    ) -> dict[str, Any]:
+        """Direct child folders of ``parent`` (or the top folders), with indexed-document counts
+        underneath; optionally the documents directly inside ``parent``. Folders then documents
+        form one sequence paged by ``offset``; ``next_offset`` is None on the last page."""
+        if offset < 0:
+            raise ValueError("offset must be >= 0")
+        source_id = self.search_engine.source_id(source) if source else None
+        with self.db.read() as connection:
+            parent_row = None
+            values: list[Any]
+            if parent:
+                parent_id = parse_drive_link(parent)
+                parent_row = connection.execute(
+                    "SELECT * FROM folders WHERE folder_id=?", (parent_id,)
+                ).fetchone()
+                if parent_row is None:
+                    raise ValueError(f"unknown or not indexed folder: {parent}")
+                where, values = "f.parent_id=?", [parent_id]
+            elif source_id is not None:
+                where, values = "f.folder_id=(SELECT root_id FROM sources WHERE id=?)", [source_id]
+            else:
+                where, values = "f.parent_id NOT IN (SELECT folder_id FROM folders)", []
+            if source_id is not None:
+                where += (
+                    " AND f.folder_id IN (SELECT folder_id FROM folder_sources WHERE source_id=?)"
+                )
+                values.append(source_id)
+            folder_total = int(
+                connection.execute(
+                    f"SELECT count(*) FROM folders f WHERE {where}", values
+                ).fetchone()[0]
+            )
+            folders = connection.execute(
+                f"""SELECT f.folder_id, f.name, f.path,
+                      (SELECT count(*) FROM document_folders df
+                       JOIN documents d ON d.id=df.document_id
+                       WHERE df.folder_id=f.folder_id AND d.status='indexed') documents,
+                      (SELECT count(*) FROM folders c WHERE c.parent_id=f.folder_id) subfolders
+                    FROM folders f WHERE {where} ORDER BY f.name, f.folder_id
+                    LIMIT ? OFFSET ?""",
+                [*values, LIST_PAGE, offset],
+            ).fetchall()
+            documents: list[Any] = []
+            document_total = 0
+            if include_documents and parent_row is not None:
+                sql = "SELECT * FROM documents d WHERE d.parent_id=?"
+                params: list[Any] = [parent_row["folder_id"]]
+                if source_id is not None:
+                    sql += (
+                        " AND d.id IN (SELECT document_id FROM document_sources WHERE source_id=?)"
+                    )
+                    params.append(source_id)
+                document_total = int(
+                    connection.execute(
+                        sql.replace("SELECT *", "SELECT count(*)", 1), params
+                    ).fetchone()[0]
+                )
+                room = LIST_PAGE - len(folders)
+                if room > 0:
+                    documents = connection.execute(
+                        f"{sql} ORDER BY d.name, d.file_id LIMIT ? OFFSET ?",
+                        [*params, room, max(0, offset - folder_total)],
+                    ).fetchall()
+        total = folder_total + document_total
+        end = offset + len(folders) + len(documents)
+        return {
+            "parent": None if parent_row is None else _folder_json(parent_row),
+            "folders": [
+                _folder_json(row)
+                | {"documents": int(row["documents"]), "subfolders": int(row["subfolders"])}
+                for row in folders
+            ],
+            "documents": [
+                {
+                    "document_id": row["file_id"],
+                    "file_name": row["name"],
+                    "path": row["path"],
+                    "drive_link": row["web_url"],
+                    "status": row["status"],
+                }
+                for row in documents
+            ],
+            "offset": offset,
+            "total": total,
+            "next_offset": end if end < total else None,
+            "truncated": end < total,
+        }
 
     def read(
         self,
@@ -541,9 +689,12 @@ class Service:
     ) -> dict[str, Any]:
         if start_chunk < 0 or not 1 <= max_chunks <= 100:
             raise ValueError("start_chunk must be >= 0 and max_chunks between 1 and 100")
+        keys = [document_id.strip()]
+        with contextlib.suppress(ValueError):
+            keys.append(parse_drive_link(document_id))  # a Drive file link or ID
         with self.db.read() as connection:
             document = connection.execute(
-                "SELECT * FROM documents WHERE file_id=?", (document_id,)
+                "SELECT * FROM documents WHERE file_id IN (?,?) LIMIT 1", (keys[0], keys[-1])
             ).fetchone()
             if document is None:
                 raise ValueError(f"unknown document id: {document_id}")
@@ -655,11 +806,65 @@ def _source_json(row: Any) -> dict[str, Any]:
     }
 
 
+def _folder_json(row: Any) -> dict[str, Any]:
+    return {
+        "folder_id": row["folder_id"],
+        "name": row["name"],
+        "path": row["path"],
+        "drive_link": folder_link(str(row["folder_id"])),
+    }
+
+
 def _delete_orphans(connection: Any) -> int:
     cursor = connection.execute(
         "DELETE FROM documents WHERE id NOT IN (SELECT document_id FROM document_sources)"
     )
     return int(cursor.rowcount or 0)
+
+
+def _refresh_ancestry(connection: Any) -> None:
+    """Drop folders no source lists any more, then recompute folder paths and the
+    document -> ancestor-folder table from parent IDs (cycle-safe)."""
+    connection.execute(
+        "DELETE FROM folders WHERE folder_id NOT IN (SELECT folder_id FROM folder_sources)"
+    )
+    folders = {
+        str(row[0]): (str(row[1]), str(row[2]), str(row[3]))
+        for row in connection.execute("SELECT folder_id, name, parent_id, path FROM folders")
+    }
+    chains: dict[str, list[str]] = {}
+
+    def chain(folder_id: str) -> list[str]:
+        """``folder_id`` and its known ancestors, nearest first."""
+        if folder_id in chains:
+            return chains[folder_id]
+        result: list[str] = []
+        current = folder_id
+        while current in folders and current not in result:
+            result.append(current)
+            current = folders[current][1]
+        chains[folder_id] = result
+        return result
+
+    paths = []
+    for folder_id, (_, _, old_path) in folders.items():
+        path = "/".join(display_segment(folders[f][0]) for f in reversed(chain(folder_id)))
+        if path != old_path:
+            paths.append((path, folder_id))
+    connection.executemany("UPDATE folders SET path=? WHERE folder_id=?", paths)
+    wanted = {
+        (int(row[0]), folder_id)
+        for row in connection.execute("SELECT id, parent_id FROM documents WHERE parent_id!=''")
+        for folder_id in chain(str(row[1]))
+    }
+    existing = {
+        (int(row[0]), str(row[1]))
+        for row in connection.execute("SELECT document_id, folder_id FROM document_folders")
+    }
+    connection.executemany(
+        "DELETE FROM document_folders WHERE document_id=? AND folder_id=?", existing - wanted
+    )
+    connection.executemany("INSERT INTO document_folders VALUES(?,?)", wanted - existing)
 
 
 def _gc_vectors(connection: Any) -> None:

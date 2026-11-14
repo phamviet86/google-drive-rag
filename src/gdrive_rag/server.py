@@ -1,6 +1,6 @@
 """MCP server over Streamable HTTP (``/mcp``), ``/healthz``, and the background sync loop.
 
-All four tools are read-only. The same JSON is sent as structured content and, escaped again,
+All five tools are read-only. The same JSON is sent as structured content and, escaped again,
 as text content; ``wire_size`` measures both after encoding and results are trimmed until it is
 at most ``MAX_WIRE_CHARS``, so quote-heavy text cannot blow up the response.
 """
@@ -29,10 +29,13 @@ log = logging.getLogger("gdrive_rag")
 MAX_WIRE_CHARS = 56_000  # + JSON-RPC envelope stays under ~60,000 characters
 INSTRUCTIONS = (
     "Search the owner's Google Drive documents (Docs, Sheets, Slides, PDF, Office files). "
-    "Use `search` first; cite the file name, locator and Drive link from each result. Use `read` "
-    "with a document_id to see more text around a hit (pass `chunk` from the search result as "
-    "start_chunk, or a PDF page). `list_sources` shows which Drive folders are indexed and "
-    "`sync_status` shows indexing progress and errors."
+    "Use `search` first; cite the file name, locator and Drive link from each result. To stay "
+    "inside one Drive folder and its subfolders pass `folder` (a folder link or ID); to stay "
+    "inside specific files pass `files`; `source` limits to one added source. `list_folders` "
+    "browses the folder tree and gives folder IDs. Use `read` with a document_id or Drive file "
+    "link to see more text around a hit (pass `chunk` from the search result as start_chunk, or "
+    "a PDF page). `list_sources` shows which Drive sources are indexed and `sync_status` shows "
+    "indexing progress and errors."
 )
 
 
@@ -40,6 +43,7 @@ class SearchHit(BaseModel):
     document_id: str = Field(description="Drive file ID; pass to `read`.")
     file_name: str
     path: str = Field(description="Path inside the Drive source folder.")
+    parent_folder_id: str = Field(description="Drive ID of the folder that holds the file.")
     locator: str = Field(description="Where in the file: page:N, slide:N, sheet:NAME/row:N, ...")
     chunk: int = Field(description="Chunk number; pass as start_chunk to `read`.")
     chunk_count: int
@@ -92,6 +96,40 @@ class SourcesOutput(BaseModel):
     sources: list[SourceInfo]
 
 
+class FolderInfo(BaseModel):
+    folder_id: str = Field(description="Drive folder ID; pass as `folder` to search.")
+    name: str
+    path: str
+    drive_link: str
+    documents: int = Field(description="Indexed documents in this folder and all subfolders.")
+    subfolders: int
+
+
+class FolderRef(BaseModel):
+    folder_id: str
+    name: str
+    path: str
+    drive_link: str
+
+
+class FolderDocument(BaseModel):
+    document_id: str
+    file_name: str
+    path: str
+    drive_link: str
+    status: str
+
+
+class FoldersOutput(BaseModel):
+    parent: FolderRef | None
+    folders: list[FolderInfo]
+    documents: list[FolderDocument]
+    offset: int
+    total: int = Field(description="Folders plus documents in this listing, over all pages.")
+    next_offset: int | None = Field(description="Pass as offset for the next page.")
+    truncated: bool
+
+
 class StatusOutput(BaseModel):
     sources: list[SourceInfo]
     documents: dict[str, int]
@@ -141,11 +179,20 @@ def create_server(service: Service) -> Any:
             str | None, Field(description="Optional source name or id from list_sources.")
         ] = None,
         limit: Annotated[int, Field(ge=1, le=50, description="Maximum results.")] = 8,
+        folder: Annotated[
+            str | None,
+            Field(description="Only this Drive folder and its subfolders (folder link or ID)."),
+        ] = None,
+        files: Annotated[
+            list[str] | None,
+            Field(description="Only these files (Drive file links or IDs).", max_length=50),
+        ] = None,
     ) -> Annotated[CallToolResult, SearchOutput]:
         """Find passages in the indexed Google Drive files. Returns snippets with the file name,
-        locator (page/slide/sheet), Drive link and a document_id for `read`."""
+        locator (page/slide/sheet), Drive link and a document_id for `read`. Narrow with
+        `folder` (one folder tree), `files` (named files) or `source`; they combine."""
         try:
-            result = service.search(query, source, limit)
+            result = service.search(query, source, limit, folder, files)
         except ValueError as exc:
             return fail(exc)
         result["truncated"] = False
@@ -153,7 +200,9 @@ def create_server(service: Service) -> Any:
 
     @server.tool(title="Read a document", annotations=local)
     def read(
-        document_id: Annotated[str, Field(description="document_id from a search result.")],
+        document_id: Annotated[
+            str, Field(description="document_id from a search result, or a Drive file link.")
+        ],
         start_chunk: Annotated[int, Field(ge=0, description="First chunk to return.")] = 0,
         max_chunks: Annotated[int, Field(ge=1, le=100, description="How many chunks.")] = 10,
         page: Annotated[
@@ -178,6 +227,32 @@ def create_server(service: Service) -> Any:
     def list_sources() -> Annotated[CallToolResult, SourcesOutput]:
         """List the Google Drive folders/files that are indexed, with their sync state."""
         return ok({"sources": service.list_sources()})
+
+    @server.tool(title="List Drive folders", annotations=local)
+    def list_folders(
+        source: Annotated[
+            str | None, Field(description="Optional source name or id from list_sources.")
+        ] = None,
+        parent: Annotated[
+            str | None,
+            Field(description="Folder link or ID to list; omit for the top folders."),
+        ] = None,
+        include_documents: Annotated[
+            bool, Field(description="Also list the documents directly inside `parent`.")
+        ] = False,
+        offset: Annotated[int, Field(ge=0, description="next_offset from the last page.")] = 0,
+    ) -> Annotated[CallToolResult, FoldersOutput]:
+        """Browse the indexed folder tree: direct subfolders with their IDs and document counts.
+        Use it to find a folder ID for `search`'s `folder` filter."""
+        try:
+            result = service.list_folders(source, parent, include_documents, offset)
+        except ValueError as exc:
+            return fail(exc)
+        capped = _cap_list(_cap_list(result, "documents"), "folders")  # trims the page's tail
+        end = offset + len(capped["folders"]) + len(capped["documents"])
+        capped["next_offset"] = end if end < capped["total"] else None
+        capped["truncated"] = capped["next_offset"] is not None
+        return ok(capped)
 
     @server.tool(title="Indexing status", annotations=local)
     def sync_status() -> Annotated[CallToolResult, StatusOutput]:

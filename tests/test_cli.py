@@ -73,3 +73,42 @@ def test_bad_inputs_exit_2(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -
         main(["--data-dir", data, "--json", "auth", "google", "--service-account", str(bad)]) == 2
     )
     assert "not a service-account key" in capsys.readouterr().out
+
+
+def test_search_command_with_folder_and_file(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    from helpers import FakeDrive, make_service
+
+    import gdrive_rag.cli as cli
+
+    drive = FakeDrive()
+    drive.add_root("folderAAAAAAAAAAAA", "Gốc")
+    drive.add_folder("folderSubSub00000", "Con", "folderAAAAAAAAAAAA")
+    drive.put("folderAAAAAAAAAAAA", "fileTop000000000", "tren.txt", "hợp đồng gốc".encode())
+    drive.put(
+        "folderAAAAAAAAAAAA",
+        "fileSub000000000",
+        "duoi.txt",
+        "hợp đồng con".encode(),
+        parent="folderSubSub00000",
+    )
+    service = make_service(tmp_path, drive)
+    service.add_sources(["folderAAAAAAAAAAAA"])
+    service.sync()
+    monkeypatch.setattr(cli, "_service", lambda args: service)
+
+    def names(*extra: str) -> list[str]:
+        assert main(["--json", "search", "hợp đồng", *extra]) == 0
+        return sorted(r["file_name"] for r in json.loads(capsys.readouterr().out)["results"])
+
+    assert names() == ["duoi.txt", "tren.txt"]
+    assert names("--folder", "https://drive.google.com/drive/folders/folderSubSub00000") == [
+        "duoi.txt"
+    ]
+    assert names("--file", "fileTop000000000", "--file", "fileSub000000000") == [
+        "duoi.txt",
+        "tren.txt",
+    ]
+    assert main(["--json", "search", "hợp đồng", "--folder", "folderMissing0000"]) == 2
+    assert "folderMissing0000" in capsys.readouterr().out

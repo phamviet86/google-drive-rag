@@ -88,6 +88,30 @@ MIGRATIONS = [
       error TEXT NOT NULL
     );
     """,
+    # Folder ancestry by Drive ID. ``document_folders`` holds every ancestor folder of a
+    # document, recomputed after each sync from ``folders.parent_id`` and the document parent.
+    """
+    ALTER TABLE documents ADD COLUMN parent_id TEXT NOT NULL DEFAULT '';
+    CREATE TABLE folders (
+      folder_id TEXT PRIMARY KEY,
+      name TEXT NOT NULL,
+      parent_id TEXT NOT NULL DEFAULT '',
+      path TEXT NOT NULL DEFAULT ''
+    );
+    CREATE INDEX folders_parent_idx ON folders(parent_id);
+    CREATE TABLE folder_sources (
+      folder_id TEXT NOT NULL REFERENCES folders(folder_id) ON DELETE CASCADE,
+      source_id INTEGER NOT NULL REFERENCES sources(id) ON DELETE CASCADE,
+      PRIMARY KEY (folder_id, source_id)
+    );
+    CREATE INDEX folder_sources_source_idx ON folder_sources(source_id);
+    CREATE TABLE document_folders (
+      document_id INTEGER NOT NULL REFERENCES documents(id) ON DELETE CASCADE,
+      folder_id TEXT NOT NULL REFERENCES folders(folder_id) ON DELETE CASCADE,
+      PRIMARY KEY (document_id, folder_id)
+    );
+    CREATE INDEX document_folders_folder_idx ON document_folders(folder_id);
+    """,
 ]
 
 

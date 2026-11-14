@@ -109,6 +109,7 @@ class DriveItem:
     checksum: str
     size: int | None
     web_url: str
+    parent_id: str = ""  # folder this file was listed in (not part of the fingerprint)
 
     @property
     def suffix(self) -> str:
@@ -122,10 +123,22 @@ class DriveItem:
 
 
 @dataclass(frozen=True)
+class DriveFolder:
+    id: str
+    name: str
+    parent_id: str  # "" for a source root whose parent is outside the source
+
+
+@dataclass(frozen=True)
 class Listing:
     items: Sequence[DriveItem]
     complete: bool = True  # False: some folder failed; never delete based on this listing
     errors: Sequence[str] = field(default_factory=tuple)
+    folders: Sequence[DriveFolder] = field(default_factory=tuple)  # includes a folder root
+
+
+def folder_link(folder_id: str) -> str:
+    return f"https://drive.google.com/drive/folders/{folder_id}"
 
 
 class DriveBackend(Protocol):
@@ -265,7 +278,7 @@ class GoogleDriveBackend:
             return DriveRoot(root_id, str(value.get("name") or root_id), "folder", drive_id)
         return DriveRoot(root_id, str(value.get("name") or root_id), "file", drive_id)
 
-    _FIELDS = "id,name,mimeType,modifiedTime,md5Checksum,size,webViewLink,trashed"
+    _FIELDS = "id,name,mimeType,modifiedTime,md5Checksum,size,webViewLink,trashed,parents"
 
     def list_files(self, root: DriveRoot) -> Listing:
         if root.kind == "file":
@@ -276,11 +289,13 @@ class GoogleDriveBackend:
             )
             if value.get("trashed"):
                 raise DriveItemError("Drive item is in the trash")
-            item = _item(value, display_segment(str(value.get("name", ""))))
+            parents = value.get("parents") or [""]
+            item = _item(value, display_segment(str(value.get("name", ""))), str(parents[0]))
             return Listing([item] if item and item.suffix else [])
         # files.list on a folder we lost access to returns an empty page, not 404, so check the
         # root itself every cycle: a revoked share must raise DriveItemError, not look empty.
-        self.resolve(root.id)
+        resolved = self.resolve(root.id)
+        folders: list[DriveFolder] = [DriveFolder(root.id, resolved.name, "")]
         items: list[DriveItem] = []
         errors: list[str] = []
         pending: list[tuple[str, str]] = [(root.id, "")]
@@ -304,11 +319,12 @@ class GoogleDriveBackend:
                 path = f"{prefix}/{display_segment(name)}" if prefix else display_segment(name)
                 if value.get("mimeType") == FOLDER_MIME:
                     pending.append((str(value["id"]), path))
+                    folders.append(DriveFolder(str(value["id"]), name, folder_id))
                     continue
-                item = _item(value, path)
+                item = _item(value, path, folder_id)
                 if item is not None and item.suffix:
                     items.append(item)
-        return Listing(items, complete=not errors, errors=errors)
+        return Listing(items, complete=not errors, errors=errors, folders=folders)
 
     def _children(self, folder_id: str, drive_id: str) -> list[dict[str, Any]]:
         result: list[dict[str, Any]] = []
@@ -444,7 +460,7 @@ def strip_data_images(content: bytes) -> bytes:
     return _IMAGE_REFERENCE.sub(b"", content)
 
 
-def _item(value: dict[str, Any], path: str) -> DriveItem | None:
+def _item(value: dict[str, Any], path: str, parent_id: str = "") -> DriveItem | None:
     try:
         identifier = str(value["id"])
         return DriveItem(
@@ -456,6 +472,7 @@ def _item(value: dict[str, Any], path: str) -> DriveItem | None:
             str(value.get("md5Checksum", "")),
             int(value["size"]) if value.get("size") is not None else None,
             str(value.get("webViewLink") or f"https://drive.google.com/open?id={identifier}"),
+            parent_id,
         )
     except (KeyError, TypeError, ValueError):
         return None

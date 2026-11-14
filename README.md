@@ -14,6 +14,7 @@ Dịch vụ chạy trong một Docker container trên chính VPS, chỉ nhận k
 - Các bước cài đặt
 - Kết nối với Claude Code
 - Kiểm tra kết quả
+- Tìm trong một thư mục hoặc một tệp
 - Việc thường ngày
 - Xử lý sự cố
 
@@ -154,6 +155,27 @@ Kết quả: lệnh `claude mcp list` hiện dòng `google-drive-rag` với tr�
 
    Kết quả: Claude trả lời kèm tên tệp, vị trí (trang, trang chiếu hoặc trang tính) và link Drive.
 
+## Tìm trong một thư mục hoặc một tệp
+
+Bạn có thể bảo Claude chỉ tìm trong một thư mục (gồm cả các thư mục con bên trong) hoặc chỉ trong vài tệp. Cách này giúp kết quả gọn và đúng chỗ hơn. Hãy dán link Drive của thư mục hoặc tệp vào câu hỏi, hoặc gọi đúng tên thư mục.
+
+Ví dụ câu hỏi trong Claude Code:
+
+- "Dùng google-drive-rag tìm 'hạn thanh toán' chỉ trong thư mục https://drive.google.com/drive/folders/…"
+- "Trong thư mục Kế toán, tìm các báo cáo thuế năm 2025." Claude sẽ tự xem cây thư mục để biết thư mục Kế toán ở đâu.
+- "Chỉ tìm trong tệp https://docs.google.com/document/d/…/edit: điều khoản phạt hợp đồng là gì?"
+- "Thư mục Hợp đồng có những thư mục con nào?"
+
+Kết quả: Claude chỉ trả lời bằng tài liệu nằm trong thư mục hoặc tệp đó. Nếu thư mục hoặc tệp chưa được đọc vào chỉ mục, Claude báo rõ là không tìm thấy nó, thay vì trả về kết quả rỗng.
+
+> **Lưu ý:** Thư mục mới thêm hoặc mới đổi tên trên Drive được cập nhật ở lần đọc Drive kế tiếp (tối đa 15 phút). Đổi tên hay chuyển thư mục không làm dịch vụ đọc lại nội dung tệp.
+
+Muốn tự thử trên VPS, chạy lệnh tìm kèm `--folder` (link thư mục) hoặc `--file` (link tệp, dùng nhiều lần được):
+
+```bash
+sudo docker compose exec gdrive-rag gdrive-rag search "báo cáo thuế" --folder "<link thư mục>"
+```
+
 ## Việc thường ngày
 
 | Việc | Lệnh (chạy trong `~/google-drive-rag`) |
@@ -162,6 +184,7 @@ Kết quả: lệnh `claude mcp list` hiện dòng `google-drive-rag` với tr�
 | Xem danh sách nguồn | `sudo docker compose exec gdrive-rag gdrive-rag source list` |
 | Bỏ một nguồn | `sudo docker compose exec gdrive-rag gdrive-rag source remove <số thứ tự hoặc tên>` |
 | Đọc lại Drive ngay | `sudo docker compose exec gdrive-rag gdrive-rag sync` |
+| Thử tìm một câu | `sudo docker compose exec gdrive-rag gdrive-rag search "<câu tìm>"` |
 | Đăng nhập Gmail lại | `sudo docker compose exec gdrive-rag gdrive-rag auth google` |
 | Thêm hoặc đổi khóa OpenRouter | Chạy lại `setup`; tài liệu cũ được tính lại ý nghĩa ở lần đọc kế tiếp |
 | Xem nhật ký | `sudo docker compose logs --tail 100 gdrive-rag` |

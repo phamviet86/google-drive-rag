@@ -302,3 +302,24 @@ def test_export_over_10mb_errors_are_clear() -> None:
         backend.download(_google_item(GOOGLE_SHEET))
     with pytest.raises(DriveDownloadError, match="even as plain text"):
         backend.download(_google_item(GOOGLE_DOC))
+
+
+def test_listing_reports_nested_folders_and_parents() -> None:
+    stub = tree()
+    stub.add("sub000000000000", "deep00000000000", "Sâu", FOLDER_MIME)
+    stub.add("deep00000000000", "txt000000000000", "ghi-chu.txt", "text/plain", md5Checksum="y")
+    backend = GoogleDriveBackend(service=stub)
+    listing = backend.list_files(backend.resolve(ROOT))
+    folders = {f.id: (f.name, f.parent_id) for f in listing.folders}
+    assert folders == {
+        ROOT: ("Kế toán", ""),
+        "sub000000000000": ("Năm 2026", ROOT),
+        "deep00000000000": ("Sâu", "sub000000000000"),
+    }
+    parents = {item.id: item.parent_id for item in listing.items}
+    assert parents["doc000000000000"] == ROOT
+    assert parents["pdf000000000000"] == "sub000000000000"
+    assert parents["txt000000000000"] == "deep00000000000"
+    stub.add(None, "single000000000", "le.txt", "text/plain", parents=["outside00000000"])
+    single = backend.list_files(DriveRoot("single000000000", "le.txt", "file"))
+    assert single.folders == () and single.items[0].parent_id == "outside00000000"

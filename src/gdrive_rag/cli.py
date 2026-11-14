@@ -1,4 +1,5 @@
-"""Admin CLI: ``gdrive-rag setup | auth google | source add/list/remove | sync | status | serve``.
+"""Admin CLI: ``gdrive-rag setup | auth google | source add/list/remove | sync | status | search |
+serve``.
 
 Output is plain readable text, or JSON with ``--json``. Secrets are never printed.
 """
@@ -87,6 +88,14 @@ def cmd_sync(args: argparse.Namespace) -> int:
         )
         return 2
     _print(report, args.json)
+    return 0
+
+
+def cmd_search(args: argparse.Namespace) -> int:
+    result = _service(args).search(
+        args.query, args.source, args.limit, args.folder, args.file or None
+    )
+    _print(result, args.json)
     return 0
 
 
@@ -225,6 +234,16 @@ def build_parser() -> argparse.ArgumentParser:
 
     commands.add_parser("status", help="show index and sync state").set_defaults(func=cmd_status)
     commands.add_parser("sync", help="sync all sources now").set_defaults(func=cmd_sync)
+
+    search = commands.add_parser("search", help="search the index (for manual checks)")
+    search.add_argument("query")
+    search.add_argument("--source", help="source id, name or link")
+    search.add_argument("--folder", help="Drive folder link or ID (includes subfolders)")
+    search.add_argument(
+        "--file", action="append", help="Drive file link or ID (repeat for several files)"
+    )
+    search.add_argument("--limit", type=int, default=8)
+    search.set_defaults(func=cmd_search)
 
     source = commands.add_parser("source", help="manage Drive sources").add_subparsers(
         dest="source_command", required=True

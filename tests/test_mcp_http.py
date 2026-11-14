@@ -20,6 +20,7 @@ from gdrive_rag.server import MAX_WIRE_CHARS, create_app
 from gdrive_rag.service import Service
 
 ROOT = "folderAAAAAAAAAAAA"
+SUB = "folderThang3000000"
 
 
 def free_port() -> int:
@@ -34,7 +35,9 @@ def running(tmp_path: Path) -> Iterator[tuple[str, Service]]:
 
     drive = FakeDrive()
     drive.add_root(ROOT, "Kế toán")
+    drive.add_folder(SUB, "Tháng 3", ROOT)
     drive.put(ROOT, "doc1111111111111", "hoa-don.txt", "Hóa đơn tiền điện tháng 3".encode())
+    drive.put(ROOT, "doc3333333333333", "nuoc.txt", "Hóa đơn tiền nước".encode(), parent=SUB)
     big = "\n".join(
         f'Dòng {i}: "trích dẫn" \\ nội dung "tiếng Việt" có dấu "đầy đủ" ở đây.'
         for i in range(20000)
@@ -79,7 +82,7 @@ def test_healthz(running: tuple[str, Service]) -> None:
 def test_tools_list(running: tuple[str, Service]) -> None:
     url, _ = running
     tools = {tool.name: tool for tool in call(url, "tools/list").tools}
-    assert set(tools) == {"search", "read", "list_sources", "sync_status"}
+    assert set(tools) == {"search", "read", "list_sources", "list_folders", "sync_status"}
     for tool in tools.values():
         assert tool.title
         assert tool.annotations is not None and tool.annotations.read_only_hint is True
@@ -110,9 +113,9 @@ def test_errors_are_tool_errors(running: tuple[str, Service]) -> None:
 def test_sources_and_status(running: tuple[str, Service]) -> None:
     url, _ = running
     sources = call(url, "list_sources").structured_content["sources"]
-    assert sources[0]["name"] == "Kế toán" and sources[0]["documents"] == 2
+    assert sources[0]["name"] == "Kế toán" and sources[0]["documents"] == 3
     status = call(url, "sync_status").structured_content
-    assert status["documents"]["indexed"] == 2
+    assert status["documents"]["indexed"] == 3
     assert status["embeddings"]["enabled"] is False
 
 
@@ -147,3 +150,50 @@ def test_foreign_host_header_is_rejected(running: tuple[str, Service]) -> None:
     with pytest.raises(urllib.error.HTTPError) as error:
         urllib.request.urlopen(request)
     assert error.value.code in {400, 403, 421}
+
+
+def test_list_folders_and_folder_search(running: tuple[str, Service]) -> None:
+    url, _ = running
+    top = call(url, "list_folders")
+    assert not top.is_error
+    assert [f["folder_id"] for f in top.structured_content["folders"]] == [ROOT]
+    level = call(
+        url,
+        "list_folders",
+        {"parent": f"https://drive.google.com/drive/folders/{ROOT}", "include_documents": True},
+    ).structured_content
+    assert [(f["name"], f["documents"]) for f in level["folders"]] == [("Tháng 3", 1)]
+    assert {d["file_name"] for d in level["documents"]} == {"hoa-don.txt", "lon.txt"}
+    assert json.loads(call(url, "list_folders", {"parent": SUB}).content[0].text)["folders"] == []
+    assert call(url, "list_folders", {"parent": "folderMissing0000"}).is_error
+    hits = call(url, "search", {"query": "hóa đơn", "folder": SUB}).structured_content["results"]
+    assert [(h["file_name"], h["parent_folder_id"]) for h in hits] == [("nuoc.txt", SUB)]
+    files = ["https://drive.google.com/file/d/doc1111111111111/view"]
+    hits = call(url, "search", {"query": "hóa đơn", "files": files}).structured_content["results"]
+    assert [h["file_name"] for h in hits] == ["hoa-don.txt"]
+    missing = call(url, "search", {"query": "hóa đơn", "folder": "folderMissing0000"})
+    assert missing.is_error and "folderMissing0000" in missing.content[0].text
+    read = call(url, "read", {"document_id": files[0]})
+    assert read.structured_content["file_name"] == "hoa-don.txt"
+
+
+def test_list_folders_pages_through_many_folders(running: tuple[str, Service]) -> None:
+    url, service = running
+    with service.db.transaction() as connection:  # 300 subfolders with long names
+        for i in range(300):
+            folder_id = f"folderMany{i:08d}"
+            name = f'Thư mục "dài" số {i:03d} ' + "đ" * 120
+            connection.execute("INSERT INTO folders VALUES(?,?,?,?)", (folder_id, name, SUB, name))
+            connection.execute("INSERT INTO folder_sources VALUES(?,1)", (folder_id,))
+    seen: list[str] = []
+    offset: int | None = 0
+    pages = 0
+    while offset is not None:
+        result = call(url, "list_folders", {"parent": SUB, "offset": offset})
+        assert not result.is_error
+        assert len(result.model_dump_json(by_alias=True)) <= MAX_WIRE_CHARS
+        page = result.structured_content
+        assert page["total"] == 300 and page["truncated"] is (page["next_offset"] is not None)
+        seen += [f["folder_id"] for f in page["folders"]]
+        offset, pages = page["next_offset"], pages + 1
+    assert pages >= 3 and len(seen) == 300 and len(set(seen)) == 300
