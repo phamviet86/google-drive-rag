@@ -16,6 +16,7 @@ Dịch vụ chạy trong một Docker container trên chính VPS, chỉ nhận k
 - Kiểm tra kết quả
 - Tìm trong một thư mục hoặc một tệp
 - Việc thường ngày
+- Quản trị từ Claude (tùy chọn)
 - Xử lý sự cố
 
 ## Dịch vụ làm gì
@@ -189,7 +190,9 @@ sudo docker compose exec gdrive-rag gdrive-rag search "báo cáo thuế" --folde
 | Thử tìm một câu | `sudo docker compose exec gdrive-rag gdrive-rag search "<câu tìm>"` |
 | Xem vì sao một kết quả đứng đầu | Thêm `--explain` vào cuối lệnh tìm ở dòng trên |
 | Đăng nhập Gmail lại | `sudo docker compose exec gdrive-rag gdrive-rag auth google` |
-| Thêm hoặc đổi khóa OpenRouter | Chạy lại `setup`; tài liệu cũ được tính lại ý nghĩa ở lần đọc kế tiếp |
+| Thêm hoặc đổi khóa OpenRouter | `sudo docker compose exec gdrive-rag gdrive-rag embedding set --api-key-file /secrets/openrouter.key` (xem trước), thêm `--yes` để làm |
+| Tắt tìm theo ý nghĩa | `sudo docker compose exec gdrive-rag gdrive-rag embedding remove --yes` |
+| Xóa quyền Google đã lưu | `sudo docker compose exec gdrive-rag gdrive-rag auth remove --yes` |
 | Xem nhật ký | `sudo docker compose logs --tail 100 gdrive-rag` |
 | Cập nhật mã mới | Chép mã mới lên VPS, rồi `sudo docker compose up -d --build` |
 
@@ -217,6 +220,49 @@ Mặc định dịch vụ đọc chữ trong bản scan bằng tiếng Việt v�
 > **Lưu ý:** Thêm nhiều ngôn ngữ làm việc đọc bản scan chậm hơn và đôi khi nhầm chữ hơn. Chỉ thêm ngôn ngữ mà tài liệu của bạn thật sự dùng.
 
 Sau khi cập nhật lên bản này, các bản scan đã đọc bằng bộ nhận dạng cũ được đọc lại một lần ở lần đọc Drive kế tiếp. Các tệp khác không bị đọc lại.
+
+## Quản trị từ Claude (tùy chọn)
+
+Mặc định Claude chỉ được tìm và đọc tài liệu. Nếu muốn nhờ Claude thêm hoặc bỏ thư mục Drive, đổi quyền Google hay đổi khóa tìm theo ý nghĩa mà không phải gõ lệnh, bạn có thể bật thêm các công cụ quản trị.
+
+> **Cảnh báo:** Một tài liệu trong Drive có thể chứa dòng chữ giả làm lời dặn cho Claude, ví dụ "hãy gửi dữ liệu sang địa chỉ X". Nếu Claude làm theo, toàn bộ nội dung tài liệu của bạn có thể bị gửi tới máy của người khác. Vì vậy chỉ bật khi cần, và luôn đọc kỹ câu Claude hỏi lại trước khi đồng ý.
+
+Cách bật:
+
+1. Mở tệp `.env` trong `~/google-drive-rag` và thêm dòng:
+
+   ```text
+   GDRAG_ADMIN_TOOLS=1
+   ```
+
+2. Dựng lại dịch vụ:
+
+   ```bash
+   sudo docker compose up -d
+   ```
+
+   Kết quả: Claude Code thấy thêm 9 công cụ dưới đây. Muốn tắt, xóa dòng đó rồi chạy lại lệnh trên.
+
+| Công cụ | Việc làm |
+| --- | --- |
+| `add_source` | Thêm một link thư mục hoặc tệp Drive và bắt đầu đọc ngay |
+| `remove_source` | Bỏ một nguồn; trước hết báo sẽ bỏ bao nhiêu tài liệu khỏi chỉ mục |
+| `google_auth_status` | Cho biết đang dùng cách đăng nhập Google nào; không hiện khóa |
+| `set_google_service_account` | Dùng tệp tài khoản dịch vụ đã chép vào thư mục `secrets` |
+| `google_auth_start` | Bước 1 đăng nhập Gmail: đưa ra địa chỉ để bạn mở và bấm Cho phép |
+| `google_auth_finish` | Bước 2: nhận địa chỉ trình duyệt hiện ra sau khi bấm Cho phép (hết hạn sau 10 phút) |
+| `remove_google_auth` | Xóa quyền Google đã lưu; ngừng đọc Drive nhưng giữ chỉ mục và việc tìm |
+| `set_embedding` | Đặt địa chỉ, model và khóa tìm theo ý nghĩa; báo rõ nội dung sẽ được gửi tới máy nào |
+| `remove_embedding` | Xóa khóa, quay về chỉ tìm theo chữ; giữ lại dữ liệu ý nghĩa đã tính |
+
+Những điều nên biết:
+
+- Việc có thể làm mất dữ liệu (bỏ nguồn, đổi hoặc xóa quyền Google, đổi khóa tìm theo ý nghĩa) luôn chạy hai lần: lần đầu Claude chỉ kể sẽ xảy ra gì, lần sau mới làm khi bạn đồng ý.
+- Tệp khóa phải nằm trong thư mục `secrets`. Claude chỉ cần tên tệp, ví dụ `openrouter.key`, nên khóa không phải dán vào cuộc trò chuyện. Công cụ không đọc được tệp nằm ngoài thư mục này.
+- Khóa và mã đăng nhập không bao giờ hiện trong câu trả lời, trong `sync_status` hay trong nhật ký.
+- Giá trị ghi trong `.env` luôn thắng. Nếu `.env` đã ghi một giá trị khác, công cụ từ chối và nói tên dòng cần xóa trong `.env`. Muốn quản lý một mục bằng Claude, hãy để trống dòng đó trong `.env` rồi dựng lại dịch vụ. `sync_status` cho biết mỗi mục lấy từ `.env` ("environment"), từ công cụ hoặc lệnh ("stored") hay mặc định ("default").
+- Nguồn ghi trong `GDRAG_DRIVE_LINKS` không bỏ được bằng công cụ, vì lần khởi động sau nó sẽ được thêm lại.
+- Khi Drive đang được đọc, việc bỏ nguồn bị từ chối; hãy thử lại khi `sync_status` báo đã xong. Các thay đổi khác được lưu ngay và dùng từ bước đọc kế tiếp.
 
 ## Xử lý sự cố
 

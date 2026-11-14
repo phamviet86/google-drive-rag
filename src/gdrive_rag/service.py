@@ -25,9 +25,10 @@ import time
 from collections.abc import Callable, Iterator
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlparse
 
 from .chunking import make_chunks
-from .config import Settings, ensure_private_dir
+from .config import Settings, ensure_private_dir, setting_origins
 from .db import Database
 from .drive import (
     GOOGLE_DOC,
@@ -259,6 +260,36 @@ class Service:
             self._last_request = now
         self.wake.set()
         return self._request_answer(True, None)
+
+    def queue_sync(self, source_id: int | None = None) -> dict[str, Any]:
+        """Queue a sync for an admin change (a new source or new credentials), without the
+        ``sync_now`` rate limit. A sync that is running finishes first; the queued one follows."""
+        with self._request_lock:
+            if self._requested is not None and self._requested[0] != source_id:
+                self._requested = (None,)  # two different requests: one sync of everything
+            elif self._requested is None:
+                self._requested = (source_id,)
+            running = self.sync_running()
+        self.wake.set()
+        return {"queued": True, "after_running_sync": running}
+
+    def source_preview(self, value: str) -> dict[str, Any]:
+        """What ``remove_source`` would do: the source and how many documents only it holds."""
+        row = self._find_source(value)
+        with self.db.read() as connection:
+            only = connection.execute(
+                """SELECT count(*) FROM document_sources d WHERE d.source_id=? AND NOT EXISTS
+                     (SELECT 1 FROM document_sources o
+                      WHERE o.document_id=d.document_id AND o.source_id<>d.source_id)""",
+                (row["id"],),
+            ).fetchone()[0]
+        return {
+            "id": int(row["id"]),
+            "name": row["name"],
+            "link": row["link"],
+            "root_id": row["root_id"],
+            "documents_removed": int(only),
+        }
 
     def take_request(self) -> tuple[int | None] | None:
         """The pending request, if any; the sync loop calls this and then runs it."""
@@ -842,6 +873,7 @@ class Service:
             "recent_failures": failures,
             "embeddings": {
                 "enabled": settings.embeddings_enabled,
+                "host": urlparse(settings.embedding_base_url).hostname or "",
                 "model": settings.embedding_model,
                 "dimensions": settings.embedding_dimensions,
                 "vectors": vectors,
@@ -850,6 +882,7 @@ class Service:
                 "last_error": self.db.get_meta("last_embedding_error"),
             },
             "google_auth": settings.google_auth,
+            "settings_from": setting_origins(settings.data_dir),
             "sync": {
                 "running": self.sync_running(),
                 "requested": self.take_request() is not None,

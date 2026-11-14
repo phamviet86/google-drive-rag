@@ -1,5 +1,5 @@
-"""Admin CLI: ``gdrive-rag setup | auth google | source add/list/remove | sync | status | search |
-serve``.
+"""Admin CLI: ``gdrive-rag setup | auth google/remove | embedding set/remove |
+source add/list/remove | sync | status | search | serve``.
 
 Output is plain readable text, or JSON with ``--json``. Secrets are never printed.
 """
@@ -137,6 +137,31 @@ def cmd_auth_google(args: argparse.Namespace) -> int:
     return 0
 
 
+def _admin(args: argparse.Namespace) -> Any:
+    from .admin import Admin
+
+    return Admin(_service(args))
+
+
+def cmd_auth_remove(args: argparse.Namespace) -> int:
+    _print(_admin(args).remove_google(args.yes), args.json)
+    return 0
+
+
+def cmd_embedding_set(args: argparse.Namespace) -> int:
+    key = _read_payload(args.api_key_file).strip() if args.api_key_file else None
+    result = _admin(args).set_embedding(
+        args.base_url, args.model, api_key=key, dimensions=args.dimensions, confirm=args.yes
+    )
+    _print(result, args.json)
+    return 0
+
+
+def cmd_embedding_remove(args: argparse.Namespace) -> int:
+    _print(_admin(args).remove_embedding(args.yes), args.json)
+    return 0
+
+
 def _ask(prompt: str, default: str = "", secret: bool = False) -> str:
     shown = " [đã có, Enter để giữ]" if secret and default else (f" [{default}]" if default else "")
     if secret:
@@ -271,6 +296,23 @@ def build_parser() -> argparse.ArgumentParser:
         "--oauth-client", metavar="FILE", help="OAuth Desktop client JSON, or - for stdin"
     )
     google.set_defaults(func=cmd_auth_google)
+    remove_auth = auth.add_parser("remove", help="delete stored Google credentials")
+    remove_auth.add_argument("--yes", action="store_true", help="apply (otherwise preview)")
+    remove_auth.set_defaults(func=cmd_auth_remove)
+
+    embedding = commands.add_parser("embedding", help="semantic-search endpoint").add_subparsers(
+        dest="embedding_command", required=True
+    )
+    set_embedding = embedding.add_parser("set", help="set the embedding API (preview first)")
+    set_embedding.add_argument("--base-url", default=DEFAULT_BASE_URL)
+    set_embedding.add_argument("--model", default=DEFAULT_MODEL)
+    set_embedding.add_argument("--api-key-file", metavar="FILE", help="key file, or - for stdin")
+    set_embedding.add_argument("--dimensions", type=int, default=None)
+    set_embedding.add_argument("--yes", action="store_true", help="apply (otherwise preview)")
+    set_embedding.set_defaults(func=cmd_embedding_set)
+    remove_embedding = embedding.add_parser("remove", help="back to full-text search only")
+    remove_embedding.add_argument("--yes", action="store_true", help="apply (otherwise preview)")
+    remove_embedding.set_defaults(func=cmd_embedding_remove)
     return parser
 
 

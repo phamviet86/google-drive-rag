@@ -156,6 +156,32 @@ def _ocr_langs(value: object) -> str:
     return "+".join(langs)
 
 
+def setting_origins(data_dir: Path) -> dict[str, str]:
+    """Where each setting comes from, never its value: ``environment (GDRAG_...)``, ``stored``
+    (config.json, written by the CLI or an admin tool) or ``default``. The environment wins."""
+    stored = read_config(data_dir)
+    origins: dict[str, str] = {}
+    for env_name, key in ENV_FIELDS.items():
+        if os.environ.get(env_name, "").strip():
+            origins[key] = f"environment ({env_name})"
+        elif key in stored:
+            origins[key] = "stored"
+        else:
+            origins[key] = "default"
+    return origins
+
+
+def environment_conflicts(changes: dict[str, Any]) -> list[str]:
+    """Names of ``GDRAG_*`` variables that hold a different value for a field in ``changes``.
+    Such a change would be overridden by the environment, so callers refuse it."""
+    names: list[str] = []
+    for env_name, key in ENV_FIELDS.items():
+        raw = os.environ.get(env_name, "").strip()
+        if key in changes and raw and raw.rstrip("/") != str(changes[key]).strip().rstrip("/"):
+            names.append(env_name)
+    return names
+
+
 def read_config(data_dir: Path) -> dict[str, Any]:
     path = data_dir / "config.json"
     if not path.is_file():
