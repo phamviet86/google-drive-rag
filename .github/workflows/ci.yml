@@ -1,0 +1,49 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  checks:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.12", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+      - run: pip install -e '.[dev]'
+      - run: ruff format --check .
+      - run: ruff check .
+      - run: mypy
+      - run: pytest -q
+      - run: python -m compileall -q src tests
+
+  docker:
+    # Builds the image on x86_64. The build runs a real OCR pass, so it also checks the OCR runtime.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: docker build -t google-drive-rag:ci .
+      - name: Start the container and check it answers
+        run: |
+          docker run -d --name gdrag -p 127.0.0.1:8765:8765 google-drive-rag:ci
+          for attempt in $(seq 1 30); do
+            if curl -fsS http://127.0.0.1:8765/healthz; then exit 0; fi
+            sleep 2
+          done
+          docker logs gdrag
+          exit 1
