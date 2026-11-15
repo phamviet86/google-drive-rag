@@ -56,7 +56,7 @@ def test_first_sync_scopes_warn_instead_of_failing(tmp_path: Path) -> None:
         assert result["results"] == []
         assert result["warnings"] == ["source 'Kế toán' is still on its first sync (listing files)"]
     early = service.search("doanh thu", folder=SUB)
-    assert early["results"] == [] and "not indexed yet" in early["warnings"][0]
+    assert early["results"] == [] and "unknown; it may not be indexed yet" in early["warnings"][0]
     assert "still on its first sync" in early["warnings"][0]
 
     seen: list[dict[str, Any]] = []
@@ -66,6 +66,8 @@ def test_first_sync_scopes_warn_instead_of_failing(tmp_path: Path) -> None:
             seen.append(service.search("doanh thu", source=ROOT))
             seen.append(service.search("doanh thu", folder=SUB))
             seen.append(service.search("doanh thu", folder=ROOT))
+            with pytest.raises(ValueError, match="unknown or not indexed folder"):
+                service.search("doanh thu", folder="folderMistyped01")  # listed: a typo
 
     drive.hook = during
     service.sync()
@@ -214,3 +216,26 @@ def test_service_skips_unsupported_items_of_any_backend(tmp_path: Path) -> None:
     assert report["indexed"] == 1 and report["failed"] == 0
     assert drive.downloads == ["fileA00000000001"]
     assert service.skipped_files()["files"][0]["path"] == "z.zip"
+
+
+def test_exclude_rules_apply_to_files_indexed_during_a_sync(tmp_path: Path) -> None:
+    drive = first_sync_drive()
+    drive.put(ROOT, "fileD00000000001", "d.txt", "doanh thu tháng tư".encode())
+    service = make_service(tmp_path, drive)
+    service.add_sources([ROOT])
+    service.set_path_rules(1, {"demote": [], "exclude": ["Lương/"]})
+    assert service.search("doanh thu", source=ROOT)["results"] == []  # rules read, no files yet
+    seen: list[set[str]] = []
+
+    def during(item: DriveItem) -> None:
+        if item.id == "fileD00000000001":  # c.txt (under Lương/) is indexed by now
+            hits = service.search("doanh thu lương", source=ROOT)["results"]
+            seen.append({h["file_name"] for h in hits})
+
+    drive.hook = during
+    service.sync()
+    assert seen and seen[0] and "c.txt" not in seen[0]
+    assert "c.txt" not in {h["file_name"] for h in service.search("bảng lương")["results"]}
+    drive.put(ROOT, "fileB00000000001", "b.txt", "doanh thu tháng hai".encode(), parent=SUB)
+    service.sync()  # moved under Lương/: rename only, hidden from the next search
+    assert "b.txt" not in {h["file_name"] for h in service.search("doanh thu")["results"]}

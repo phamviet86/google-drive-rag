@@ -146,17 +146,68 @@ def test_demote_lifts_the_canonical_file_above_every_attachment(
     assert top["path_rule"] is None and top["fused"] == top["fused_before_rules"]
 
 
-def test_demote_shift_keeps_scores_ordered() -> None:
+def test_demote_moves_whole_documents_and_keeps_scores_ordered() -> None:
     from gdrive_rag.rules import DEMOTE_PLACES, demote
 
-    order = list(range(20))
-    scores = {i: 1.0 - i / 100 for i in order}
-    assert demote(order, {0}, dict(scores)).index(0) == DEMOTE_PLACES
-    result = demote(order, {0, 1}, scores)
-    assert result[: DEMOTE_PLACES - 1] == list(range(2, DEMOTE_PLACES + 1))
-    assert result.index(0) < result.index(1)
-    assert [scores[i] for i in result] == sorted((scores[i] for i in result), reverse=True)
-    assert demote([5], {5}, {5: 1.0}) == [5]  # nothing to move below
+    # chunks 0-2 belong to the demoted document 100; chunks 3.. to documents 0..14, one each
+    order = list(range(18))
+    document_of = {c: 100 if c < 3 else c - 3 for c in order}
+    scores = {c: 1.0 - c / 100 for c in order}
+    result = demote(order, document_of, {100}, scores)
+    first_demoted = min(result.index(c) for c in (0, 1, 2))
+    assert result[:first_demoted] == list(range(3, 3 + DEMOTE_PLACES))  # 10 other files first
+    assert result[first_demoted : first_demoted + 3] == [0, 1, 2]
+    assert [scores[c] for c in result] == sorted((scores[c] for c in result), reverse=True)
+    few = demote([0, 1, 2, 3], {0: 9, 1: 9, 2: 1, 3: 2}, {9}, {0: 4.0, 1: 3.0, 2: 2.0, 3: 1.0})
+    assert few == [2, 3, 0, 1]  # fewer than 10 other files: to the end, still listed
+    assert demote([5], {5: 1}, {1}, {5: 1.0}) == [5]
+
+
+def multi_chunk(tmp_path: Path, embeddings: FakeEmbeddings | None) -> Service:
+    """Each attachment has several chunks that match the query on its own; the canonical
+    article has several chunks too and an English name."""
+    drive = FakeDrive()
+    drive.add_root(SOURCE, "Kế toán")
+    drive.add_folder("folderAttach0001", "attachments", SOURCE)
+    old = " ".join(
+        f"Đoạn {n}: sổ cái doanh thu hộ kinh doanh, bản gốc cũ, mẫu sổ cái doanh thu."
+        for n in range(6)
+    )
+    for i in range(3):
+        drive.put(
+            SOURCE,
+            f"fileAttach{i:06d}",
+            f"so-cai-doanh-thu-ho-kinh-doanh-{i}.txt",
+            old.encode(),
+            parent="folderAttach0001",
+        )
+    canonical = " ".join(
+        f"Phần {n}: hướng dẫn ghi chép doanh thu của hộ kinh doanh vào sổ và lập sổ cái."
+        for n in range(6)
+    )
+    drive.put(
+        SOURCE, CANONICAL, "household-revenue-ledger-and-reconciliation.md", canonical.encode()
+    )
+    for i in range(2):
+        drive.put(SOURCE, f"fileNote{i:08d}", f"ghi-chu-{i}.txt", f"Ghi chú chi phí {i}.".encode())
+    service = make_service(tmp_path, drive, embeddings, chunk_chars=160, chunk_overlap=0)
+    service.add_sources([SOURCE])
+    service.sync()
+    return service
+
+
+@pytest.mark.parametrize("hybrid", [False, True])
+def test_demote_drops_multi_chunk_files_as_a_whole(tmp_path: Path, hybrid: bool) -> None:
+    service = multi_chunk(tmp_path, FakeEmbeddings() if hybrid else None)
+    query = "sổ cái doanh thu hộ kinh doanh"
+    canonical = "household-revenue-ledger-and-reconciliation.md"
+    before = service.search(query, limit=8)
+    assert all(h["chunk_count"] > 1 for h in before["results"][:3])
+    assert all(n.startswith("so-cai") for n in names(before)[:3])
+    service.set_path_rules(1, {"demote": ["attachments/**"], "exclude": []})
+    after = names(service.search(query, limit=8))
+    assert after[:3] == [canonical] * 3  # all its hits (per-file cap) before any old file
+    assert sum(n.startswith("so-cai") for n in after) >= 3  # old files still listed, lower
 
 
 def test_exclude_hides_from_search_but_keeps_the_file(tmp_path: Path) -> None:
@@ -299,3 +350,32 @@ def test_largest_rules_still_fit_the_wire(env: Env) -> None:
         assert isinstance(value, dict) and wire_size(value) <= MAX_WIRE_CHARS
     assert any(s["path_rules_truncated"] for s in listed["sources"])
     assert len(listed["sources"]) == len(env.service.list_sources())  # sources are never dropped
+
+
+def test_glob_matching_has_no_backtracking_blowup() -> None:
+    import time
+
+    started = time.monotonic()
+    for pattern in ("**a" * 8, "*a" * 30, "**/" * 10 + "z", "?*" * 40):
+        for path in ("a" * 59 + "b", "a/" * 30, "x" * 99 + "y"):
+            matches(pattern, path)
+    assert time.monotonic() - started < 2.0
+    assert matches("**a" * 8, "a" * 8) and not matches("**a" * 8, "a" * 7 + "b")
+
+
+@pytest.mark.parametrize("pattern", ["*", "**/*", "**/**", "/**/*", "**/*.*/**/*"])
+def test_match_everything_patterns_are_refused(pattern: str) -> None:
+    if pattern == "**/*.*/**/*":  # needs a dot folder: not everything, allowed
+        assert clean([pattern], "exclude") == [pattern]
+        return
+    with pytest.raises(ValueError, match="matches every file path"):
+        clean([pattern], "exclude")
+
+
+def test_exclude_hiding_every_document_of_a_source_is_refused(env: Env) -> None:
+    refused = env.tool("set_path_rules", source=ROOT, exclude=["*.txt"])  # its only file
+    assert isinstance(refused, str) and "would hide every document" in refused
+    refused = env.tool("set_path_rules", source=ROOT, exclude=["*.txt"], confirm=True)
+    assert isinstance(refused, str) and "would hide every document" in refused
+    assert env.tool("list_sources")["sources"][0]["path_rules"]["exclude"] == []
+    assert env.tool("set_path_rules", source=ROOT, demote=["*.txt"])["applied"] is False

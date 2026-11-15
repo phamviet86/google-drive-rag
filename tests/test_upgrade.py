@@ -34,6 +34,19 @@ def snapshot(path: Path) -> dict[str, list[Any]]:
             "identity": connection.execute(
                 "SELECT value FROM meta WHERE key='embedding_identity'"
             ).fetchall(),
+            "document_sources": connection.execute(
+                "SELECT * FROM document_sources ORDER BY document_id, source_id"
+            ).fetchall(),
+            "document_folders": connection.execute(
+                "SELECT * FROM document_folders ORDER BY document_id, folder_id"
+            ).fetchall(),
+            "folders": connection.execute("SELECT * FROM folders ORDER BY folder_id").fetchall(),
+            "folder_sources": connection.execute(
+                "SELECT * FROM folder_sources ORDER BY folder_id, source_id"
+            ).fetchall(),
+            "fts": connection.execute(
+                "SELECT rowid, text, title FROM chunks_fts ORDER BY rowid"
+            ).fetchall(),
         }
     finally:
         connection.close()
@@ -42,7 +55,9 @@ def snapshot(path: Path) -> dict[str, list[Any]]:
 def test_upgrade_from_v0_2_0_reextracts_and_reembeds_nothing(tmp_path: Path) -> None:
     shutil.copy(FIXTURE, tmp_path / "index.sqlite3")
     before = snapshot(tmp_path / "index.sqlite3")
-    assert len(before["chunks"]) == len(FILES) and len(before["vectors"]) == len(FILES)
+    assert len(before["chunks"]) > len(FILES)  # multi-chunk files
+    assert len(before["vectors"]) == len({row[5] for row in before["chunks"]})
+    assert len(before["fts"]) == len(before["chunks"]) and before["document_folders"]
     drive = upgrade_drive(FakeDrive)
     assert isinstance(drive, FakeDrive)
     embeddings = FakeEmbeddings()

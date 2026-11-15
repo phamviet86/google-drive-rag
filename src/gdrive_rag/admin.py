@@ -204,6 +204,12 @@ class Admin:
             "rules": wanted,
             "matches": self.service.rule_matches(source_id, wanted),
         }
+        found = answer["matches"]
+        if wanted["exclude"] and found["documents"] and found["excluded"] == found["documents"]:
+            raise AdminRefused(
+                "these exclude patterns would hide every document of this source from search; "
+                "use narrower patterns, or remove_source to drop the source"
+            )
         if not confirm:
             answer["would"] = (
                 "Search would use these rules for this source: demote lowers a file's score, "

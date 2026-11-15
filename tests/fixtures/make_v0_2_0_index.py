@@ -15,16 +15,23 @@ import sys
 import tempfile
 from pathlib import Path
 
-ROOT, SUB = "rootUpgrade00001", "folderAttach0001"
+ROOT, SUB, DEEP = "rootUpgrade00001", "folderAttach0001", "folderDeep000001"
+
+
+def _long(topic: str, parts: int) -> str:
+    """Several numbered paragraphs, long enough for several chunks at the default size."""
+    return "\n\n".join(
+        f"Mục {n}. {topic} Nội dung chi tiết của mục {n}, ghi rõ số liệu, người phụ trách "
+        "và thời hạn hoàn thành. " * 6
+        for n in range(1, parts + 1)
+    )
+
+
 FILES = [  # (file id, name, text, parent folder or None for the root)
-    (
-        "fileLedger000001",
-        "so-cai.md",
-        "Sổ cái doanh thu hộ kinh doanh và đối soát hằng tháng.",
-        None,
-    ),
+    ("fileLedger000001", "so-cai.md", _long("Sổ cái doanh thu và đối soát.", 6), None),
     ("filePayroll00001", "luong.txt", "Bảng lương và bảo hiểm xã hội của nhân viên.", None),
-    ("fileOldCopy00001", "ban-goc.txt", "Bản gốc cũ: sổ cái doanh thu và đối soát.", SUB),
+    ("fileOldCopy00001", "ban-goc.txt", _long("Bản gốc cũ của sổ cái.", 4), SUB),
+    ("fileDeep00000001", "chi-tiet.txt", _long("Chứng từ chi tiết.", 3), DEEP),
 ]
 
 
@@ -32,6 +39,7 @@ def upgrade_drive(fake_drive: type) -> object:
     drive = fake_drive()
     drive.add_root(ROOT, "Kế toán")
     drive.add_folder(SUB, "attachments", ROOT)
+    drive.add_folder(DEEP, "2025", SUB)
     for file_id, name, text, parent in FILES:
         drive.put(ROOT, file_id, name, text.encode(), parent=parent)
     return drive

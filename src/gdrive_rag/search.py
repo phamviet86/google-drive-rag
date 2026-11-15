@@ -41,7 +41,7 @@ from .db import TERM, Database, fts_fold
 from .drive import parse_drive_link
 from .embeddings import EmbeddingClient
 from .ranking import contains_phrase, idf, lexical_score, title_score, tokens
-from .rules import demote, effects
+from .rules import combine, demote, group, row_effect
 
 CANDIDATES = 200  # FTS candidates re-scored per query
 RRF_K = 60
@@ -63,7 +63,9 @@ class SearchEngine:
         self.embeddings = embeddings
         self._lock = threading.Lock()
         self._matrix: tuple[str, list[int], Any] | None = None
-        self._rule_cache: tuple[Any, dict[int, tuple[str, str]]] | None = None
+        self._rule_cache: tuple[Any, dict[tuple[int, str, int], tuple[str, str] | None]] | None = (
+            None
+        )
 
     def search(
         self,
@@ -115,12 +117,14 @@ class SearchEngine:
         applied: dict[int, str] = {}
         ordered = sorted(scores, key=lambda chunk_id: scores[chunk_id], reverse=True)
         if rules:
-            for chunk_id, document_id in self._documents_of(ordered).items():
+            document_of = self._documents_of(ordered)
+            for chunk_id, document_id in document_of.items():
                 effect = rules.get(document_id)
                 if effect is not None and effect[0] == "demote":
                     applied[chunk_id] = f"demote: {effect[1]}"
             if applied:
-                ordered = demote(ordered, set(applied), scores)
+                demoted = {document_of[c] for c in applied}
+                ordered = demote(ordered, document_of, demoted, scores)
         results = self._rows(ordered, scores, limit)
         if explain:
             fts = {c: (rank, score, bm25) for rank, (c, score, bm25) in enumerate(lexical, 1)}
@@ -193,12 +197,6 @@ class SearchEngine:
             ]
             if not rules:
                 return {}
-            revision = connection.execute(
-                "SELECT value FROM meta WHERE key=?", (REVISION_KEY,)
-            ).fetchone()
-            key = (revision[0] if revision else "0", tuple(rules))
-            if self._rule_cache is not None and self._rule_cache[0] == key:
-                return self._rule_cache[1]
             sources = sorted({rule[0] for rule in rules})
             documents = [
                 (int(row[0]), str(row[1]), int(row[2]))
@@ -209,9 +207,22 @@ class SearchEngine:
                     sources,
                 )
             ]
-        result = effects(rules, documents)
-        self._rule_cache = (key, result)
-        return result
+        # Memo per membership row (document, path, source) under these rules, read fresh on
+        # every query: files linked or renamed during a sync get their rules at once, without
+        # an index_revision bump (which would reload the vector matrix).
+        key = tuple(rules)
+        if self._rule_cache is None or self._rule_cache[0] != key:
+            self._rule_cache = (key, {})
+        memo = self._rule_cache[1]
+        by_source = group(rules)
+        rows = []
+        for row in documents:
+            if row not in memo:
+                memo[row] = row_effect(by_source.get(row[2], []), row[1])
+            rows.append((row[0], memo[row]))
+        if len(memo) > 4 * len(documents) + 1000:  # forget rows of renamed or removed files
+            self._rule_cache = (key, {row: memo[row] for row in documents})
+        return combine(rows)
 
     def _documents_of(self, chunk_ids: list[int]) -> dict[int, int]:
         output: dict[int, int] = {}
@@ -245,15 +256,19 @@ class SearchEngine:
                 if not connection.execute(
                     "SELECT 1 FROM folders WHERE folder_id=?", (folder_id,)
                 ).fetchone():
-                    pending = [  # a source stuck in error must not hide typos forever
+                    # Only a folder source that has not been listed yet can hold an unknown
+                    # folder (a listed source's folders are registered at once); otherwise a
+                    # mistyped folder is a plain error, also while some first sync runs.
+                    listing = [
                         first_sync_note(r)
                         for r in connection.execute(
-                            f"{_PENDING_SOURCES} AND s.last_status!='error'"
+                            f"{_PENDING_SOURCES} AND s.last_status='pending' AND s.kind!='file'"
                         )
                     ]
-                    if pending:
+                    if listing:
                         raise NotIndexedYet(
-                            f"folder {folder} is not indexed yet: " + "; ".join(pending)
+                            f"folder {folder} is unknown; it may not be indexed yet: "
+                            + "; ".join(listing)
                         )
                     raise ValueError(f"unknown or not indexed folder: {folder}")
                 conditions.append(
