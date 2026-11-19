@@ -533,7 +533,7 @@ def register_source_tools(
 
     @server.tool(
         title="Set search path rules",
-        annotations=notes(destructive=False, idempotent=True, world=False),
+        annotations=notes(destructive=True, idempotent=True, world=False),
         description=ADMIN_RULE
         + "Set path patterns for one source's search results: demote lowers the score of "
         "matching files, exclude leaves them out of search (they stay indexed and readable by "
