@@ -24,6 +24,7 @@ from gdrive_rag.drive import (
     display_segment,
 )
 from gdrive_rag.extract import Extractor
+from gdrive_rag.local import LocalBackend, RoutingBackend
 from gdrive_rag.service import Service
 
 DOCX = "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
@@ -210,6 +211,7 @@ def make_service(
     embeddings: FakeEmbeddings | None = None,
     converter: Callable[[Path, str, Path], Path] = fake_converter,
     ocr: FakeOCR | None = None,
+    local_root: Path | None = None,
     **settings: Any,
 ) -> Service:
     base = replace(
@@ -221,9 +223,21 @@ def make_service(
     def no_backend(_: Settings) -> FakeDrive:
         raise DriveSourceError("Google access is not configured; run: gdrive-rag setup")
 
+    if local_root is not None:  # Drive (if any) and a local folder behind one backend
+        routed = RoutingBackend(
+            (lambda: backend) if drive is not None else (lambda: no_backend(configured)),
+            LocalBackend(local_root),
+        )
+
+        def factory(_: Settings) -> Any:
+            return routed
+
+    else:
+        factory = (lambda _: backend) if drive is not None else no_backend
+
     return Service(
         lambda: configured,
-        backend_factory=(lambda _: backend) if drive is not None else no_backend,
+        backend_factory=factory,
         embedding_factory=lambda _: embeddings,
         extractor_factory=lambda s: Extractor(
             ocr, ocr_enabled=ocr is not None, converter=converter, work_dir=s.work_dir

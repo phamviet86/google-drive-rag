@@ -2,6 +2,20 @@
 
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions follow [Semantic Versioning](https://semver.org/). The install guide for the owner is `README.md` (Vietnamese).
 
+## [Unreleased]
+
+Tóm tắt: thêm/bớt nguồn, quy tắc đường dẫn và loại trừ theo ID không còn cần công cụ quản trị; đọc được tệp trên máy (local); chỉ quyền Google và khóa embedding còn là công cụ quản trị. Cập nhật không đọc lại tệp nào.
+
+### Added
+
+- Local files: a folder mounted at `GDRAG_LOCAL_DIR` (`/files` in Docker; compose mounts `./files:/files:ro`) can be added as a source with `local:<path>` (`local:` is the whole folder; a folder or a single file). The ID `local:<path>` works for `folder`, `files`, `read` and exclusions. Same extractors and OCR as Drive; works with no Google access. Paths outside the folder, symlinks, hidden names and `~$` files are never read. A missing folder (unmounted volume) is a source error that deletes nothing.
+- Exclusions by ID: `set_exclusions` / `list_exclusions` tools and `gdrive-rag exclusion list|add|remove` hide a file, or a folder and everything below it, from search (Drive IDs or `local:` IDs). Search-time only; the files stay indexed and readable, and a file named in `files` is still found. Migration 5 adds the `exclusions` table.
+
+### Changed
+
+- `add_source`, `remove_source` and `set_path_rules` are always available; only the Google access and embedding tools remain admin tools (`GDRAG_ADMIN_TOOLS=1`, seven tools). `remove_source` and `set_path_rules` still preview first and apply only with `confirm: true`.
+- Temporary extraction files are named by a hash of the file ID.
+
 ## [0.3.0] - 2026-11-15
 
 Tóm tắt: thêm bộ công cụ quản trị từ Claude (tắt sẵn, bật bằng `GDRAG_ADMIN_TOOLS=1`), quy tắc hạ thấp hoặc ẩn tệp theo đường dẫn khi tìm, tiến độ đọc Drive trực tiếp trong `sync_status`, danh sách tệp bị bỏ qua, và tìm được ngay trong lúc nguồn mới đang được đọc lần đầu. Cập nhật không đọc lại tệp nào và không tính lại dữ liệu ý nghĩa.

@@ -1,6 +1,6 @@
 # CLAUDE.md
 
-google-drive-rag is a single-process RAG service over Google Drive: an MCP server (Streamable HTTP at `/mcp`, plus `/healthz`) and a background sync loop, packaged as one Docker container. The owner is not a programmer and reads Vietnamese; `README.md` is their install guide and must stay in Vietnamese.
+google-drive-rag is a single-process RAG service over Google Drive and a mounted local folder: an MCP server (Streamable HTTP at `/mcp`, plus `/healthz`) and a background sync loop, packaged as one Docker container. The owner is not a programmer and reads Vietnamese; `README.md` is their install guide and must stay in Vietnamese.
 
 ## Commands
 
@@ -34,6 +34,7 @@ All code is in `src/gdrive_rag`. Console script `gdrive-rag` → `gdrive_rag.cli
 
 ```text
 cli.py / server.py  →  service.Service  →  drive.py (DriveBackend protocol, GoogleDriveBackend)
+                                        →  local.py (LocalBackend, RoutingBackend)
                                         →  extract.py (+ formats.py, xlsx_compat.py, ocr.py)
                                         →  chunking.py → db.py (SQLite WAL, FTS5, vectors)
                                         →  embeddings.py (OpenAI-compatible client)
@@ -66,22 +67,33 @@ cli.py / server.py  →  service.Service  →  drive.py (DriveBackend protocol, 
   - A scoped search on such a source warns `source 'X' is still on its first sync (N of M files indexed)`. A folder not in `folders` gives that warning (`search.NotIndexedYet`, 'unknown; it may not be indexed yet') only while a folder source still has `last_status='pending'` (not listed yet); otherwise it is a `ValueError`.
 - Progress: `service.Progress` writes `meta.sync_progress` (throttled by `PROGRESS_INTERVAL_SECONDS`) and removes it when the sync ends. `status()` shows it as `sync.progress` only while `sync_running()` is true.
 - Skipped files: `drive.split_supported` / `skip_reason` split listed items. `Listing.skipped` is stored in `skipped_files`, replaced from a complete listing and added to from an incomplete one. `Service._sync` applies the same split to any backend's items.
-- MCP tools (`server.py`), six always registered: read-only `search`, `read`, `list_sources`, `list_folders`, `sync_status`, plus `sync_now` (not read-only, not destructive, idempotent), which only asks for an early sync. `list_folders` pages folders then documents as one sequence (`offset` / `next_offset`, 100 per page, then the wire cap). Each returns `Annotated[CallToolResult, <Model>]` with the same JSON as text and structured content, trimmed until `wire_size` (both copies, after JSON escaping) is at most `MAX_WIRE_CHARS` (56,000), so a response stays under about 60,000 characters. `sync_status` takes `include_skipped`, which lists the first 100 skipped files.
-- Admin MCP tools (`admin.Admin`, registered by `server.register_admin_tools`) exist only when `GDRAG_ADMIN_TOOLS` is 1/true/yes/on in the environment; otherwise they are not listed. That switch and `GDRAG_SECRETS_DIR` (`/secrets` in Docker) are read from the environment only, never from `config.json`, so no tool can turn the switch on or widen the secrets folder.
-  - The ten tools: `add_source`, `remove_source`, `set_path_rules`, `google_auth_status`, `set_google_service_account`, `google_auth_start`, `google_auth_finish`, `remove_google_auth`, `set_embedding`, `remove_embedding`.
-  - Destructive tools, and `set_path_rules`, take `confirm`; without it they only preview.
+- MCP tools (`server.py`), always registered, no admin switch:
+  - read-only `search`, `read`, `list_sources`, `list_folders`, `sync_status`, `list_exclusions`;
+  - `sync_now` (not read-only, not destructive, idempotent), which only asks for an early sync;
+  - source tools `add_source`, `remove_source` (destructive, `confirm`), `set_path_rules` (`confirm`), implemented by `Admin.add_source` / `remove_source` / `set_path_rules` (an `Admin` built without a secrets folder serves them) and registered by `register_source_tools`; and `set_exclusions`.
+  - Source and exclusion tools carry `CHANGE_RULE` in their description (call only when the user asks in the conversation).
+
+  `list_folders` pages folders then documents as one sequence (`offset` / `next_offset`, 100 per page, then the wire cap). Each returns `Annotated[CallToolResult, <Model>]` with the same JSON as text and structured content, trimmed until `wire_size` (both copies, after JSON escaping) is at most `MAX_WIRE_CHARS` (56,000), so a response stays under about 60,000 characters. `sync_status` takes `include_skipped`, which lists the first 100 skipped files.
+- Local files (`local.py`): `GDRAG_LOCAL_DIR` (`/files` in Docker, compose mounts `./files:/files:ro`) is read from the environment only, like `GDRAG_ADMIN_TOOLS`, so no tool widens it. A local source, folder or file is the ID `local:<path relative to that folder>` (`local:` is the whole folder); `drive.parse_drive_link` normalizes it (no `..`, backslash or control character) and it works wherever a Drive ID does (`folder`, `files`, `read`, exclusions, `list_folders(parent=...)`). `web_url` and the hit's `drive_link` are the ID itself (`folder_link` returns local IDs unchanged).
+  - `RoutingBackend` sends `local:` IDs to `LocalBackend` and the rest to a lazily built Google backend, so local files work with no Google access. `default_backend` builds it; tests use `make_service(..., local_root=...)`.
+  - Paths are resolved with symlinks and refused outside the root. Symlinks, hidden names (`.`) and `~$` files are not listed. Fingerprint is the mtime (`modified_time`, no checksum) and size; a rename changes the ID, so the file is extracted again (embeddings are reused through `chunk_hash`). Temporary files in `work_dir` are named by the SHA-1 of the ID.
+  - `resolve` (adding a source) raises `DriveItemError` for a missing path or when `GDRAG_LOCAL_DIR` is unset, so nothing is stored. `list_files` raises `DriveSourceError` when the path is missing (an unmounted volume): the source shows an error and nothing is deleted. A complete listing that lacks files still deletes them, as with Drive.
+- Exclusions (`exclusions` table, migration 5): global file / folder IDs (Drive or `local:`), at most `MAX_EXCLUSIONS` (200), `MAX_EXCLUSION_CHANGES` (50) per call, set by `Service.set_exclusions`. Applied at query time only, as one more `NOT IN` scope condition together with the path-rule excludes (`SearchEngine._excluded_documents`: the file itself, or any document in `document_folders` under an excluded folder). A file named in `files` is never excluded. An ID not (yet) indexed can be excluded and shows as `not_indexed_yet`. Nothing is re-extracted or re-embedded and documents stay readable; with no exclusions the search path is unchanged. `list_folders` does not hide excluded folders.
+- Admin MCP tools (`admin.Admin`, registered by `server.register_admin_tools`) are Google access and the embedding endpoint, and exist only when `GDRAG_ADMIN_TOOLS` is 1/true/yes/on in the environment; otherwise they are not listed. That switch and `GDRAG_SECRETS_DIR` (`/secrets` in Docker) are read from the environment only, never from `config.json`, so no tool can turn the switch on or widen the secrets folder.
+  - The seven tools: `google_auth_status`, `set_google_service_account`, `google_auth_start`, `google_auth_finish`, `remove_google_auth`, `set_embedding`, `remove_embedding`.
+  - Destructive tools take `confirm`; without it they only preview. The same holds for the always-on `remove_source` and `set_path_rules`.
   - File arguments are names inside the secrets folder, resolved with symlinks and refused outside it.
-  - Every admin tool argument is typed `Any` with a default and checked in the handler, because the SDK's validation error prints the whole argument dict. The JSON type is still advertised through `server.loose`. `confirm` must be the JSON boolean `true`. Errors never repeat an argument value.
+  - Every admin and source tool argument is typed `Any` with a default and checked in the handler, because the SDK's validation error prints the whole argument dict. The JSON type is still advertised through `server.loose`. `confirm` must be the JSON boolean `true`. Errors never repeat an argument value.
   - `set_embedding` rules:
     - A new origin (scheme, host, port) needs a new key, and the change is refused while `GDRAG_EMBEDDING_API_KEY` is set.
     - Key files must be one token of `[A-Za-z0-9._~+/=-]{16,4096}` and must not look like a Google credential (`GOCSPX-`, `ya29.`, `1//`, `-----BEGIN`).
     - `netcheck.check` runs when the address is set and on every request. It allows only a plain host name or a bracketed IPv6 literal, and every resolved address must be public. Loopback and private addresses need `GDRAG_ALLOW_LOCAL_EMBEDDINGS=1`, and plain http is allowed only to such a literal address.
     - Requests connect to the checked IP and never follow redirects.
-  - `add_source` stores only sources Google confirmed. Links must be on `drive.google.com` or `docs.google.com` exactly. The stored link is rebuilt from the ID.
+  - `add_source` stores only sources Google (or the local folder) confirmed. Drive links must be on `drive.google.com` or `docs.google.com` exactly; the stored link is rebuilt from the ID.
   - `remove_google_auth` does not revoke the grant at Google; its result says how to. Token refresh and removal share `config.token_lock`. A refresh writes `token.json` only if the file still exists.
   - The OAuth flow (PKCE, state) is held in memory, expires after 10 minutes and is single use. No bare code is accepted over MCP.
   - Changing Google access does not start a sync, because an account without access to a source root would empty it. `add_source` queues a sync.
-  - The CLI admin commands apply the same `Admin` methods and precedence: `source add/remove/rules`, `auth google/remove`, `embedding set/remove`, `config import-env`.
+  - The CLI commands apply the same `Admin` / `Service` methods and precedence: `source add/remove/rules`, `exclusion list/add/remove`, `auth google/remove`, `embedding set/remove`, `config import-env`.
   - Do not add more admin tools without the owner's approval.
 - The server is stateless JSON-response Streamable HTTP with DNS-rebinding protection allowing only `127.0.0.1`, `localhost` and `[::1]` hosts (extend with `GDRAG_ALLOWED_HOSTS`). In Docker it listens on `0.0.0.0`; compose publishes only `127.0.0.1:8765`.
 

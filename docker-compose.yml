@@ -11,6 +11,9 @@ services:
     env_file:
       - path: .env
         required: false
+    environment:
+      # Local files: the folder mounted at /files below. Sources are added as local:<path>.
+      GDRAG_LOCAL_DIR: /files
     ports:
       # Only reachable from the VPS itself (Claude Code runs there). Never expose publicly.
       - "127.0.0.1:8765:8765"
@@ -18,6 +21,8 @@ services:
       - gdrive-rag-data:/data
       # Put the Google JSON file here (owned by uid 10001, mode 600); mounted read-only.
       - ./secrets:/secrets:ro
+      # Local files to index (read-only). Files must be readable by uid 10001 (chmod -R a+rX).
+      - ./files:/files:ro
 
 volumes:
   gdrive-rag-data:

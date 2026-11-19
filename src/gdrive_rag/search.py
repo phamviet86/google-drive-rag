@@ -88,14 +88,16 @@ class SearchEngine:
             return {"mode": "full_text", "warnings": [str(exc)], "results": []}
         warnings += self._first_sync_notes(source, folder)
         rules = self._rule_effects()
-        if rules:
-            excluded = sorted(d for d, (e, _) in rules.items() if e == "exclude" and d not in named)
-            if excluded:
-                condition = "c.document_id NOT IN (SELECT value FROM json_each(?))"
-                scope = (
-                    f"{scope[0]} AND {condition}" if scope[0] else condition,
-                    [*scope[1], json.dumps(excluded)],
-                )
+        # documents hidden by a path rule or by an excluded file / folder ID; a file named in
+        # `files` stays
+        hidden = {d for d, (e, _) in rules.items() if e == "exclude"} if rules else set()
+        excluded = sorted((hidden | self._excluded_documents()) - named)
+        if excluded:
+            condition = "c.document_id NOT IN (SELECT value FROM json_each(?))"
+            scope = (
+                f"{scope[0]} AND {condition}" if scope[0] else condition,
+                [*scope[1], json.dumps(excluded)],
+            )
         pool = max(limit * 5, 40)
         lexical, phrases, query_terms, weights = self._full_text(terms, scope, pool)
         semantic: list[tuple[int, float]] = []
@@ -185,6 +187,21 @@ class SearchEngine:
                     sorted(ids),
                 )
             ]
+
+    def _excluded_documents(self) -> set[int]:
+        """Documents hidden by the excluded file and folder IDs (a folder hides everything below
+        it); empty when nothing is excluded."""
+        with self.db.read() as connection:
+            if connection.execute("SELECT 1 FROM exclusions LIMIT 1").fetchone() is None:
+                return set()
+            return {
+                int(row[0])
+                for row in connection.execute(
+                    "SELECT id FROM documents WHERE file_id IN (SELECT item_id FROM exclusions) "
+                    "UNION SELECT document_id FROM document_folders "
+                    "WHERE folder_id IN (SELECT item_id FROM exclusions)"
+                )
+            }
 
     def _rule_effects(self) -> dict[int, tuple[str, str]]:
         """``{document id: (effect, pattern)}`` from all path rules; {} when there are none."""

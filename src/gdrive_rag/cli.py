@@ -1,5 +1,5 @@
 """Admin CLI: ``gdrive-rag setup | auth google/remove | embedding set/remove |
-source add/list/remove | sync | status | search | serve``.
+source add/list/remove/rules | exclusion list/add/remove | sync | status | search | serve``.
 
 Output is plain readable text, or JSON with ``--json``. Secrets are never printed.
 """
@@ -117,6 +117,21 @@ def cmd_source_list(args: argparse.Namespace) -> int:
 def cmd_source_remove(args: argparse.Namespace) -> int:
     # the same rules as the remove_source tool (GDRAG_DRIVE_LINKS, running sync)
     _print(_admin(args).remove_source(args.source, True), args.json)
+    return 0
+
+
+def cmd_exclusion_list(args: argparse.Namespace) -> int:
+    _print(_service(args).exclusions(), args.json)
+    return 0
+
+
+def cmd_exclusion_add(args: argparse.Namespace) -> int:
+    _print(_service(args).set_exclusions(args.ids, []), args.json)
+    return 0
+
+
+def cmd_exclusion_remove(args: argparse.Namespace) -> int:
+    _print(_service(args).set_exclusions([], args.ids), args.json)
     return 0
 
 
@@ -305,10 +320,10 @@ def build_parser() -> argparse.ArgumentParser:
     )
     search.set_defaults(func=cmd_search)
 
-    source = commands.add_parser("source", help="manage Drive sources").add_subparsers(
+    source = commands.add_parser("source", help="manage Drive and local sources").add_subparsers(
         dest="source_command", required=True
     )
-    add = source.add_parser("add", help="add one or more Drive links")
+    add = source.add_parser("add", help="add Drive links, or local:<path> folders and files")
     add.add_argument("links", nargs="+")
     add.set_defaults(func=cmd_source_add)
     source.add_parser("list", help="list sources").set_defaults(func=cmd_source_list)
@@ -326,6 +341,17 @@ def build_parser() -> argparse.ArgumentParser:
     rules.add_argument("--demote", nargs="*", metavar="PATTERN", help="files that rank lower")
     rules.add_argument("--exclude", nargs="*", metavar="PATTERN", help="files left out of search")
     rules.set_defaults(func=cmd_source_rules)
+
+    exclusion = commands.add_parser(
+        "exclusion", help="hide files or folders from search by ID (Drive ID or local:<path>)"
+    ).add_subparsers(dest="exclusion_command", required=True)
+    exclusion.add_parser("list", help="list excluded IDs").set_defaults(func=cmd_exclusion_list)
+    hide = exclusion.add_parser("add", help="exclude files or folders")
+    hide.add_argument("ids", nargs="+", metavar="ID", help="Drive link or ID, or local:<path>")
+    hide.set_defaults(func=cmd_exclusion_add)
+    show = exclusion.add_parser("remove", help="include them in search again")
+    show.add_argument("ids", nargs="+", metavar="ID")
+    show.set_defaults(func=cmd_exclusion_remove)
 
     auth = commands.add_parser("auth", help="Google credentials").add_subparsers(
         dest="auth_command", required=True

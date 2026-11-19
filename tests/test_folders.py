@@ -269,7 +269,7 @@ def test_upgrade_from_a_d9e8061_data_dir(tmp_path: Path, monkeypatch: pytest.Mon
     service = make_service(tmp_path, drive, embeddings)
     with service.db.read() as connection:
         versions = [r[0] for r in connection.execute("SELECT version FROM schema_migrations")]
-    assert versions == [1, 2, 3, 4]
+    assert versions == [1, 2, 3, 4, 5]
     assert service.search("quý một")["mode"] == "hybrid"  # works before the first new sync
     with pytest.raises(ValueError, match="not indexed folder"):
         service.search("thuế", folder=KE_TOAN)

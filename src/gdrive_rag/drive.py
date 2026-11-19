@@ -176,7 +176,29 @@ def split_supported(items: Sequence[DriveItem]) -> tuple[list[DriveItem], list[S
     return kept, skipped
 
 
+LOCAL_PREFIX = "local:"
+
+
+def is_local_id(value: str) -> bool:
+    return value.startswith(LOCAL_PREFIX)
+
+
+def normalize_local_id(value: str) -> str:
+    """``local:<path>`` with the path relative to the local folder: no leading ``/``, no empty
+    or ``.`` parts, and no ``..``, backslash or control character. ``local:`` alone is the whole
+    local folder."""
+    path = value.strip()[len(LOCAL_PREFIX) :]
+    if "\\" in path or any(ord(char) < 32 or ord(char) == 127 for char in path):
+        raise ValueError("not a valid local path")
+    parts = [part for part in path.split("/") if part not in {"", "."}]
+    if ".." in parts:
+        raise ValueError("a local path cannot contain '..'")
+    return LOCAL_PREFIX + "/".join(parts)
+
+
 def folder_link(folder_id: str) -> str:
+    if is_local_id(folder_id):
+        return folder_id  # a local item has no web link; its ID is its address
     return f"https://drive.google.com/drive/folders/{folder_id}"
 
 
@@ -193,7 +215,7 @@ DRIVE_HOSTS = {"drive.google.com", "docs.google.com"}
 
 def drive_link(drive_id: str, kind: str) -> str:
     """The link stored for a source, rebuilt from its ID (never the text the user pasted)."""
-    if kind in {"folder", "shared_drive"}:
+    if kind in {"folder", "shared_drive"} or is_local_id(drive_id):
         return folder_link(drive_id)
     return f"https://drive.google.com/open?id={drive_id}"
 
@@ -211,8 +233,11 @@ def save_refreshed_token(token_file: Path, payload: str) -> bool:
 
 
 def parse_drive_link(link: str) -> str:
-    """Return the Drive ID from a folder, shared-drive, file, Docs/Sheets/Slides or open?id link."""
+    """Return the Drive ID from a folder, shared-drive, file, Docs/Sheets/Slides or open?id link,
+    or the normalized ``local:<path>`` ID of a local file or folder."""
     value = link.strip()
+    if is_local_id(value):
+        return normalize_local_id(value)
     if _ID.fullmatch(value):
         return value
     parsed = urlparse(value)

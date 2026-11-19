@@ -136,6 +136,12 @@ MIGRATIONS = [
       PRIMARY KEY (source_id, file_id)
     );
     """,
+    """
+    CREATE TABLE exclusions (
+      item_id TEXT PRIMARY KEY,
+      added_at TEXT NOT NULL
+    );
+    """,
 ]
 
 

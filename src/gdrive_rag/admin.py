@@ -143,7 +143,9 @@ class Admin:
     def add_source(self, link: str) -> dict[str, Any]:
         result = self.service.add_sources([link])[0]
         if "id" not in result:  # not a Drive link: nothing was stored
-            raise AdminRefused("could not add: not a Google Drive folder or file link")
+            raise AdminRefused(
+                "could not add: not a Google Drive folder or file link, or a local: path"
+            )
         answer = {"applied": not result.get("already_added"), "source": _source(result)}
         if result.get("already_added"):
             answer["message"] = "This source was already added; nothing changed."
@@ -152,6 +154,10 @@ class Admin:
             # Google did not confirm it (404, not shared, or Google access not working): keep
             # nothing, so a mistyped key that looks like an ID never reaches list_sources
             self.service.discard_source(int(result["id"]))
+            if str(result["root_id"]).startswith("local:"):  # our own message, no secret in it
+                raise AdminRefused(
+                    f"could not add: {result.get('error') or 'local folder not available'}"
+                )
             raise AdminRefused(
                 "Google did not confirm that link or ID (not found, not shared with the Google "
                 "account in use, or Google access is not set up); nothing was added"
@@ -169,7 +175,8 @@ class Admin:
             )
         message = (
             f"Removing source {preview['name']!r} drops {preview['documents_removed']} documents "
-            "from the index (documents another source also holds stay). Drive is not changed."
+            "from the index (documents another source also holds stay). Drive and local files are "
+            "not changed."
         )
         if not confirm:
             return {"applied": False, "confirm_needed": True, "would": message, **preview}

@@ -35,9 +35,10 @@ REFRESH = "1//REFRESHTOKENVALUE"
 CODE = "4/AUTHCODEVALUE"
 SECRETS = (API_KEY, "PRIVATEKEYMATERIAL", CLIENT_SECRET, REFRESH, CODE)
 READ_ONLY = {"search", "read", "list_sources", "list_folders", "sync_status", "sync_now"}
+SOURCE_TOOLS = {"add_source", "remove_source", "set_path_rules"}
+EXCLUSION_TOOLS = {"set_exclusions", "list_exclusions"}
+ALWAYS = READ_ONLY | SOURCE_TOOLS | EXCLUSION_TOOLS
 ADMIN_TOOLS = {
-    "add_source",
-    "remove_source",
     "google_auth_status",
     "set_google_service_account",
     "google_auth_start",
@@ -45,7 +46,6 @@ ADMIN_TOOLS = {
     "remove_google_auth",
     "set_embedding",
     "remove_embedding",
-    "set_path_rules",
 }
 CLIENT_LOGGERS = ("mcp.client", "httpx", "httpcore")
 CLEARED = (*ENV_FIELDS, "GDRAG_DRIVE_LINKS", "GDRAG_GOOGLE_CREDENTIALS", ADMIN_ENV)
@@ -189,13 +189,13 @@ def test_admin_tools_are_off_by_default(tmp_path: Path, monkeypatch: pytest.Monk
 
     import anyio
 
-    assert anyio.run(names, create_server(service)) == READ_ONLY
-    assert anyio.run(names, create_server(service, Admin(service))) == READ_ONLY | ADMIN_TOOLS
+    assert anyio.run(names, create_server(service)) == ALWAYS
+    assert anyio.run(names, create_server(service, Admin(service))) == ALWAYS | ADMIN_TOOLS
 
 
 def test_admin_listing_and_annotations(env: Env) -> None:
     tools = {tool.name: tool for tool in call(env.url, "tools/list").tools}
-    assert set(tools) == READ_ONLY | ADMIN_TOOLS
+    assert set(tools) == ALWAYS | ADMIN_TOOLS
     destructive = {
         "remove_source",
         "set_google_service_account",
@@ -204,7 +204,7 @@ def test_admin_listing_and_annotations(env: Env) -> None:
         "set_embedding",
         "remove_embedding",
     }
-    for name in ADMIN_TOOLS:
+    for name in ADMIN_TOOLS | SOURCE_TOOLS:
         notes = tools[name].annotations
         assert notes is not None
         assert notes.read_only_hint is (name == "google_auth_status")

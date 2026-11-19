@@ -64,7 +64,7 @@ def test_upgrade_from_v0_2_0_reextracts_and_reembeds_nothing(tmp_path: Path) -> 
     service = make_service(tmp_path, drive, embeddings)
     with service.db.read() as connection:
         versions = [r[0] for r in connection.execute("SELECT version FROM schema_migrations")]
-    assert versions == [1, 2, 3, 4]
+    assert versions == [1, 2, 3, 4, 5]
     source = service.list_sources()[0]
     assert source["first_sync_done"] is True  # backfilled: no first-sync warning after upgrade
     assert source["path_rules"] == {"demote": [], "exclude": []} and source["skipped"] == 0

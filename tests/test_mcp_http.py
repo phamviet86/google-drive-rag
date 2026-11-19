@@ -92,13 +92,19 @@ def test_tools_list(running: tuple[str, Service]) -> None:
         "list_folders",
         "sync_status",
         "sync_now",
+        "add_source",
+        "remove_source",
+        "set_path_rules",
+        "set_exclusions",
+        "list_exclusions",
     }
+    changing = {"sync_now", "add_source", "remove_source", "set_path_rules", "set_exclusions"}
     for name, tool in tools.items():
         assert tool.title
         assert tool.annotations is not None
-        assert tool.annotations.read_only_hint is (name != "sync_now")
-        assert tool.annotations.destructive_hint is False
-        assert tool.annotations.idempotent_hint is True
+        assert tool.annotations.read_only_hint is (name not in changing)
+        assert tool.annotations.destructive_hint is (name == "remove_source")
+        assert tool.annotations.idempotent_hint is (name != "remove_source")
         assert tool.output_schema is not None
     assert "sync_status" in (tools["sync_now"].description or "")
 

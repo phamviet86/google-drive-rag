@@ -15,6 +15,7 @@ from __future__ import annotations
 import contextlib
 import datetime as dt
 import fcntl
+import hashlib
 import json
 import logging
 import math
@@ -64,6 +65,8 @@ REQUEST_INTERVAL_SECONDS = 60  # sync_now: at most one accepted request per minu
 READ_LIMIT_CHARS = 40_000
 LIST_PAGE = 100  # folders + documents per list_folders page
 SKIPPED_PAGE = 100  # skipped files listed by sync_status(include_skipped=true)
+MAX_EXCLUSIONS = 200  # excluded file / folder IDs
+MAX_EXCLUSION_CHANGES = 50  # IDs added or removed per call
 PROGRESS_KEY = "sync_progress"
 PROGRESS_INTERVAL_SECONDS = 1.0  # at most one progress write per second (plus phase changes)
 _PENDING_SQL = (
@@ -117,11 +120,16 @@ class Progress:
 
 def default_backend(settings: Settings) -> DriveBackend:  # pragma: no cover - real Google API
     from .drive import GoogleDriveBackend, load_credentials
+    from .local import LocalBackend, RoutingBackend, local_root_from_env
 
-    credentials = load_credentials(
-        settings.google_auth, settings.service_account_file, settings.token_file
-    )
-    return GoogleDriveBackend(credentials)
+    def google() -> DriveBackend:
+        credentials = load_credentials(
+            settings.google_auth, settings.service_account_file, settings.token_file
+        )
+        return GoogleDriveBackend(credentials)
+
+    root = local_root_from_env()
+    return RoutingBackend(google, LocalBackend(root) if root is not None else None)
 
 
 def default_embeddings(settings: Settings) -> EmbeddingClient | None:
@@ -304,6 +312,44 @@ class Service:
                 "INSERT INTO path_rules(source_id, effect, pattern) VALUES(?,?,?)",
                 [(source_id, e, p) for e in EFFECTS for p in cleaned[e]],
             )
+
+    # -- exclusions ---------------------------------------------------------------------------
+    def exclusions(self) -> dict[str, Any]:
+        """Every excluded file or folder ID with what it is and how many documents it hides."""
+        with self.db.read() as connection:
+            rows = connection.execute(
+                "SELECT item_id, added_at FROM exclusions ORDER BY added_at, item_id"
+            ).fetchall()
+            items = [_exclusion_json(connection, str(r[0]), str(r[1])) for r in rows]
+        return {"total": len(items), "exclusions": items}
+
+    def set_exclusions(self, add: list[str], remove: list[str]) -> dict[str, Any]:
+        """Add or remove excluded file / folder IDs (Drive links or IDs, ``local:`` paths). A
+        search leaves out an excluded file, and every file below an excluded folder, unless the
+        file is named in ``files``. Search-time only: nothing is re-read or re-embedded, the
+        files stay readable by ID, and an ID may be excluded before it is first indexed."""
+        if len(add) > MAX_EXCLUSION_CHANGES or len(remove) > MAX_EXCLUSION_CHANGES:
+            raise ValueError(f"at most {MAX_EXCLUSION_CHANGES} IDs per call")
+        wanted = [parse_drive_link(value) for value in add]
+        dropped = [parse_drive_link(value) for value in remove]
+        with self.db.transaction() as connection:
+            known = {str(r[0]) for r in connection.execute("SELECT item_id FROM exclusions")}
+            fresh = [item for item in dict.fromkeys(wanted) if item not in known]
+            if len(known) + len(fresh) > MAX_EXCLUSIONS:
+                raise ValueError(f"at most {MAX_EXCLUSIONS} excluded IDs; remove some first")
+            connection.executemany(
+                "INSERT INTO exclusions(item_id, added_at) VALUES(?,?)",
+                [(item, _now()) for item in fresh],
+            )
+            gone = [item for item in dict.fromkeys(dropped) if item in known]
+            connection.executemany("DELETE FROM exclusions WHERE item_id=?", [(i,) for i in gone])
+            changed = {
+                "added": [_exclusion_json(connection, i, "") for i in fresh],
+                "already_excluded": [i for i in dict.fromkeys(wanted) if i in known],
+                "removed": gone,
+                "not_excluded": [i for i in dict.fromkeys(dropped) if i not in known],
+            }
+        return {**changed, **self.exclusions()}
 
     def skipped_files(self, limit: int = SKIPPED_PAGE) -> dict[str, Any]:
         with self.db.read() as connection:
@@ -686,7 +732,9 @@ class Service:
                 data = download.data
                 if item.mime_type == GOOGLE_DOC:
                     data = strip_data_images(data)
-                temporary = self.settings.work_dir / f"{item.id}{download.suffix}"
+                # the ID may hold "/" (local files), so the temporary name is its hash
+                name = hashlib.sha1(item.id.encode()).hexdigest()
+                temporary = self.settings.work_dir / f"{name}{download.suffix}"
                 temporary.write_bytes(data)
                 document = extractor.extract(temporary)
             except Exception as exc:
@@ -1179,6 +1227,46 @@ def _stale_ocr(metadata_json: str | None, extractor: Extractor) -> bool:
         return False  # no OCR pages, or OCR cannot run now: keep the stored text
     engine = extractor.ocr.name if extractor.ocr is not None else None
     return metadata.get("ocr_engine") != engine or bool(metadata.get("ocr_unavailable"))
+
+
+def _exclusion_json(connection: Any, item_id: str, added_at: str) -> dict[str, Any]:
+    folder = connection.execute(
+        "SELECT name, path FROM folders WHERE folder_id=?", (item_id,)
+    ).fetchone()
+    if folder is not None:
+        hidden = int(
+            connection.execute(
+                "SELECT count(*) FROM document_folders WHERE folder_id=?", (item_id,)
+            ).fetchone()[0]
+        )
+        return {
+            "id": item_id,
+            "kind": "folder",
+            "name": folder["name"],
+            "path": folder["path"],
+            "documents_hidden": hidden,
+            "added_at": added_at,
+        }
+    document = connection.execute(
+        "SELECT name, path FROM documents WHERE file_id=?", (item_id,)
+    ).fetchone()
+    if document is not None:
+        return {
+            "id": item_id,
+            "kind": "file",
+            "name": document["name"],
+            "path": document["path"],
+            "documents_hidden": 1,
+            "added_at": added_at,
+        }
+    return {
+        "id": item_id,
+        "kind": "not_indexed_yet",
+        "name": "",
+        "path": "",
+        "documents_hidden": 0,
+        "added_at": added_at,
+    }
 
 
 def _folder_json(row: Any) -> dict[str, Any]:
