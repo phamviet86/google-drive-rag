@@ -218,6 +218,23 @@ def test_legacy_key_binds_to_the_stored_address(tmp_path: Path) -> None:
     assert legacy_default.embeddings_enabled
 
 
+def test_legacy_key_binds_to_the_environment_address_and_records_it(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # A key stored before 0.3.1 while .env set the address keeps working after the upgrade, and
+    # the origin is written once, so removing the .env line later cannot send it elsewhere.
+    data = tmp_path / "d"
+    data.mkdir()
+    (data / "config.json").write_text(json.dumps({"embedding_api_key": KEY}))
+    monkeypatch.setenv("GDRAG_EMBEDDING_BASE_URL", "https://embed.selfhosted.example/v1")
+    settings = load_settings(data)
+    assert settings.embeddings_enabled
+    assert stored(data)["embedding_key_origin"] == "https://embed.selfhosted.example:443"
+    monkeypatch.delenv("GDRAG_EMBEDDING_BASE_URL")
+    after = load_settings(data)
+    assert not after.embeddings_enabled and after.embedding_warning
+
+
 def test_remove_embedding_clears_the_origin(tmp_path: Path) -> None:
     data = tmp_path / "d"
     service = make(data)

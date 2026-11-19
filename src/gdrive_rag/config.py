@@ -159,15 +159,6 @@ def load_settings(data_dir: str | Path | None = None, *, use_env: bool = True) -
     ):
         if key in stored:
             values[key] = stored[key]
-    if (
-        str(values.get("embedding_api_key") or "").strip()
-        and not str(values.get("embedding_key_origin") or "").strip()
-    ):
-        # a config written before keys were bound: bind it to the address stored with it
-        # (or the default one), which is where it has been sent so far
-        values["embedding_key_origin"] = netcheck.origin(
-            str(values.get("embedding_base_url") or DEFAULT_BASE_URL).strip().rstrip("/")
-        )
     if use_env:
         for env_name, key in ENV_FIELDS.items():
             raw = os.environ.get(env_name)
@@ -175,6 +166,18 @@ def load_settings(data_dir: str | Path | None = None, *, use_env: bool = True) -
                 values[key] = raw.strip()
                 if key == "embedding_api_key":
                     values["embedding_key_from_env"] = True
+    legacy = bool(
+        str(stored.get("embedding_api_key") or "").strip()
+        and not str(stored.get("embedding_key_origin") or "").strip()
+    )
+    if legacy:
+        # A key stored before keys were bound to an origin: bind it to the address in effect now
+        # (environment included), which is where it has been sent so far, and record that once
+        # so a later change of the address cannot redirect it.
+        address = str(values.get("embedding_base_url") or DEFAULT_BASE_URL).strip().rstrip("/")
+        values["embedding_key_origin"] = netcheck.origin(address)
+        if use_env:
+            save_config(root, {"embedding_key_origin": values["embedding_key_origin"]})
     return _coerce(replace(settings, **values))
 
 
