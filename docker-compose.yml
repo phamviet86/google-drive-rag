@@ -12,7 +12,7 @@ services:
       - path: .env
         required: false
     ports:
-      # Only reachable from the VPS itself (Claude Code runs there). Never expose publicly.
+      # Only reachable from the VPS itself (the AI agent runs there; from another computer use an SSH tunnel). Never expose publicly.
       - "127.0.0.1:8765:8765"
     volumes:
       - gdrive-rag-data:/data
