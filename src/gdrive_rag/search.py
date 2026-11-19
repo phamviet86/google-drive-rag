@@ -22,8 +22,12 @@ Scope filters (source, folder with all subfolders, specific files) are applied t
 and the vector candidates before fusion, so a narrow scope still fills ``limit``.
 
 Per-source path rules (``rules.py``) apply only when a source has some: ``exclude`` is one more
-scope condition (files named in ``files`` are never excluded) and ``demote`` multiplies the
-position by ``rules.DEMOTE_PLACES`` places. With no rules the code path is the same as before.
+scope condition (files named in ``files`` are never excluded) and ``demote`` puts a file's hits
+below the next ``rules.DEMOTE_PLACES`` other files. When demoted files take places in the
+candidate lists, the lists are topped up with the candidates ``exclude`` would have found, so
+the files that take their places are there to be found. ``ignore`` (files kept out of the index;
+the next sync removes them) is hidden the same way until then, also when named in ``files``,
+which then gets a warning. With no rules the code path is the same as before.
 A scope on a source still on its first sync gets a warning with its progress instead of a
 silent empty result.
 """
@@ -31,6 +35,7 @@ silent empty result.
 from __future__ import annotations
 
 import json
+import math
 import threading
 from collections.abc import Callable
 from typing import Any
@@ -38,10 +43,20 @@ from typing import Any
 import numpy as np
 
 from .db import TERM, Database, fts_fold
-from .drive import parse_drive_link
+from .drive import DriveFolder, Listing, parse_drive_link
 from .embeddings import EmbeddingClient
 from .ranking import contains_phrase, idf, lexical_score, title_score, tokens
-from .rules import combine, demote, group, row_effect
+from .rules import (
+    ID_PREFIX,
+    IGNORED_GLOB,
+    IGNORED_REASON,
+    combine,
+    demote,
+    group,
+    ignore_listing,
+    is_id,
+    row_effect,
+)
 
 CANDIDATES = 200  # FTS candidates re-scored per query
 RRF_K = 60
@@ -83,13 +98,21 @@ class SearchEngine:
             raise ValueError("query must contain at least one word")
         warnings: list[str] = []
         try:
-            scope, named = self._scope(source, folder, files)
+            scope, named, notes = self._scope(source, folder, files)
         except NotIndexedYet as exc:
             return {"mode": "full_text", "warnings": [str(exc)], "results": []}
-        warnings += self._first_sync_notes(source, folder)
+        warnings += self._first_sync_notes(source, folder) + notes
         rules = self._rule_effects()
         if rules:
-            excluded = sorted(d for d, (e, _) in rules.items() if e == "exclude" and d not in named)
+            # ignored files are not indexed: hidden even when named in ``files``
+            excluded = sorted(
+                d
+                for d, (e, _) in rules.items()
+                if e == "ignore" or e == "exclude" and d not in named
+            )
+            warnings += self._ignored_notes(
+                sorted(d for d in named if rules.get(d, ("",))[0] == "ignore")
+            )
             if excluded:
                 condition = "c.document_id NOT IN (SELECT value FROM json_each(?))"
                 scope = (
@@ -99,6 +122,7 @@ class SearchEngine:
         pool = max(limit * 5, 40)
         lexical, phrases, query_terms, weights = self._full_text(terms, scope, pool)
         semantic: list[tuple[int, float]] = []
+        ranked: Ranked | None = None
         client = self.embeddings()
         mode = "full_text"
         if client is not None:
@@ -106,10 +130,16 @@ class SearchEngine:
                 warnings.append("vectors are being rebuilt for the configured model; FTS only")
             else:
                 try:
-                    semantic = self._semantic(client, query, scope, pool)
+                    ranked = self._rank_vectors(client, query)
+                    semantic = pick(ranked, [self._allowed(scope)], pool)
                     mode = "hybrid"
                 except Exception as exc:  # network/key problems must not break search
                     warnings.append(f"semantic search unavailable ({exc}); FTS only")
+        demoted = {d for d, (e, _) in rules.items() if e == "demote"}
+        if demoted:
+            lexical, phrases, semantic = self._top_up(
+                terms, scope, pool, demoted, (lexical, phrases, semantic), ranked
+            )
         candidates = {c for c, _, _ in lexical} | {c for c, _ in semantic}
         titles = self._title_scores(candidates, query_terms, weights)
         scores = fuse(lexical, semantic, titles, phrases)
@@ -125,7 +155,7 @@ class SearchEngine:
             if applied:
                 demoted = {document_of[c] for c in applied}
                 ordered = demote(ordered, document_of, demoted, scores)
-        results = self._rows(ordered, scores, limit)
+        results = self._rows(ordered, scores, limit, ruled=bool(rules))
         if explain:
             fts = {c: (rank, score, bm25) for rank, (c, score, bm25) in enumerate(lexical, 1)}
             vec = {c: (rank, score) for rank, (c, score) in enumerate(semantic, 1)}
@@ -207,6 +237,7 @@ class SearchEngine:
                     sources,
                 )
             ]
+            ignored = self._ignored_rows(connection, rules)
         # Memo per membership row (document, path, source) under these rules, read fresh on
         # every query: files linked or renamed during a sync get their rules at once, without
         # an index_revision bump (which would reload the vector matrix).
@@ -222,7 +253,123 @@ class SearchEngine:
             rows.append((row[0], memo[row]))
         if len(memo) > 4 * len(documents) + 1000:  # forget rows of renamed or removed files
             self._rule_cache = (key, {row: memo[row] for row in documents})
-        return combine(rows)
+        return combine([*rows, *ignored])
+
+    @staticmethod
+    def _ignored_rows(
+        connection: Any, rules: list[tuple[int, str, str]]
+    ) -> list[tuple[int, tuple[str, str] | None]]:
+        """Documents still in the index that ``id:`` ignore entries hit (the file itself, or a
+        folder of the same source above it), and documents a source's last listing ignored
+        (``skipped_files``): the next sync removes them; until then they are hidden."""
+        rows: list[tuple[int, tuple[str, str] | None]] = []
+        for source_id, effect, pattern in rules:
+            if effect != "ignore" or not is_id(pattern):
+                continue
+            ident = pattern[len(ID_PREFIX) :]
+            for row in connection.execute(
+                """SELECT ds.document_id FROM document_sources ds
+                   JOIN documents d ON d.id=ds.document_id
+                   WHERE ds.source_id=:source AND (d.file_id=:id OR (
+                     d.id IN (SELECT document_id FROM document_folders WHERE folder_id=:id)
+                     AND EXISTS (SELECT 1 FROM folder_sources
+                                 WHERE folder_id=:id AND source_id=:source)))""",
+                {"source": source_id, "id": ident},
+            ):
+                rows.append((int(row[0]), ("ignore", pattern)))
+        # A skipped row only counts while the entry that made it still exists on its source: a
+        # file that no entry hits any more (moved out of an ignored folder, entry removed) is not
+        # hidden by the row an older listing left behind.
+        current = {(sid, pattern) for sid, effect, pattern in rules if effect == "ignore"}
+        if current:
+            for row in connection.execute(
+                "SELECT d.id, k.source_id, k.reason FROM skipped_files k JOIN documents d "
+                "ON d.file_id=k.file_id WHERE k.reason GLOB ?",
+                (IGNORED_GLOB,),
+            ):
+                entry = str(row[2])[len(IGNORED_REASON) :]
+                if (int(row[1]), entry) in current:
+                    rows.append((int(row[0]), ("ignore", entry)))
+        return rows
+
+    def ignored_documents(self) -> set[int]:
+        """Document ids an ignore rule hits (hidden now, removed by the next sync)."""
+        return {d for d, (effect, _) in self._rule_effects().items() if effect == "ignore"}
+
+    def ignored_folders(self) -> set[str]:
+        """Drive IDs of the folders an ignore entry covers (the folder itself, or a glob matching
+        everything below it) among those the index holds: hidden now, dropped by the next sync."""
+        with self.db.read() as connection:
+            entries: dict[int, list[str]] = {}
+            for source_id, pattern in connection.execute(
+                "SELECT source_id, pattern FROM path_rules WHERE effect='ignore' ORDER BY rowid"
+            ):
+                entries.setdefault(int(source_id), []).append(str(pattern))
+            hidden: set[str] = set()
+            for source_id, patterns in entries.items():
+                folders = [
+                    DriveFolder(str(row[0]), str(row[1]), str(row[2]))
+                    for row in connection.execute(
+                        "SELECT f.folder_id, f.name, f.parent_id FROM folders f "
+                        "JOIN folder_sources fs ON fs.folder_id=f.folder_id "
+                        "WHERE fs.source_id=?",
+                        (source_id,),
+                    )
+                ]
+                hidden |= ignore_listing(Listing([], folders=folders), patterns)[1]
+        return hidden
+
+    def _ignored_notes(self, document_ids: list[int]) -> list[str]:
+        if not document_ids:
+            return []
+        with self.db.read() as connection:
+            names = [
+                str(row[0])
+                for row in connection.execute(
+                    "SELECT name FROM documents "
+                    f"WHERE id IN ({','.join('?' for _ in document_ids)}) ORDER BY name",
+                    document_ids,
+                )
+            ]
+        return [
+            f"file {name} is ignored by a path rule of its source: it is not indexed and is "
+            "left out"
+            for name in names
+        ]
+
+    def _top_up(
+        self,
+        terms: list[str],
+        scope: tuple[str, list[Any]],
+        pool: int,
+        demoted: set[int],
+        found: tuple[list[tuple[int, float, float]], set[int], list[tuple[int, float]]],
+        ranked: Ranked | None,
+    ) -> tuple[list[tuple[int, float, float]], set[int], list[tuple[int, float]]]:
+        """When chunks of demoted documents hold places in the text or vector candidates, add
+        the candidates found with those documents left out (what ``exclude`` would find), so
+        the files that should take their places are in the fusion at all. Each list stays in
+        its own score order over the union, so a rank is still a position by that signal: the
+        first lists keep their order, and a chunk found only without the demoted documents
+        ranks below the chunks that score higher on that signal."""
+        lexical, phrases, semantic = found
+        first = [c for c, _, _ in lexical] + [c for c, _ in semantic]
+        if not demoted & set(self._documents_of(first).values()):
+            return found
+        condition = "c.document_id NOT IN (SELECT value FROM json_each(?))"
+        without = (
+            f"{scope[0]} AND {condition}" if scope[0] else condition,
+            [*scope[1], json.dumps(sorted(demoted))],
+        )
+        more, more_phrases, _, _ = self._full_text(terms, without, pool)
+        merged = {c: (score, bm25) for c, score, bm25 in lexical}
+        for c, score, bm25 in more:
+            merged.setdefault(c, (score, bm25))
+        lexical = [(c, score, bm25) for c, (score, bm25) in merged.items()]
+        lexical.sort(key=lambda item: (-item[1], item[2]))
+        if ranked is not None:
+            semantic = pick(ranked, [self._allowed(scope), self._allowed(without)], pool)
+        return lexical, phrases | more_phrases, semantic
 
     def _documents_of(self, chunk_ids: list[int]) -> dict[int, int]:
         output: dict[int, int] = {}
@@ -239,12 +386,15 @@ class SearchEngine:
 
     def _scope(
         self, source: str | None, folder: str | None, files: list[str] | None
-    ) -> tuple[tuple[str, list[Any]], set[int]]:
-        """SQL condition on ``c.document_id`` (``""`` for no scope) with its parameters, and the
-        document ids named in ``files``. An unknown source, folder or file is an error naming
-        it, never an empty result; a folder unknown while a first sync runs is ``NotIndexedYet``."""
+    ) -> tuple[tuple[str, list[Any]], set[int], list[str]]:
+        """SQL condition on ``c.document_id`` (``""`` for no scope) with its parameters, the
+        document ids named in ``files``, and warnings. An unknown source, folder or file is an
+        error naming it, never an empty result; a folder unknown while a first sync runs is
+        ``NotIndexedYet``; a file an ignore rule kept out of the index is a warning (and adds
+        nothing to the scope)."""
         conditions: list[str] = []
         values: list[Any] = []
+        notes: list[str] = []
         if source:
             conditions.append(
                 "c.document_id IN (SELECT document_id FROM document_sources WHERE source_id=?)"
@@ -262,7 +412,8 @@ class SearchEngine:
                     listing = [
                         first_sync_note(r)
                         for r in connection.execute(
-                            f"{_PENDING_SOURCES} AND s.last_status='pending' AND s.kind!='file'"
+                            f"{_PENDING_SOURCES} AND s.last_status='pending' "
+                            "AND s.kind NOT IN ('file','local_file')"
                         )
                     ]
                     if listing:
@@ -280,10 +431,23 @@ class SearchEngine:
                     raise ValueError(f"at most {MAX_FILES} files can be given")
                 ids: list[int] = []
                 for value in files:
+                    file_id = parse_drive_link(value)
                     row = connection.execute(
                         "SELECT id, name, status, error FROM documents WHERE file_id=?",
-                        (parse_drive_link(value),),
+                        (file_id,),
                     ).fetchone()
+                    if (
+                        row is None
+                        and connection.execute(
+                            "SELECT 1 FROM skipped_files WHERE file_id=? AND reason GLOB ?",
+                            (file_id, "ignored *"),  # by its own source's rule or another's
+                        ).fetchone()
+                    ):
+                        notes.append(
+                            f"file {value} is ignored by a path rule of its source: it is not "
+                            "indexed and is left out"
+                        )
+                        continue
                     if row is None:
                         raise ValueError(f"unknown or not indexed file: {value}")
                     if row["status"] != "indexed":
@@ -292,7 +456,7 @@ class SearchEngine:
                 conditions.append(f"c.document_id IN ({','.join('?' for _ in ids)})")
                 values.extend(ids)
         named = set(ids) if files else set()
-        return (" AND ".join(conditions), values), named
+        return (" AND ".join(conditions), values), named, notes
 
     def _full_text(
         self, terms: list[str], scope: tuple[str, list[Any]], pool: int
@@ -372,35 +536,29 @@ class SearchEngine:
                     output[int(row[0])] = title_score(query, weights, f"{row[1]} {row[2]}")
         return output
 
-    def _semantic(
-        self, client: EmbeddingClient, query: str, scope: tuple[str, list[Any]], pool: int
-    ) -> list[tuple[int, float]]:
+    def _rank_vectors(self, client: EmbeddingClient, query: str) -> Ranked | None:
+        """Stored chunk ids, their cosine with the query and the best-first order; None when
+        nothing is embedded (the query is then not embedded either)."""
         ids, matrix = self._load_matrix()
         if not ids:
-            return []
+            return None
         vector = np.asarray(client.embed_query(query), dtype=np.float32)
         if vector.shape[0] != matrix.shape[1]:
             raise RuntimeError("query vector has a different dimension than stored vectors")
         scores = matrix @ vector
-        allowed: set[int] | None = None
-        if scope[0]:
-            with self.db.read() as connection:
-                allowed = {
-                    int(row[0])
-                    for row in connection.execute(
-                        f"SELECT c.id FROM chunks c WHERE {scope[0]}", scope[1]
-                    )
-                }
-        order = np.argsort(-scores)
-        output: list[tuple[int, float]] = []
-        for index in order:
-            chunk_id = ids[int(index)]
-            if allowed is not None and chunk_id not in allowed:
-                continue
-            output.append((chunk_id, float(scores[int(index)])))
-            if len(output) >= pool:
-                break
-        return output
+        return ids, scores, np.argsort(-scores)
+
+    def _allowed(self, scope: tuple[str, list[Any]]) -> set[int] | None:
+        """The chunk ids inside ``scope``; None for no scope."""
+        if not scope[0]:
+            return None
+        with self.db.read() as connection:
+            return {
+                int(row[0])
+                for row in connection.execute(
+                    f"SELECT c.id FROM chunks c WHERE {scope[0]}", scope[1]
+                )
+            }
 
     def _load_matrix(self) -> tuple[list[int], Any]:
         revision = self.db.get_meta(REVISION_KEY) or "0"
@@ -421,7 +579,7 @@ class SearchEngine:
             return ids, matrix
 
     def _rows(
-        self, ordered: list[int], scores: dict[int, float], limit: int
+        self, ordered: list[int], scores: dict[int, float], limit: int, ruled: bool = False
     ) -> list[dict[str, Any]]:
         if not ordered:
             return []
@@ -443,19 +601,42 @@ class SearchEngine:
                     batch,
                 ):
                     rows[int(row["id"])] = row
-        present = [chunk_id for chunk_id in ordered if chunk_id in rows]
-        chosen: list[int] = []
+        if not ruled:  # unchanged without path rules (the ranking was tuned on this)
+            present = [chunk_id for chunk_id in ordered if chunk_id in rows]
+            chosen: list[int] = []
+            counts: dict[int, int] = {}
+            for chunk_id in present:  # at most PER_DOCUMENT hits per file first ...
+                document = int(rows[chunk_id]["document_id"])
+                if counts.get(document, 0) < PER_DOCUMENT and len(chosen) < limit:
+                    counts[document] = counts.get(document, 0) + 1
+                    chosen.append(chunk_id)
+            if len(chosen) < limit:  # ... then fill from the same files when the scope is narrow
+                taken = set(chosen)
+                chosen += [c for c in present if c not in taken][: limit - len(chosen)]
+                chosen.sort(key=lambda chunk_id: scores[chunk_id], reverse=True)
+            return [self._hit(rows[chunk_id], scores[chunk_id]) for chunk_id in chosen]
+        capped: list[int] = []
+        overflow: list[int] = []
         per_document: dict[int, int] = {}
-        for chunk_id in present:  # at most PER_DOCUMENT hits per file first ...
+        for chunk_id in ordered:  # at most PER_DOCUMENT hits per file first ...
+            if chunk_id not in rows:
+                continue
             document = int(rows[chunk_id]["document_id"])
-            if per_document.get(document, 0) < PER_DOCUMENT and len(chosen) < limit:
-                per_document[document] = per_document.get(document, 0) + 1
-                chosen.append(chunk_id)
-        if len(chosen) < limit:  # ... then fill from the same files when the scope is narrow
-            taken = set(chosen)
-            chosen += [c for c in present if c not in taken][: limit - len(chosen)]
-            chosen.sort(key=lambda chunk_id: scores[chunk_id], reverse=True)
-        return [self._hit(rows[chunk_id], scores[chunk_id]) for chunk_id in chosen]
+            seen = per_document.get(document, 0)
+            per_document[document] = seen + 1
+            (capped if seen < PER_DOCUMENT else overflow).append(chunk_id)
+        # ... then more from the same files when the scope is narrow. With path rules they
+        # come after every capped hit whatever the limit, so a smaller limit shows the start of
+        # a larger one; one that outscores the hit above it gets a score just below that hit.
+        output: list[dict[str, Any]] = []
+        previous = math.inf
+        for chunk_id in (capped + overflow)[:limit]:
+            score = scores[chunk_id]
+            if score > previous:
+                score = math.nextafter(previous, 0.0)
+            output.append(self._hit(rows[chunk_id], score))
+            previous = score
+        return output
 
     @staticmethod
     def _hit(row: Any, score: float) -> dict[str, Any]:
@@ -499,6 +680,33 @@ def first_sync_note(row: Any) -> str:
 
 def _round(value: float | None) -> float | None:
     return None if value is None else round(value, 4)
+
+
+Ranked = tuple[list[int], Any, Any]  # chunk ids, cosine per id, indexes best first
+
+
+def pick(
+    ranked: Ranked | None, scopes: list[set[int] | None], pool: int
+) -> list[tuple[int, float]]:
+    """``(chunk id, cosine)`` best first: the first ``pool`` chunks inside each scope (None is
+    no scope), merged into one list in cosine order."""
+    if ranked is None:
+        return []
+    ids, scores, order = ranked
+    counts = [0] * len(scopes)
+    output: list[tuple[int, float]] = []
+    for index in order:
+        chunk_id = ids[int(index)]
+        taken = False
+        for n, allowed in enumerate(scopes):
+            if counts[n] < pool and (allowed is None or chunk_id in allowed):
+                counts[n] += 1
+                taken = True
+        if taken:
+            output.append((chunk_id, float(scores[int(index)])))
+            if min(counts) >= pool:
+                break
+    return output
 
 
 def fuse(

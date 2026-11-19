@@ -2,6 +2,41 @@
 
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions follow [Semantic Versioning](https://semver.org/). The install guide for the owner is `README.md` (Vietnamese).
 
+## [0.4.0] - 2026-11-19
+
+Tóm tắt: thêm nguồn là thư mục trên chính VPS (`local:`), thêm quy tắc `ignore` để loại thư mục hoặc tệp khỏi chỉ mục, ba công cụ nguồn (`add_source`, `remove_source`, `set_path_rules`) luôn có không cần `GDRAG_ADMIN_TOOLS`, và sửa các lỗi an toàn của bản 0.3.0. Cập nhật thêm migration 5 mà không đọc lại tệp nào và không tính lại dữ liệu ý nghĩa.
+
+### Added
+
+- Local folder sources: a folder of the server, mounted read-only as `/local` (`GDRAG_LOCAL_HOST_DIR` in `.env`, default `./local` next to `docker-compose.yml`; the container reads it through the env-only `GDRAG_LOCAL_ROOT`, set to `/local` by the Dockerfile).
+  - Add with `add_source local:<path inside it>` (an absolute path inside the root also works) or `gdrive-rag source add local:<path>`. IDs are `local:<relative path>` and the root is `local:.`; reading, scopes and `list_folders` work as for Drive.
+  - Names starting with `.` and `~$` lock files are ignored. Symlinks are followed inside the root; one that leaves the root, points to a folder, a hidden file or a file the same source already lists, or is broken, is listed as skipped with a reason.
+  - The service's data folder and secrets folder are never read, even when they sit inside the mounted folder, and a file that looks like a private key or a Google token is refused at download. Names are matched in Unicode NFC, so Vietnamese names copied from a Mac are found as typed.
+  - A source folder that suddenly lists nothing while it holds documents (an unplugged disk) deletes nothing.
+  - A missing, unreadable or empty root, or a mount that disappears mid-sync, deletes nothing. A source path that is gone while the root is fine clears that source.
+  - Each source uses the backend of its kind, so a Google or a local failure stops only its own side. `GDRAG_DRIVE_LINKS` may hold `local:` entries. `sync_status.local_folder` shows `configured`, `ok` and `error`.
+  - A renamed file is read again but, with the same chunk text, not embedded again (a scanned PDF is OCR'd again). Files must be readable by uid 10001 (mode 644, folders 755).
+- Path rule effect `ignore`: keeps files and folders out of the index. An entry is a glob, a Drive link, `id:<ID>`, `local:<path>` or a bare ID that the source already knows (any other bare value is a glob, and the preview warns about entries that match nothing); folder entries follow renames and moves. After listing and before any download, matching items are dropped and recorded as skipped (`ignored by rule: <entry>`); the next complete listing removes what was indexed, and an incomplete one or a `DriveSourceError` deletes nothing. A file ignored by any source is dropped from every source that lists it. Search and `list_folders` hide ignored items at once and `read` refuses them; a file moved out of an ignored folder is searchable again even if later listings are incomplete. The preview counts documents and folders per entry and refuses entries that would empty a source. Changing `ignore` queues a full sync; `demote` and `exclude` changes queue nothing. CLI: `source rules --ignore` (applied at the server's next sync, or run `gdrive-rag sync`).
+
+### Changed
+
+- `add_source`, `remove_source` and `set_path_rules` are always registered; the other seven admin tools still need `GDRAG_ADMIN_TOOLS=1`. `set_path_rules` is annotated destructive, because `ignore` removes indexed documents.
+- `gdrive-rag source add` no longer stores a Drive link that Google has not confirmed; the server reads it at the next scheduled sync, or run `gdrive-rag sync`.
+- MCP `set_embedding`: `base_url` and `model` are optional and keep the current value, as in the CLI.
+- Demote with a full candidate pool: when demoted chunks fill the first text or vector candidates, text search runs again without them and vector candidates come from one cosine order, so other documents are not pushed out of the list.
+- A demoted hit's score is capped just below the hit it was placed under. When path rules exist, hits beyond the 3-per-file cap come after all capped hits, so scores never increase down the list and a smaller `limit` is a prefix of a larger one. Without rules the order is unchanged.
+
+### Fixed
+
+- Shared address space (`100.64.0.0/10`: CGNAT, Tailscale, the Alibaba metadata address) is no longer treated as public; an embedding endpoint there needs `GDRAG_ALLOW_LOCAL_EMBEDDINGS=1`. A destination is public only if it is globally routable.
+- Every read-merge-write of `config.json` runs under a file lock (`<data_dir>/.config.lock`), so the CLI and the server cannot overwrite each other's changes.
+- Pattern `**??` and similar names that match every path are refused as match-all patterns.
+
+### Security
+
+- A stored embedding key is bound to the origin (scheme, host, port) it was set for (`embedding_key_origin`). If the address later has another origin, the key is not used: search is full-text only, and `sync_status` and `status` show a warning. `GDRAG_EMBEDDING_API_KEY` is not bound. A key stored by an earlier version binds to the address in effect at first load, once; `set_embedding` without a new key is refused while a stored key is unbound.
+- Schema migration 5 rebuilds `path_rules` to allow `ignore`; every row is kept, and no document, chunk or vector row is touched.
+
 ## [0.3.0] - 2026-11-15
 
 Tóm tắt: thêm bộ công cụ quản trị từ Claude (tắt sẵn, bật bằng `GDRAG_ADMIN_TOOLS=1`), quy tắc hạ thấp hoặc ẩn tệp theo đường dẫn khi tìm, tiến độ đọc Drive trực tiếp trong `sync_status`, danh sách tệp bị bỏ qua, và tìm được ngay trong lúc nguồn mới đang được đọc lần đầu. Cập nhật không đọc lại tệp nào và không tính lại dữ liệu ý nghĩa.

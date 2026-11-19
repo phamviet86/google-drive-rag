@@ -8,6 +8,10 @@ folder of each document, so "inside folder X or below" is an ID lookup.
 Deletion is conservative: a document leaves the index only when every source that held it was
 listed completely, or its source root is explicitly gone (404 / not shared). Auth, quota and
 network failures never delete anything.
+
+Local folder sources (``local.py``) go through the same pass with their own backend: each source
+uses the backend of its kind, so Google access missing or failing never stops local sources and
+a missing local mount never stops Drive sources.
 """
 
 from __future__ import annotations
@@ -15,10 +19,12 @@ from __future__ import annotations
 import contextlib
 import datetime as dt
 import fcntl
+import hashlib
 import json
 import logging
 import math
 import os
+import re
 import struct
 import threading
 import time
@@ -43,6 +49,8 @@ from .drive import (
     display_segment,
     drive_link,
     folder_link,
+    is_local_id,
+    local_id,
     parse_drive_link,
     split_supported,
     strip_data_images,
@@ -50,13 +58,24 @@ from .drive import (
 from .embeddings import EmbeddingClient, EmbeddingError
 from .extract import Extractor
 from .extraction_errors import ExtractionError
-from .rules import EFFECTS, clean, effects
+from .local import LocalBackend, default_local_backend, is_local_input
+from .rules import (
+    EFFECTS,
+    IGNORED_GLOB,
+    OTHER_SOURCE_REASON,
+    clean,
+    clean_ignore,
+    effects,
+    ignore_listing,
+)
 from .search import EMBEDDING_IDENTITY_KEY, REVISION_KEY, SearchEngine
 
 log = logging.getLogger("gdrive_rag")
 
 BackendFactory = Callable[[Settings], DriveBackend]
 EmbeddingFactory = Callable[[Settings], EmbeddingClient | None]
+LocalFactory = Callable[[Settings], LocalBackend]
+DRIVE, LOCAL = "drive", "local"  # backend families: a source uses the backend of its kind
 ERROR_RETRY_HOURS = 24
 DOWNLOAD_ERROR_PREFIX = "download: "  # download errors are retried on every sync
 EMBED_BATCH = 64
@@ -148,6 +167,7 @@ class Service:
         backend_factory: BackendFactory = default_backend,
         embedding_factory: EmbeddingFactory = default_embeddings,
         extractor_factory: Callable[[Settings], Extractor] = default_extractor,
+        local_factory: LocalFactory = default_local_backend,
     ):
         self._load = settings_loader
         self.settings = settings_loader()
@@ -157,6 +177,7 @@ class Service:
         self.backend_factory = backend_factory
         self.embedding_factory = embedding_factory
         self.extractor_factory = extractor_factory
+        self.local_factory = local_factory
         self.search_engine = SearchEngine(self.db, self._embeddings)
         # On-demand sync requests (MCP ``sync_now``), run by ``server.SyncLoop`` in its thread.
         self.wake = threading.Event()
@@ -180,6 +201,9 @@ class Service:
         backend: DriveBackend | None = None
         backend_error = ""
         for link in links:
+            if is_local_input(link):
+                results.append(self._add_local(link))
+                continue
             try:
                 root_id = parse_drive_link(link)
             except ValueError as exc:
@@ -203,30 +227,49 @@ class Service:
                     status, error = "error", str(exc)
                 except DriveSourceError as exc:
                     error = str(exc)
-            with self.db.transaction() as connection:
-                cursor = connection.execute(
-                    "INSERT INTO sources(link,root_id,kind,drive_id,name,last_status,last_error) "
-                    "VALUES(?,?,?,?,?,?,?)",
-                    (
-                        drive_link(root.id, root.kind),
-                        root.id,
-                        root.kind,
-                        root.drive_id,
-                        root.name,
-                        status,
-                        error,
-                    ),
-                )
-                if root.kind in {"folder", "shared_drive"} and status != "error":
-                    # known at once, so search(folder=<root>) works during the first sync
-                    _register_folders(
-                        connection,
-                        int(cursor.lastrowid or 0),
-                        [DriveFolder(root.id, root.name, "")],
-                    )
-            row = self._source_row(root_id)
+            row = self._insert_source(root, status, error)
             results.append({"link": link, "ok": status != "error", **(row or {})})
         return results
+
+    def _add_local(self, link: str) -> dict[str, Any]:
+        """A local source is stored only when the path exists inside the local root now.
+        Errors never repeat the path given (it may point outside the root)."""
+        try:
+            backend = self.local_factory(self.settings)
+            root_id = backend.parse(link)
+            existing = self._source_row(root_id)
+            if existing is not None:
+                return {"link": link, "ok": True, "already_added": True, **existing}
+            root = backend.resolve(root_id)
+        except (ValueError, DriveItemError, DriveSourceError) as exc:
+            return {"link": link, "ok": False, "error": str(exc)}
+        return {"link": link, "ok": True, **(self._insert_source(root, "pending", None) or {})}
+
+    def _insert_source(
+        self, root: DriveRoot, status: str, error: str | None
+    ) -> dict[str, Any] | None:
+        with self.db.transaction() as connection:
+            cursor = connection.execute(
+                "INSERT INTO sources(link,root_id,kind,drive_id,name,last_status,last_error) "
+                "VALUES(?,?,?,?,?,?,?)",
+                (
+                    drive_link(root.id, root.kind),
+                    root.id,
+                    root.kind,
+                    root.drive_id,
+                    root.name,
+                    status,
+                    error,
+                ),
+            )
+            if root.kind in {"folder", "shared_drive", "local_folder"} and status != "error":
+                # known at once, so search(folder=<root>) works during the first sync
+                _register_folders(
+                    connection,
+                    int(cursor.lastrowid or 0),
+                    [DriveFolder(root.id, root.name, "")],
+                )
+        return self._source_row(root.id)
 
     def discard_source(self, source_id: int) -> None:
         """Drop a just-added source that holds no documents yet (no sync lock needed)."""
@@ -266,19 +309,33 @@ class Service:
             return _rules_by_source(connection).get(source_id) or {e: [] for e in EFFECTS}
 
     def rule_matches(self, source_id: int, rules: dict[str, list[str]]) -> dict[str, Any]:
-        """How many of the source's documents each pattern hits, with a few example paths."""
+        """How many of the source's documents each pattern hits, with a few example paths. For
+        ignore entries also the folders, and which other sources lose documents with them (a
+        file any source ignores leaves the index)."""
         with self.db.read() as connection:
-            documents = [
-                (int(row[0]), str(row[1]), source_id)
-                for row in connection.execute(
-                    "SELECT d.id, d.path FROM documents d JOIN document_sources ds "
-                    "ON ds.document_id=d.id WHERE ds.source_id=? ORDER BY d.path",
-                    (source_id,),
-                )
-            ]
+            rows = connection.execute(
+                "SELECT d.id, d.path, d.file_id, d.parent_id FROM documents d "
+                "JOIN document_sources ds ON ds.document_id=d.id WHERE ds.source_id=? "
+                "ORDER BY d.path",
+                (source_id,),
+            ).fetchall()
+            folder_rows = connection.execute(
+                "SELECT f.folder_id, f.name, f.parent_id FROM folders f JOIN folder_sources fs "
+                "ON fs.folder_id=f.folder_id WHERE fs.source_id=?",
+                (source_id,),
+            ).fetchall()
+            skipped_rows = connection.execute(
+                "SELECT file_id, path FROM skipped_files WHERE source_id=?", (source_id,)
+            ).fetchall()
+            others = connection.execute(
+                "SELECT s.id, s.name, ds.document_id FROM document_sources ds "
+                "JOIN sources s ON s.id=ds.source_id WHERE ds.source_id<>? ORDER BY s.id",
+                (source_id,),
+            ).fetchall()
+        documents = [(int(row[0]), str(row[1]), source_id) for row in rows]
         paths = {document_id: path for document_id, path, _ in documents}
         output: dict[str, Any] = {}
-        for effect in EFFECTS:
+        for effect in ("demote", "exclude"):
             per_pattern: dict[str, Any] = {}
             for pattern in rules.get(effect, []):
                 hit = effects([(source_id, effect, pattern)], documents)
@@ -287,23 +344,104 @@ class Service:
                     "examples": [paths[d] for d in list(hit)[:3]],
                 }
             output[effect] = per_pattern
+        # the same filter a sync applies, over what the index holds for this source
+        listing = Listing(
+            [DriveItem(str(r[2]), "", "", str(r[1]), "", "", None, "", str(r[3])) for r in rows]
+            + [  # unsupported or already ignored files: an entry hitting one is not a typo
+                DriveItem(str(r[0]), "", "", str(r[1]), "", "", None, "", "") for r in skipped_rows
+            ],
+            folders=[DriveFolder(str(r[0]), str(r[1]), str(r[2])) for r in folder_rows],
+        )
+        by_file = {str(row[2]): int(row[0]) for row in rows}
+        folder_ids = {str(row[0]) for row in folder_rows}
+
+        def ignored(entries: list[str]) -> tuple[set[int], int, int]:
+            _, left_out = ignore_listing(listing, entries)
+            documents_hit = {by_file[i] for i in left_out if i in by_file}
+            return documents_hit, len(left_out & folder_ids), len(left_out)
+
+        output["ignore"] = {}
+        output["ignore_matches_nothing"] = []  # no indexed file, skipped file or folder: a typo?
+        for entry in rules.get("ignore", []):
+            gone_here, folders, anything = ignored([entry])
+            if not anything:
+                output["ignore_matches_nothing"].append(entry)
+            output["ignore"][entry] = {
+                "documents": len(gone_here),
+                "folders": folders,
+                "examples": [path for d, path, _ in documents if d in gone_here][:3],
+            }
+        gone, gone_folders, _ = ignored(list(rules.get("ignore", [])))
         combined = effects(
-            [(source_id, e, p) for e in EFFECTS for p in rules.get(e, [])], documents
+            [(source_id, e, p) for e in ("demote", "exclude") for p in rules.get(e, [])],
+            documents,
         )
         output["documents"] = len(documents)
-        output["demoted"] = sum(1 for e, _ in combined.values() if e == "demote")
-        output["excluded"] = sum(1 for e, _ in combined.values() if e == "exclude")
+        for key, effect in (("demoted", "demote"), ("excluded", "exclude")):
+            output[key] = sum(1 for d, (e, _) in combined.items() if e == effect and d not in gone)
+        output["ignored"] = len(gone)
+        output["ignored_folders"] = gone_folders
+        held: dict[int, tuple[str, set[int]]] = {}
+        for row in others:
+            held.setdefault(int(row[0]), (str(row[1]), set()))[1].add(int(row[2]))
+        output["ignored_in_other_sources"] = {
+            name: len(ids & gone) for name, ids in held.values() if ids & gone
+        }
+        output["empties_sources"] = [name for name, ids in held.values() if ids <= gone][:10]
         return output
 
-    def set_path_rules(self, source_id: int, rules: dict[str, list[str]]) -> None:
-        """Replace the source's rules. Search-time only: no document, chunk or vector changes."""
-        cleaned = {effect: clean(rules.get(effect, []), effect) for effect in EFFECTS}
+    def ignore_entries(self, source_id: int, values: Any) -> list[str]:
+        """``rules.clean_ignore`` knowing the source's file and folder IDs, so a bare ID of one
+        is stored as an ID. An entry naming the source root itself is refused."""
+        with self.db.read() as connection:
+            root = connection.execute(
+                "SELECT root_id FROM sources WHERE id=?", (source_id,)
+            ).fetchone()
+            known = {str(root[0])} if root is not None else set()
+            known |= {
+                str(row[0])
+                for row in connection.execute(
+                    "SELECT d.file_id FROM documents d JOIN document_sources ds "
+                    "ON ds.document_id=d.id WHERE ds.source_id=? "
+                    "UNION SELECT folder_id FROM folder_sources WHERE source_id=? "
+                    "UNION SELECT file_id FROM skipped_files WHERE source_id=?",
+                    (source_id, source_id, source_id),
+                )
+            }
+        entries = clean_ignore(values, known.__contains__)
+        if root is not None and f"id:{root[0]}" in entries:
+            raise ValueError(
+                "ignore: an entry names the source itself; remove_source drops a whole source"
+            )
+        return entries
+
+    def set_path_rules(
+        self, source_id: int, rules: dict[str, list[str]], queue: bool = True
+    ) -> dict[str, Any]:
+        """Replace the source's rules. demote and exclude are search-time only: no document,
+        chunk or vector changes. When the ignore entries change, the source's 'ignored by rule'
+        skipped files are dropped (the next sync lists them under the new entries) and a sync
+        of every source is queued: it removes newly ignored files from the index (from every
+        source that lists them) and indexes files no longer ignored. ``queue=False`` (the CLI:
+        this process is short-lived) leaves the sync to the server's next scheduled one."""
+        cleaned = {effect: clean(rules.get(effect, []), effect) for effect in ("demote", "exclude")}
+        cleaned["ignore"] = self.ignore_entries(source_id, rules.get("ignore", []))
+        changed = cleaned["ignore"] != self.path_rules(source_id)["ignore"]
         with self.db.transaction() as connection:
             connection.execute("DELETE FROM path_rules WHERE source_id=?", (source_id,))
             connection.executemany(
                 "INSERT INTO path_rules(source_id, effect, pattern) VALUES(?,?,?)",
                 [(source_id, e, p) for e in EFFECTS for p in cleaned[e]],
             )
+            if changed:
+                connection.execute(
+                    "DELETE FROM skipped_files WHERE source_id=? AND reason GLOB ?",
+                    (source_id, IGNORED_GLOB),
+                )
+        return {
+            "changed": changed,
+            "sync": self.queue_sync() if changed and queue else None,
+        }
 
     def skipped_files(self, limit: int = SKIPPED_PAGE) -> dict[str, Any]:
         with self.db.read() as connection:
@@ -316,9 +454,37 @@ class Service:
             ).fetchall()
         return {"total": total, "files": [dict(row) for row in rows]}
 
+    def _refuse_vanished_folder(self, source: dict[str, Any], listing: Listing) -> None:
+        """A local folder source that lists nothing at all while it holds indexed documents is
+        most likely an unplugged disk or a failed mount that left an empty mount point: stop
+        (``DriveSourceError``, nothing deleted) instead of clearing it. A folder that was always
+        empty, and one that still lists subfolders, is fine."""
+        if source["kind"] != "local_folder" or listing.items or listing.skipped:
+            return
+        if not listing.complete or len(listing.folders) > 1:
+            return
+        with self.db.read() as connection:
+            held = connection.execute(
+                "SELECT 1 FROM document_sources WHERE source_id=? LIMIT 1", (source["id"],)
+            ).fetchone()
+        if held is not None:
+            raise DriveSourceError(
+                "this local folder is empty now, which usually means the disk or mount is "
+                "missing; nothing is removed from the index until it has files again (remove "
+                "the source to clear it on purpose)"
+            )
+
     def _find_source(self, value: str) -> dict[str, Any]:
         with contextlib.suppress(ValueError):
             value = parse_drive_link(value)
+        if value.startswith("/") and self.settings.local_root is not None:
+            # an absolute path inside the local root names that local source (lexically: the
+            # path itself may be gone, which is why the source is being removed)
+            # resolved like LocalBackend.parse does, so a root reached through a link works
+            root = os.path.realpath(self.settings.local_root)
+            inside = os.path.realpath(value)
+            if os.path.commonpath([root, inside]) == root:
+                value = local_id(os.path.relpath(inside, root).replace(os.sep, "/"))
         with self.db.read() as connection:
             row = connection.execute(
                 "SELECT * FROM sources WHERE CAST(id AS TEXT)=? OR root_id=? OR name=? "
@@ -481,11 +647,21 @@ class Service:
         # sources whose first sync has not finished: their documents and folders are linked
         # while the pass runs, so search can scope to them before the pass ends
         fresh = {s["id"] for s in sources if not s["first_sync_done"]}
-        try:
-            backend = self.backend_factory(self.settings)
-        except Exception as exc:
-            message = _message(exc)
+        # one backend per family, made only when a source of that family is synced: Google
+        # access not configured (or failing) leaves local sources alone, and the other way round
+        backends: dict[str, DriveBackend] = {}
+        unavailable: dict[str, str] = {}
+        for family in sorted({_family(s["root_id"]) for s in sources}):
+            try:
+                if family == LOCAL:
+                    backends[family] = self.local_factory(self.settings)
+                else:
+                    backends[family] = self.backend_factory(self.settings)
+            except Exception as exc:
+                unavailable[family] = _message(exc)
+        if not backends:
             for source in sources:
+                message = unavailable[_family(source["root_id"])]
                 self._set_source_status(source["id"], "error", message)
                 report["sources"].append({"name": source["name"], "ok": False, "error": message})
             return report
@@ -493,8 +669,18 @@ class Service:
         # failed, incomplete or left out of this pass (a one-source sync): such a source may
         # still hold a folder with its parent, so that parent is kept
         degraded: set[int] = {s["id"] for s in every} - {s["id"] for s in sources}
+        ignore = {s["id"]: s["path_rules"]["ignore"] for s in sources}
+        left_out: dict[int, set[str]] = {}  # IDs each listing's own ignore entries dropped
         for source in sources:
             outcome = {"name": source["name"], "ok": True}
+            family = _family(source["root_id"])
+            if family in unavailable:
+                degraded.add(source["id"])
+                self._set_source_status(source["id"], "error", unavailable[family])
+                outcome.update(ok=False, error=unavailable[family])
+                report["sources"].append(outcome)
+                continue
+            backend = backends[family]
             try:
                 root = DriveRoot(
                     source["root_id"], source["name"], source["kind"], source["drive_id"]
@@ -504,6 +690,9 @@ class Service:
                     self._update_root(source["id"], root)
                     outcome["name"] = root.name
                 listing = backend.list_files(root)
+                self._refuse_vanished_folder(source, listing)
+                # ignore rules: never downloaded, not listed membership, folders not registered
+                listing, left_out[source["id"]] = ignore_listing(listing, ignore[source["id"]])
                 kept, skipped = split_supported(listing.items)  # also for backends that list all
                 listing = Listing(
                     kept,
@@ -533,6 +722,7 @@ class Service:
                 self._set_source_status(source["id"], "error", _message(exc))
                 outcome.update(ok=False, error=_message(exc))
             report["sources"].append(outcome)
+        self._ignore_everywhere(listings, left_out)
         unique: dict[str, DriveItem] = {}
         holders: dict[str, list[int]] = {}
         for listed_by, found in listings.items():
@@ -540,27 +730,31 @@ class Service:
                 unique.setdefault(item.id, item)
                 holders.setdefault(item.id, []).append(listed_by)
         extractor = self.extractor_factory(self.settings)
-        stop = ""
+        stopped: dict[str, str] = {}  # family -> why its pass stopped
         if progress is not None:
             progress.phase("extracting")
         for item in unique.values():
-            if stop:
-                break
+            family = _family(item.id)
+            if family in stopped:
+                continue
             try:
-                report[self._index_item(backend, extractor, item)] += 1
-            except DriveSourceError as exc:  # sign-in or connection: stop, delete nothing
-                stop = str(exc)
+                report[self._index_item(backends[family], extractor, item)] += 1
+            except DriveSourceError as exc:  # sign-in, connection or mount: stop, delete nothing
+                stopped[family] = str(exc)
                 report["failed"] += 1
             early = [h for h in holders[item.id] if h in fresh]
-            if early and not stop:
+            if early and family not in stopped:
                 self._link_early(item, early)
             if progress is not None:
                 for holder in holders[item.id]:
                     if entry := progress.source(holder):
                         entry["files_done"] += 1
                 progress.write()
-        if stop:
-            report["stopped"] = stop
+        if stopped:
+            report["stopped"] = "; ".join(stopped[f] for f in sorted(stopped))
+        # sources whose family stopped: their membership is kept as it is, like a failed source
+        root_ids = {s["id"]: str(s["root_id"]) for s in sources}
+        halted = {sid for sid in listings if _family(root_ids[sid]) in stopped}
         folders: dict[str, DriveFolder] = {}
         for found in listings.values():  # a folder seen as a root and as a child: keep the parent
             for folder in found.folders if found else ():
@@ -579,7 +773,12 @@ class Service:
                      parent_id=CASE WHEN excluded.parent_id='' AND ? THEN folders.parent_id
                                     ELSE excluded.parent_id END""",
                 [
-                    (f.id, f.name, f.parent_id, int(bool(stop or held.get(f.id, set()) & degraded)))
+                    (
+                        f.id,
+                        f.name,
+                        f.parent_id,
+                        int(bool(held.get(f.id, set()) & (degraded | halted))),
+                    )
                     for f in folders.values()
                 ],
             )
@@ -588,13 +787,13 @@ class Service:
                 for row in connection.execute("SELECT file_id, id FROM documents")
             }
             for source_id, found in listings.items():
-                if found is None or (found.complete and not stop):  # same rule as documents
+                if found is None or (found.complete and source_id not in halted):  # as documents
                     connection.execute("DELETE FROM folder_sources WHERE source_id=?", (source_id,))
                 connection.executemany(
                     "INSERT OR IGNORE INTO folder_sources VALUES(?,?)",
                     [(folder.id, source_id) for folder in (found.folders if found else ())],
                 )
-                if found is None or (found.complete and not stop):
+                if found is None or (found.complete and source_id not in halted):
                     connection.execute(
                         "DELETE FROM document_sources WHERE source_id=?", (source_id,)
                     )
@@ -606,6 +805,16 @@ class Service:
                         )
                 if found is None or found.complete:
                     connection.execute("DELETE FROM skipped_files WHERE source_id=?", (source_id,))
+                else:  # a file listed and not ignored is no longer "ignored by rule", however
+                    # incomplete the listing (it may have moved out of an ignored folder)
+                    connection.executemany(
+                        "DELETE FROM skipped_files WHERE source_id=? AND file_id=? "
+                        "AND (reason GLOB ? OR reason=?)",
+                        [
+                            (source_id, item.id, IGNORED_GLOB, OTHER_SOURCE_REASON)
+                            for item in found.items
+                        ],
+                    )
                 connection.executemany(
                     "INSERT OR REPLACE INTO skipped_files VALUES(?,?,?,?,?,?)",
                     [
@@ -613,7 +822,7 @@ class Service:
                         for f in (found.skipped if found else ())
                     ],
                 )
-                if found is not None and not stop:
+                if found is not None and source_id not in halted:
                     connection.execute(
                         "UPDATE sources SET first_synced_at=? "
                         "WHERE id=? AND first_synced_at IS NULL",
@@ -624,6 +833,29 @@ class Service:
             _gc_vectors(connection)
             _bump(connection)
         return report
+
+    def _ignore_everywhere(
+        self, listings: dict[int, Listing | None], left_out: dict[int, set[str]]
+    ) -> None:
+        """A file or folder that one source's ignore entries dropped is dropped from every
+        listing of this pass, and so is a file a source left out of this pass ignored when it
+        was last listed (its 'ignored by rule' skipped rows)."""
+        listed = sorted(listings)
+        with self.db.read() as connection:
+            remembered = {
+                str(row[0])
+                for row in connection.execute(
+                    "SELECT file_id FROM skipped_files WHERE reason GLOB ? "
+                    f"AND source_id NOT IN ({','.join('?' for _ in listed)})",
+                    [IGNORED_GLOB, *listed],
+                )
+            }
+        everywhere = remembered.union(*left_out.values())
+        if not everywhere:
+            return
+        for source_id, found in listings.items():
+            if found is not None:
+                listings[source_id], _ = ignore_listing(found, (), everywhere)
 
     def _link_early(self, item: DriveItem, source_ids: list[int]) -> None:
         """During a first sync: link a processed file to its sources and ancestor folders now
@@ -686,7 +918,7 @@ class Service:
                 data = download.data
                 if item.mime_type == GOOGLE_DOC:
                     data = strip_data_images(data)
-                temporary = self.settings.work_dir / f"{item.id}{download.suffix}"
+                temporary = self.settings.work_dir / f"{_temp_name(item.id)}{download.suffix}"
                 temporary.write_bytes(data)
                 document = extractor.extract(temporary)
             except Exception as exc:
@@ -912,6 +1144,11 @@ class Service:
         if offset < 0:
             raise ValueError("offset must be >= 0")
         source_id = self.search_engine.source_id(source) if source else None
+        # what an ignore entry covers is hidden at once, like in search (the next sync drops it)
+        hidden_documents = json.dumps(sorted(self.search_engine.ignored_documents()))
+        hidden_folder_ids = self.search_engine.ignored_folders()
+        hidden_folders = json.dumps(sorted(hidden_folder_ids))
+        not_hidden_folder = "{}.folder_id NOT IN (SELECT value FROM json_each(?))"
         with self.db.read() as connection:
             parent_row = None
             values: list[Any]
@@ -922,6 +1159,8 @@ class Service:
                 ).fetchone()
                 if parent_row is None:
                     raise ValueError(f"unknown or not indexed folder: {parent}")
+                if parent_id in hidden_folder_ids:
+                    raise ValueError(f"folder {parent} is ignored by a path rule; not indexed")
                 where, values = "f.parent_id=?", [parent_id]
             elif source_id is not None:
                 where, values = "f.folder_id=(SELECT root_id FROM sources WHERE id=?)", [source_id]
@@ -932,6 +1171,8 @@ class Service:
                     " AND f.folder_id IN (SELECT folder_id FROM folder_sources WHERE source_id=?)"
                 )
                 values.append(source_id)
+            where += " AND " + not_hidden_folder.format("f")
+            values.append(hidden_folders)
             folder_total = int(
                 connection.execute(
                     f"SELECT count(*) FROM folders f WHERE {where}", values
@@ -944,13 +1185,15 @@ class Service:
                     " AND d.id IN (SELECT document_id FROM document_sources WHERE source_id=?)"
                 )
                 count_values.append(source_id)
+            count_values += [hidden_documents, hidden_folders]
             folders = connection.execute(
                 f"""SELECT f.folder_id, f.name, f.path,
                       (SELECT count(*) FROM document_folders df
                        JOIN documents d ON d.id=df.document_id
-                       WHERE df.folder_id=f.folder_id AND d.status='indexed'{in_source})
-                       documents,
-                      (SELECT count(*) FROM folders c WHERE c.parent_id=f.folder_id) subfolders
+                       WHERE df.folder_id=f.folder_id AND d.status='indexed'{in_source}
+                       AND d.id NOT IN (SELECT value FROM json_each(?))) documents,
+                      (SELECT count(*) FROM folders c WHERE c.parent_id=f.folder_id
+                       AND {not_hidden_folder.format("c")}) subfolders
                     FROM folders f WHERE {where} ORDER BY f.name, f.folder_id
                     LIMIT ? OFFSET ?""",
                 [*count_values, *values, LIST_PAGE, offset],
@@ -958,8 +1201,11 @@ class Service:
             documents: list[Any] = []
             document_total = 0
             if include_documents and parent_row is not None:
-                sql = "SELECT * FROM documents d WHERE d.parent_id=?"
-                params: list[Any] = [parent_row["folder_id"]]
+                sql = (
+                    "SELECT * FROM documents d WHERE d.parent_id=? "
+                    "AND d.id NOT IN (SELECT value FROM json_each(?))"
+                )
+                params: list[Any] = [parent_row["folder_id"], hidden_documents]
                 if source_id is not None:
                     sql += (
                         " AND d.id IN (SELECT document_id FROM document_sources WHERE source_id=?)"
@@ -1024,6 +1270,9 @@ class Service:
                 "SELECT ordinal, text, locator FROM chunks WHERE document_id=? ORDER BY ordinal",
                 (document["id"],),
             ).fetchall()
+        if int(document["id"]) in self.search_engine.ignored_documents():
+            # being removed by the next sync: already treated as not indexed
+            raise ValueError(f"document {document_id} is ignored by a path rule; not indexed")
         if page is not None:
             matching = [r for r in rows if _locator_has_page(str(r["locator"]), page)]
             start_chunk = int(matching[0]["ordinal"]) if matching else len(rows)
@@ -1105,8 +1354,11 @@ class Service:
                 "pending": self._pending_vectors(),
                 "rejected": self._failed_vectors(),
                 "last_error": self.db.get_meta("last_embedding_error"),
+                "key_origin": settings.public()["embedding_key_origin"],
+                "warning": settings.embedding_warning,
             },
             "google_auth": settings.google_auth,
+            "local_folder": self._local_state(),
             "settings_from": setting_origins(settings.data_dir),
             "sync": {
                 "running": running,
@@ -1119,6 +1371,18 @@ class Service:
                 "last_report": json.loads(self.db.get_meta("last_sync_report") or "null"),
             },
         }
+
+    def _local_state(self) -> dict[str, Any]:
+        """Whether local sources can be read: GDRAG_LOCAL_ROOT set, mounted and not empty."""
+        try:
+            backend = self.local_factory(self.settings)
+        except DriveSourceError as exc:
+            return {"configured": False, "ok": False, "error": str(exc)}
+        try:
+            backend.check()
+        except DriveSourceError as exc:
+            return {"configured": True, "ok": False, "error": str(exc)}
+        return {"configured": True, "ok": True, "error": None}
 
 
 _SOURCE_SQL = """SELECT s.*,
@@ -1270,6 +1534,18 @@ def _locator_has_page(locator: str, page: int) -> bool:
         if int(start) <= page <= int(end or start):
             return True
     return False
+
+
+def _family(identifier: str) -> str:
+    """Which backend reads a source root or file: ``local`` for ``local:`` IDs, else ``drive``."""
+    return LOCAL if is_local_id(identifier) else DRIVE
+
+
+def _temp_name(identifier: str) -> str:
+    """A file name for the extraction copy: Drive IDs as they are, others (local paths) hashed."""
+    if re.fullmatch(r"[A-Za-z0-9_-]{1,128}", identifier):
+        return identifier
+    return hashlib.sha256(identifier.encode("utf-8")).hexdigest()[:32]
 
 
 def _message(exc: BaseException) -> str:

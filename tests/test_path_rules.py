@@ -251,17 +251,21 @@ def test_set_path_rules_tool_previews_then_applies(env: Env) -> None:
     assert preview["applied"] is False and preview["confirm_needed"] is True
     assert preview["matches"]["demote"]["*.txt"] == {"documents": 1, "examples": ["hoa-don.txt"]}
     assert preview["matches"]["demoted"] == 1
-    assert env.tool("list_sources")["sources"][0]["path_rules"] == {"demote": [], "exclude": []}
+    assert env.tool("list_sources")["sources"][0]["path_rules"] == {
+        "demote": [],
+        "exclude": [],
+        "ignore": [],
+    }
 
     applied = env.tool("set_path_rules", source=ROOT, demote=["*.txt"], confirm=True)
     assert applied["applied"] is True
     rules = env.tool("list_sources")["sources"][0]["path_rules"]
-    assert rules == {"demote": ["*.txt"], "exclude": []}
+    assert rules == {"demote": ["*.txt"], "exclude": [], "ignore": []}
 
     kept = env.tool("set_path_rules", source=ROOT, exclude=["old/"], confirm=True)
-    assert kept["rules"] == {"demote": ["*.txt"], "exclude": ["old/"]}  # omitted list kept
+    assert kept["rules"] == {"demote": ["*.txt"], "exclude": ["old/"], "ignore": []}  # kept
     cleared = env.tool("set_path_rules", source=ROOT, demote=[], exclude=[], confirm=True)
-    assert cleared["rules"] == {"demote": [], "exclude": []}
+    assert cleared["rules"] == {"demote": [], "exclude": [], "ignore": []}
 
 
 def test_set_path_rules_tool_refuses_bad_arguments(env: Env) -> None:
@@ -295,7 +299,11 @@ def test_cli_source_rules(
     args = ["--data-dir", str(tmp_path), "--json", "source", "rules", ROOT]
     assert main(args) == 0  # no options: show only
     shown = json.loads(capsys.readouterr().out)
-    assert shown["applied"] is False and shown["rules"] == {"demote": [], "exclude": []}
+    assert shown["applied"] is False and shown["rules"] == {
+        "demote": [],
+        "exclude": [],
+        "ignore": [],
+    }
     assert main([*args, "--demote", "*.txt", "attachments/**"]) == 0
     assert json.loads(capsys.readouterr().out)["applied"] is True
     assert service.list_sources()[0]["path_rules"]["demote"] == ["*.txt", "attachments/**"]
@@ -379,3 +387,122 @@ def test_exclude_hiding_every_document_of_a_source_is_refused(env: Env) -> None:
     assert isinstance(refused, str) and "would hide every document" in refused
     assert env.tool("list_sources")["sources"][0]["path_rules"]["exclude"] == []
     assert env.tool("set_path_rules", source=ROOT, demote=["*.txt"])["applied"] is False
+
+
+def crowded(tmp_path: Path, embeddings: FakeEmbeddings | None) -> Service:
+    """Three old copies under old/ with ~22 matching chunks each fill every candidate place;
+    the short canonical guide ranks below all of them and is not among the candidates."""
+    drive = FakeDrive()
+    drive.add_root(SOURCE, "R")
+    drive.add_folder("folderOld0000001", "old", SOURCE)
+    body = " ".join(f"Đoạn {n}: sổ cái doanh thu hộ kinh doanh bản gốc cũ." for n in range(40))
+    for i in range(3):
+        drive.put(
+            SOURCE, f"fileOld{i:09d}", f"so-cai-{i}.txt", body.encode(), parent="folderOld0000001"
+        )
+    drive.put(SOURCE, CANONICAL, "guide.md", "Hướng dẫn sổ cái doanh thu hộ kinh doanh.".encode())
+    service = make_service(tmp_path, drive, embeddings, chunk_chars=100, chunk_overlap=0)
+    service.add_sources([SOURCE])
+    service.sync()
+    return service
+
+
+@pytest.mark.parametrize("hybrid", [False, True])
+def test_demote_works_when_demoted_files_fill_the_candidates(tmp_path: Path, hybrid: bool) -> None:
+    service = crowded(tmp_path, FakeEmbeddings() if hybrid else None)
+    query = "sổ cái doanh thu hộ kinh doanh bản gốc"
+    assert "guide.md" not in names(service.search(query, limit=8))
+    service.set_path_rules(1, {"demote": ["old/"], "exclude": []})
+    result = service.search(query, limit=8, explain=True)
+    assert names(result)[0] == "guide.md"  # fewer than 10 other files: all old hits below it
+    assert all(n.startswith("so-cai") for n in names(result)[1:])  # still listed, lower
+    scores = [hit["score"] for hit in result["results"]]
+    assert scores == sorted(scores, reverse=True)
+    assert result["results"][0]["explain"]["path_rule"] is None
+    service.set_path_rules(1, {"demote": [], "exclude": ["old/"]})
+    assert names(service.search(query, limit=8)) == ["guide.md"]  # exclude is unchanged
+
+
+def weak_chunk(tmp_path: Path) -> Service:
+    """A demoted file whose second chunk is weak, and 14 one-chunk files in between."""
+    drive = FakeDrive()
+    drive.add_root(SOURCE, "R")
+    drive.add_folder("folderOld0000001", "old", SOURCE)
+    text = "alpha beta gamma. " + "x " * 100 + "\n\n" + "alpha " + "filler " * 100
+    drive.put(SOURCE, "fileDem000000001", "dem.txt", text.encode(), parent="folderOld0000001")
+    for i in range(14):
+        drive.put(SOURCE, f"fileOth{i:08d}", f"o{i}.txt", f"alpha beta {'pad ' * 5}".encode())
+    service = make_service(tmp_path, drive, None, chunk_chars=120, chunk_overlap=0)
+    service.add_sources([SOURCE])
+    service.sync()
+    return service
+
+
+def consistent_over_limits(service: Service, query: str, **scope: Any) -> list[dict[str, Any]]:
+    """Asserts that scores never rise and that a smaller limit shows the start of the list a
+    larger one shows; returns the limit-20 hits."""
+    full = service.search(query, limit=20, **scope)["results"]
+    keys = [(hit["document_id"], hit["chunk"], hit["score"]) for hit in full]
+    assert [k[2] for k in keys] == sorted((k[2] for k in keys), reverse=True)
+    for limit in range(1, 20):
+        hits = service.search(query, limit=limit, **scope)["results"]
+        assert [(h["document_id"], h["chunk"], h["score"]) for h in hits] == keys[:limit], limit
+    return full
+
+
+def test_demoted_weak_chunks_keep_scores_in_order_for_any_limit(tmp_path: Path) -> None:
+    service = weak_chunk(tmp_path)
+    query = "alpha beta gamma"
+    consistent_over_limits(service, query)
+    service.set_path_rules(1, {"demote": ["old/"], "exclude": []})
+    full = consistent_over_limits(service, query)
+    order = [(hit["file_name"], hit["chunk"]) for hit in full]
+    assert order.index(("dem.txt", 0)) == 10  # below the best hit of the next 10 files
+    assert order[-1] == ("dem.txt", 1)  # the weak chunk stays below stronger hits
+
+
+def test_demote_keeps_weaker_chunks_at_their_own_score() -> None:
+    from gdrive_rag.rules import demote
+
+    # document 100: chunk 0 is best overall, chunk 13 is weaker than all 12 other files
+    order = list(range(14))
+    document_of = {c: 100 if c in (0, 13) else c for c in order}
+    scores = {c: 1.0 - c / 100 for c in order}
+    result = demote(order, document_of, {100}, scores)
+    assert result == [*range(1, 11), 0, 11, 12, 13]
+    assert [scores[c] for c in result] == sorted((scores[c] for c in result), reverse=True)
+    assert scores[13] == 1.0 - 13 / 100  # already below its anchor: unchanged
+
+
+def test_hits_beyond_the_per_file_cap_come_after_every_capped_hit(tmp_path: Path) -> None:
+    drive = FakeDrive()
+    drive.add_root(SOURCE, "R")
+    big = " ".join(f"Phần {n}: phí giữ xe tháng {n}, ghi chép thêm cho đủ dài." for n in range(8))
+    drive.put(SOURCE, "fileBig000000001", "big.txt", big.encode())
+    drive.put(SOURCE, "fileSmall0000001", "small.txt", "Phí giữ xe cũ.".encode())
+    drive.put(SOURCE, "fileSmall0000002", "other.txt", "Bảng giữ xe.".encode())
+    drive.add_folder("folderArch000001", "archive", SOURCE)
+    drive.put(SOURCE, "fileArch00000001", "x.txt", "Lịch họp.".encode(), parent="folderArch000001")
+    service = make_service(tmp_path, drive, None, chunk_chars=100, chunk_overlap=0)
+    service.add_sources([SOURCE])
+    service.sync()
+    # a rule that touches none of the hits; without any rule the old fill order is kept
+    service.set_path_rules(1, {"demote": ["archive/"], "exclude": []})
+    full = consistent_over_limits(service, "phí giữ xe tháng")
+    files = [hit["file_name"] for hit in full]
+    assert files.count("big.txt") > 3 and "small.txt" in files and "other.txt" in files
+    assert files[:3] == ["big.txt"] * 3  # its best hits first, then the other files ...
+    assert files.index("big.txt", 3) > max(files.index("small.txt"), files.index("other.txt"))
+    narrow = consistent_over_limits(service, "phí giữ xe", files=["fileBig000000001"])
+    assert [hit["file_name"] for hit in narrow] == ["big.txt"] * len(narrow)
+
+
+@pytest.mark.parametrize("pattern", ["**??", "?*?", "**/?*?", "**" + "?" * 98])
+def test_patterns_that_skip_only_short_names_are_refused(pattern: str) -> None:
+    with pytest.raises(ValueError, match="matches every file path"):
+        clean([pattern], "demote")
+
+
+@pytest.mark.parametrize("pattern", ["**/??", "old/", "*.pdf", "**/archive/**", "*.*", "*/*"])
+def test_narrow_patterns_are_still_accepted(pattern: str) -> None:
+    assert clean([pattern], "demote") == [pattern]

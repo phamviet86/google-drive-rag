@@ -35,6 +35,7 @@ REFRESH = "1//REFRESHTOKENVALUE"
 CODE = "4/AUTHCODEVALUE"
 SECRETS = (API_KEY, "PRIVATEKEYMATERIAL", CLIENT_SECRET, REFRESH, CODE)
 READ_ONLY = {"search", "read", "list_sources", "list_folders", "sync_status", "sync_now"}
+SOURCE_TOOLS = {"add_source", "remove_source", "set_path_rules"}  # registered with the switch off
 ADMIN_TOOLS = {
     "add_source",
     "remove_source",
@@ -189,7 +190,7 @@ def test_admin_tools_are_off_by_default(tmp_path: Path, monkeypatch: pytest.Monk
 
     import anyio
 
-    assert anyio.run(names, create_server(service)) == READ_ONLY
+    assert anyio.run(names, create_server(service)) == READ_ONLY | SOURCE_TOOLS
     assert anyio.run(names, create_server(service, Admin(service))) == READ_ONLY | ADMIN_TOOLS
 
 
@@ -198,6 +199,7 @@ def test_admin_listing_and_annotations(env: Env) -> None:
     assert set(tools) == READ_ONLY | ADMIN_TOOLS
     destructive = {
         "remove_source",
+        "set_path_rules",  # ignore entries remove indexed documents
         "set_google_service_account",
         "google_auth_finish",
         "remove_google_auth",
@@ -493,7 +495,7 @@ def test_settings_change_during_a_sync_applies_from_the_next_step(
 def test_bad_arguments_never_echo_secrets(env: Env) -> None:
     """The SDK's own validation error prints every argument; these tools never trigger it."""
     cases = [
-        {"model": "m", "api_key": API_KEY},  # missing base_url
+        {"base_url": "https://x/v1", "model": [5], "api_key": API_KEY},  # model not a string
         {"base_url": "https://x/v1", "model": "m", "api_key": [API_KEY]},
         {"base_url": "https://x/v1", "model": "m", "api_key": {"k": API_KEY}},
         {"base_url": "https://x/v1", "model": "m", "api_key": API_KEY, "dimensions": "many"},

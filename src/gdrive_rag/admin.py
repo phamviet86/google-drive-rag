@@ -1,5 +1,7 @@
-"""Admin operations shared by the CLI and the optional admin MCP tools: Drive sources, Google
-access and the embedding endpoint.
+"""Admin operations shared by the CLI and the MCP tools: sources (Drive and local), search path
+rules, Google access and the embedding endpoint. The three source tools (``add_source``,
+``remove_source``, ``set_path_rules``) are always registered; the others only with
+``GDRAG_ADMIN_TOOLS``.
 
 Rules every operation follows:
 
@@ -10,7 +12,8 @@ Rules every operation follows:
 - Destructive operations take ``confirm``; without it they change nothing and say what would
   happen.
 - File inputs are names inside the secrets folder (``GDRAG_SECRETS_DIR``, ``/secrets`` in
-  Docker), resolved with symlinks and refused outside it.
+  Docker), resolved with symlinks and refused outside it. Local sources are paths inside the
+  local folder (``GDRAG_LOCAL_ROOT``, ``/local`` in Docker), confined the same way.
 - No result or error contains a key, token, client secret or file contents. The pasted OAuth
   redirect and the API key are never repeated.
 - Settings changes are saved at once: search uses them immediately, the sync loop from its next
@@ -51,12 +54,12 @@ from .config import (
 )
 from .drive import parse_drive_link
 from .embeddings import OpenAICompatibleEmbeddings
+from .local import SECRETS_ENV, is_local_input
 from .rules import clean
 from .search import EMBEDDING_IDENTITY_KEY
 from .service import Service, SyncBusy
 
 ADMIN_ENV = "GDRAG_ADMIN_TOOLS"
-SECRETS_ENV = "GDRAG_SECRETS_DIR"
 GOOGLE_ENV = ("GDRAG_GOOGLE_AUTH", "GDRAG_GOOGLE_CREDENTIALS")
 OAUTH_EXPIRY_SECONDS = 600
 MAX_SECRET_FILE_BYTES = 1_000_000
@@ -140,9 +143,15 @@ class Admin:
             raise AdminRefused("cannot read that file (check its owner and mode)") from None
 
     # -- sources -------------------------------------------------------------------------------
-    def add_source(self, link: str) -> dict[str, Any]:
+    def add_source(self, link: str, queue: bool = True) -> dict[str, Any]:
+        """Add a Drive link (stored only when Google confirms it) or a local path (stored only
+        when it exists inside the local folder). ``queue`` asks this process's sync loop to read
+        it now; the CLI passes False (the server picks it up at its next scheduled sync)."""
+        local = is_local_input(link)
         result = self.service.add_sources([link])[0]
-        if "id" not in result:  # not a Drive link: nothing was stored
+        if "id" not in result:  # nothing was stored
+            if local:  # these messages never repeat the path given
+                raise AdminRefused(f"could not add: {result.get('error')}")
             raise AdminRefused("could not add: not a Google Drive folder or file link")
         answer = {"applied": not result.get("already_added"), "source": _source(result)}
         if result.get("already_added"):
@@ -156,6 +165,12 @@ class Admin:
                 "Google did not confirm that link or ID (not found, not shared with the Google "
                 "account in use, or Google access is not set up); nothing was added"
             )
+        if not queue:
+            answer["message"] = (
+                "Source added. The server reads it at its next scheduled sync; to read it now, "
+                "run: gdrive-rag sync"
+            )
+            return answer
         answer["sync"] = self.service.queue_sync(int(result["id"]))
         answer["message"] = "Source added; it is read in the background. Check sync_status."
         return answer
@@ -167,9 +182,10 @@ class Admin:
                 "this source is listed in GDRAG_DRIVE_LINKS and would come back at the next "
                 "restart; remove it from .env first"
             )
+        where = "The local files are" if preview["root_id"].startswith("local:") else "Drive is"
         message = (
             f"Removing source {preview['name']!r} drops {preview['documents_removed']} documents "
-            "from the index (documents another source also holds stay). Drive is not changed."
+            f"from the index (documents another source also holds stay). {where} not changed."
         )
         if not confirm:
             return {"applied": False, "confirm_needed": True, "would": message, **preview}
@@ -187,16 +203,26 @@ class Admin:
         demote: list[str] | None = None,
         exclude: list[str] | None = None,
         confirm: bool = False,
+        ignore: list[str] | None = None,
+        queue: bool = True,
     ) -> dict[str, Any]:
-        """Set a source's search path rules. An omitted list keeps the current patterns; an
-        empty list clears them. Without confirm it only previews how many documents each
-        pattern hits. Search-time only: nothing is re-extracted or re-embedded."""
+        """Set a source's path rules. An omitted list keeps the current entries; an empty list
+        clears them. Without confirm it only previews how many documents (and, for ignore,
+        folders) each entry hits. demote and exclude are search-time only; ignore keeps files
+        out of the index: hidden from search at once, removed by the sync it queues. ``queue``
+        False (the CLI, whose process ends) queues nothing: the server's next scheduled sync
+        applies the change."""
         preview = self.service.source_preview(source)
         source_id = int(preview["id"])
         current = self.service.path_rules(source_id)
         wanted = {
             "demote": current["demote"] if demote is None else clean(demote, "demote"),
             "exclude": current["exclude"] if exclude is None else clean(exclude, "exclude"),
+            "ignore": (
+                current["ignore"]
+                if ignore is None
+                else self.service.ignore_entries(source_id, ignore)
+            ),
         }
         answer: dict[str, Any] = {
             "source": {"id": source_id, "name": preview["name"]},
@@ -205,19 +231,65 @@ class Admin:
             "matches": self.service.rule_matches(source_id, wanted),
         }
         found = answer["matches"]
-        if wanted["exclude"] and found["documents"] and found["excluded"] == found["documents"]:
+        everything = found["documents"]
+        if wanted["ignore"] and everything and found["ignored"] == everything:
+            raise AdminRefused(
+                "these ignore entries would remove every document of this source from the "
+                "index; use narrower entries, or remove_source to drop the source"
+            )
+        if wanted["ignore"] and found["empties_sources"]:
+            raise AdminRefused(
+                "these ignore entries would remove every document of another source ("
+                + ", ".join(found["empties_sources"])
+                + ") from the index, because a file any source ignores is not indexed; use "
+                "narrower entries, or remove_source to drop that source"
+            )
+        if wanted["exclude"] and everything and found["excluded"] + found["ignored"] == everything:
             raise AdminRefused(
                 "these exclude patterns would hide every document of this source from search; "
                 "use narrower patterns, or remove_source to drop the source"
             )
+        ignore_changed = wanted["ignore"] != current["ignore"]
+        nothing = [e for e in found["ignore_matches_nothing"] if e not in current["ignore"]]
+        if nothing:
+            answer["warning"] = (
+                f"{len(nothing)} ignore entries match no indexed file, skipped file or folder of "
+                "this source yet: " + "; ".join(nothing) + ". Check them for typos. A bare "
+                "value is a file or folder ID only when this source already lists it (otherwise "
+                "it is a path pattern); write id:<ID> or a Drive link to name an ID not yet "
+                "listed."
+            )
         if not confirm:
             answer["would"] = (
                 "Search would use these rules for this source: demote lowers a file's score, "
-                "exclude leaves it out of results (still readable by ID). Nothing is re-indexed."
+                "exclude leaves it out of results (still readable by ID)."
+            ) + (
+                f" ignore: {found['ignored']} indexed documents and {found['ignored_folders']} "
+                "folders would be hidden from search at once and removed from the index by the "
+                "next sync, also where another source lists them (Drive is not changed); files "
+                "under an ignore entry are never downloaded or read. Removing an entry later "
+                "indexes those files again."
+                if ignore_changed
+                else " Nothing is re-indexed."
             )
             return {"applied": False, "confirm_needed": True, **answer}
-        self.service.set_path_rules(source_id, wanted)
-        return {"applied": True, "message": "Path rules saved; search uses them now.", **answer}
+        saved = self.service.set_path_rules(source_id, wanted, queue=queue)
+        message = "Path rules saved; search uses them now."
+        if saved["sync"] is not None:
+            answer["sync"] = saved["sync"]
+            message += (
+                " Ignored files are hidden now; a sync was queued to remove them from the index "
+                "(and to index files no longer ignored)."
+            )
+        elif saved["changed"]:  # the CLI: this process queues nothing
+            message += (
+                " Ignored files are hidden now. The server removes them from the index (and "
+                "indexes files no longer ignored) at its next scheduled sync; to do it now, run: "
+                "gdrive-rag sync"
+            )
+        if "warning" in answer:
+            message += " Warning: " + answer["warning"]
+        return {"applied": True, "message": message, **answer}
 
     # -- Google access -------------------------------------------------------------------------
     def google_status(self) -> dict[str, Any]:
@@ -371,6 +443,14 @@ class Admin:
             raise AdminRefused(
                 "a new address needs its own API key: pass api_key_file (or api_key) as well"
             )
+        if settings.embedding_key_mismatch and not new_key:
+            # the stored key belongs to another origin than the address in effect; saving it
+            # now would silently re-bind it to this address
+            raise AdminRefused(
+                f"the stored API key was set for {settings.embedding_key_origin}, not for "
+                f"{netcheck.origin(settings.embedding_base_url)}: pass api_key_file (or "
+                "api_key) for this address"
+            )
         if moves and os.environ.get("GDRAG_EMBEDDING_API_KEY", "").strip():
             raise AdminRefused(
                 "the API key comes from GDRAG_EMBEDDING_API_KEY in the environment (.env); the "
@@ -389,6 +469,8 @@ class Admin:
             "embedding_dimensions": dims,
         }
         changes = _refuse_environment(changes)
+        if "embedding_api_key" in changes:  # a key from the environment is never stored
+            changes["embedding_key_origin"] = netcheck.origin(base_url)
         identity = OpenAICompatibleEmbeddings(base_url, "", model, dims, "").identity
         stored = self.service.db.get_meta(EMBEDDING_IDENTITY_KEY)
         with self.service.db.read() as connection:
@@ -448,7 +530,7 @@ class Admin:
         )
         if not confirm:
             return {"applied": False, "confirm_needed": True, "would": message}
-        save_config(settings.data_dir, {"embedding_api_key": ""})
+        save_config(settings.data_dir, {"embedding_api_key": "", "embedding_key_origin": ""})
         self.service.reload()
         return {"applied": True, "message": message, "vectors_kept": vectors}
 
@@ -466,6 +548,8 @@ def import_environment(service: Service) -> dict[str, Any]:
         if os.environ.get(name, "").strip()
     }
     if values:
+        if "embedding_api_key" in values:  # bind the imported key to the address it was used with
+            values["embedding_key_origin"] = netcheck.origin(settings.embedding_base_url)
         save_config(settings.data_dir, values)
         blank += [name for name, key in ENV_FIELDS.items() if key in values]
     settings = service.reload()

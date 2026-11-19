@@ -31,6 +31,7 @@ RUN useradd --create-home --uid 10001 --shell /usr/sbin/nologin app \
 
 ENV GDRAG_DATA_DIR=/data \
     GDRAG_SECRETS_DIR=/secrets \
+    GDRAG_LOCAL_ROOT=/local \
     GDRAG_HOST=0.0.0.0 \
     GDRAG_PORT=8765 \
     HOME=/home/app

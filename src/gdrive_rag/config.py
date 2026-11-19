@@ -17,12 +17,17 @@ from dataclasses import asdict, dataclass, replace
 from pathlib import Path
 from typing import Any
 
+from . import netcheck
+
 DEFAULT_BASE_URL = "https://openrouter.ai/api/v1"
 DEFAULT_MODEL = "qwen/qwen3-embedding-8b"
 DEFAULT_DIMENSIONS = 1024
 DEFAULT_QUERY_INSTRUCTION = (
     "Given a search question, retrieve relevant passages from documents that answer it"
 )
+# never stored in config.json; local_root comes from GDRAG_LOCAL_ROOT only
+DERIVED_FIELDS = {"data_dir", "embedding_key_from_env", "local_root"}
+LOCAL_ROOT_ENV = "GDRAG_LOCAL_ROOT"
 AUTH_METHODS = ("none", "service_account", "oauth")
 
 # Environment variable -> config field. Values from the environment win over config.json.
@@ -45,6 +50,7 @@ class Settings:
     embedding_base_url: str = DEFAULT_BASE_URL
     embedding_model: str = DEFAULT_MODEL
     embedding_api_key: str = ""
+    embedding_key_origin: str = ""  # scheme://host:port the stored key was issued for
     embedding_dimensions: int = DEFAULT_DIMENSIONS
     query_instruction: str = DEFAULT_QUERY_INSTRUCTION
     google_auth: str = "none"
@@ -53,6 +59,10 @@ class Settings:
     ocr_langs: str = DEFAULT_OCR_LANGS
     chunk_chars: int = 1500
     chunk_overlap: int = 200
+    embedding_key_from_env: bool = False  # derived: GDRAG_EMBEDDING_API_KEY is set
+    # derived: the folder local sources live in (GDRAG_LOCAL_ROOT, environment only, like
+    # GDRAG_SECRETS_DIR); None = local sources are not available
+    local_root: Path | None = None
 
     @property
     def db_path(self) -> Path:
@@ -83,8 +93,32 @@ class Settings:
         return self.data_dir / "tmp"
 
     @property
+    def embedding_key_mismatch(self) -> bool:
+        """A stored key is bound to the origin it was set for. When the address now points at
+        another origin the key is not used (never sent), so a removed ``.env`` address cannot
+        redirect it. A key from ``GDRAG_EMBEDDING_API_KEY`` is the owner's choice and is exempt."""
+        if not self.embedding_api_key.strip() or self.embedding_key_from_env:
+            return False
+        return self.embedding_key_origin != netcheck.origin(self.embedding_base_url)
+
+    @property
+    def embedding_warning(self) -> str | None:
+        if not self.embedding_key_mismatch:
+            return None
+        return (
+            "The stored embedding API key was set for "
+            f"{self.embedding_key_origin} but the address is now "
+            f"{netcheck.origin(self.embedding_base_url)}, so the key is not used and search is "
+            "full-text only. Restore the address, or run set_embedding with a key for the new one."
+        )
+
+    @property
     def embeddings_enabled(self) -> bool:
-        return bool(self.embedding_api_key.strip() and self.embedding_model.strip())
+        return bool(
+            self.embedding_api_key.strip()
+            and self.embedding_model.strip()
+            and not self.embedding_key_mismatch
+        )
 
     def public(self) -> dict[str, Any]:
         """Settings safe to print: the key is reported as set/unset only."""
@@ -94,6 +128,12 @@ class Settings:
             "embedding_model": self.embedding_model,
             "embedding_dimensions": self.embedding_dimensions,
             "embedding_api_key": "set" if self.embedding_api_key else "not set",
+            "embedding_key_origin": (
+                self.embedding_key_origin
+                if self.embedding_api_key and not self.embedding_key_from_env
+                else ""
+            ),
+            "embedding_warning": self.embedding_warning,
             "google_auth": self.google_auth,
             "sync_interval_minutes": self.sync_interval_minutes,
             "ocr_enabled": self.ocr_enabled,
@@ -115,14 +155,37 @@ def load_settings(data_dir: str | Path | None = None, *, use_env: bool = True) -
     settings = Settings(data_dir=root)
     stored = read_config(root)
     values: dict[str, Any] = {}
-    for key in (*ENV_FIELDS.values(), "query_instruction", "chunk_chars", "chunk_overlap"):
+    for key in (
+        *ENV_FIELDS.values(),
+        "embedding_key_origin",
+        "query_instruction",
+        "chunk_chars",
+        "chunk_overlap",
+    ):
         if key in stored:
             values[key] = stored[key]
     if use_env:
+        local_root = os.environ.get(LOCAL_ROOT_ENV, "").strip()
+        if local_root:
+            values["local_root"] = Path(local_root).expanduser()
         for env_name, key in ENV_FIELDS.items():
             raw = os.environ.get(env_name)
             if raw is not None and raw.strip():
                 values[key] = raw.strip()
+                if key == "embedding_api_key":
+                    values["embedding_key_from_env"] = True
+    legacy = bool(
+        str(stored.get("embedding_api_key") or "").strip()
+        and not str(stored.get("embedding_key_origin") or "").strip()
+    )
+    if legacy:
+        # A key stored before keys were bound to an origin: bind it to the address in effect now
+        # (environment included), which is where it has been sent so far, and record that once
+        # so a later change of the address cannot redirect it.
+        address = str(values.get("embedding_base_url") or DEFAULT_BASE_URL).strip().rstrip("/")
+        values["embedding_key_origin"] = netcheck.origin(address)
+        if use_env:
+            save_config(root, {"embedding_key_origin": values["embedding_key_origin"]})
     return _coerce(replace(settings, **values))
 
 
@@ -141,6 +204,7 @@ def _coerce(settings: Settings) -> Settings:
         embedding_base_url=str(settings.embedding_base_url).strip().rstrip("/"),
         embedding_model=str(settings.embedding_model).strip(),
         embedding_api_key=str(settings.embedding_api_key).strip(),
+        embedding_key_origin=str(settings.embedding_key_origin or "").strip(),
         embedding_dimensions=dimensions,
         google_auth=auth,
         sync_interval_minutes=max(1, int(settings.sync_interval_minutes)),
@@ -198,14 +262,28 @@ def read_config(data_dir: Path) -> dict[str, Any]:
 
 def save_config(data_dir: Path, changes: dict[str, Any]) -> Settings:
     """Merge ``changes`` into config.json (written atomically with mode 0600)."""
-    allowed = {f for f in asdict(Settings(data_dir=data_dir)) if f != "data_dir"}
+    allowed = {f for f in asdict(Settings(data_dir=data_dir)) if f not in DERIVED_FIELDS}
     unknown = set(changes) - allowed
     if unknown:
         raise ValueError(f"unknown config keys: {', '.join(sorted(unknown))}")
-    current = read_config(data_dir)
-    current.update(changes)
-    write_private(data_dir / "config.json", json.dumps(current, indent=2, ensure_ascii=False))
+    with config_lock(data_dir):  # the read-merge-write is one step, across threads and processes
+        current = read_config(data_dir)
+        current.update(changes)
+        write_private(data_dir / "config.json", json.dumps(current, indent=2, ensure_ascii=False))
     return load_settings(data_dir, use_env=False)
+
+
+@contextlib.contextmanager
+def config_lock(data_dir: Path) -> Iterator[None]:
+    """Exclusive lock for every read-merge-write of config.json. ``flock`` locks belong to the
+    open file, so it also serialises threads of this process, not only other processes."""
+    ensure_private_dir(data_dir)
+    with (data_dir / ".config.lock").open("a+") as handle:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
 
 
 @contextlib.contextmanager

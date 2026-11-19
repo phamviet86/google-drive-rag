@@ -4,7 +4,8 @@ again on every request (``embeddings``), which also connects to the very address
 - Host names: only ``[a-z0-9.-]`` (lower-cased, one trailing dot dropped) or a bracketed IPv6
   literal. Percent-encoding and numeric shorthands (``2852039166``, ``0xa9fea9fe``, octal or
   short dotted forms) are refused, so a host cannot be disguised as something it is not.
-- Every address the name resolves to must be public. Link-local, cloud-metadata, unspecified,
+- Every address the name resolves to must be public (globally routable: shared address space
+  such as 100.64.0.0/10 counts as local). Link-local, cloud-metadata, unspecified,
   multicast and reserved addresses are always refused; loopback and private ones only with
   ``GDRAG_ALLOW_LOCAL_EMBEDDINGS=1`` (environment only).
 - Plain http is allowed only to a literal loopback or private address, with that same setting.
@@ -40,6 +41,16 @@ def _resolve(host: str, port: int) -> list[IP]:
 
 
 resolver: Callable[[str, int], list[IP]] = _resolve  # tests replace this; no network there
+
+
+def origin(base_url: str) -> str:
+    """``scheme://host:port`` of an address, lower-cased; the raw text when it cannot be parsed
+    (so an unparsable address never equals another origin). Holds no secret."""
+    try:
+        scheme, host, port, _ = parse(base_url)
+    except ValueError:
+        return f"?{str(base_url or '').strip()}"
+    return f"{scheme}://{host}:{port}"
 
 
 def parse(base_url: str) -> tuple[str, str, int, str]:
@@ -93,15 +104,37 @@ def literal(host: str) -> IP | None:
         return None
 
 
+def _public(address: IP) -> bool:
+    """Only globally routable addresses are public. Shared address space (100.64.0.0/10:
+    Tailscale, CGNAT, Alibaba metadata 100.100.100.200) and the like are local, not public."""
+    mapped = getattr(address, "ipv4_mapped", None)
+    return address.is_global and (mapped is None or mapped.is_global)
+
+
+def is_local(address: IP) -> bool:
+    """A non-public address that is allowed (with the local flag) as an http destination."""
+    return not _public(address)
+
+
+def _ipv4_compatible(address: IP) -> bool:
+    """A deprecated IPv4-compatible IPv6 address (``::a.b.c.d``, not ``::`` or ``::1``)."""
+    if address.version != 6:
+        return False
+    value = int(address)
+    return value >> 32 == 0 and value > 1
+
+
 def check_address(address: IP, allow_local: bool) -> None:
     if address.is_link_local or address in _METADATA_NETS:
         raise DestinationRefused("base_url points at a link-local or cloud metadata address")
+    # IPv4 inside IPv6 (::ffff:a.b.c.d mapped, ::a.b.c.d compatible) is refused outright: newer
+    # Python versions judge a mapped address by the IPv4 inside instead of calling it reserved,
+    # so this must not depend on ``is_reserved``.
+    if getattr(address, "ipv4_mapped", None) is not None or _ipv4_compatible(address):
+        raise DestinationRefused("base_url points at an address that is not a server")
     if address.is_unspecified or address.is_multicast or address.is_reserved:
         raise DestinationRefused("base_url points at an address that is not a server")
-    mapped = getattr(address, "ipv4_mapped", None)
-    if mapped is not None:
-        check_address(mapped, allow_local)
-    if (address.is_loopback or address.is_private) and not allow_local:
+    if not _public(address) and not allow_local:
         raise DestinationRefused(
             f"base_url points at a loopback or private address; allowed only with {LOCAL_ENV}=1"
         )
@@ -118,9 +151,7 @@ def check(base_url: str, allow_local: bool | None = None) -> tuple[str, str, int
     fixed = literal(host)
     if fixed is not None:
         check_address(fixed, allow)  # link-local/metadata named first, whatever the scheme
-    if scheme == "http" and (
-        fixed is None or not (fixed.is_loopback or fixed.is_private) or not allow
-    ):
+    if scheme == "http" and (fixed is None or not is_local(fixed) or not allow):
         raise DestinationRefused(
             "base_url must use https (plain http is allowed only to a literal loopback or "
             f"private address, with {LOCAL_ENV}=1)"

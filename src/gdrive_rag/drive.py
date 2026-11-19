@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import io
 import json
+import posixpath
 import re
 import unicodedata
 from collections.abc import Sequence
@@ -140,13 +141,15 @@ class Listing:
 
 @dataclass(frozen=True)
 class SkippedFile:
-    """A listed file that is not indexed because no extractor handles its type."""
+    """A listed file that is not indexed: no extractor handles its type, or a path rule
+    ignores it."""
 
     id: str
     path: str
     mime_type: str
     size: int | None
     reason: str
+    parent_id: str = ""  # folder it was listed in, so a folder ignore rule covers it too
 
 
 SHORTCUT_MIME = "application/vnd.google-apps.shortcut"
@@ -170,13 +173,38 @@ def split_supported(items: Sequence[DriveItem]) -> tuple[list[DriveItem], list[S
     for item in items:
         reason = skip_reason(item)
         if reason:
-            skipped.append(SkippedFile(item.id, item.path, item.mime_type, item.size, reason))
+            skipped.append(
+                SkippedFile(item.id, item.path, item.mime_type, item.size, reason, item.parent_id)
+            )
         else:
             kept.append(item)
     return kept, skipped
 
 
+LOCAL_PREFIX = "local:"  # IDs of local sources: ``local:<path relative to GDRAG_LOCAL_ROOT>``
+LOCAL_KINDS = frozenset({"local_folder", "local_file"})
+
+
+def is_local_id(value: str) -> bool:
+    return value.startswith(LOCAL_PREFIX)
+
+
+def local_id(relative: str) -> str:
+    """``local:<relative path>``; the local root itself is ``local:.``. Always NFC, so a name
+    typed in NFC finds the same ID as one stored from an NFD name on disk (macOS copies)."""
+    return LOCAL_PREFIX + (unicodedata.normalize("NFC", relative).strip("/") or ".")
+
+
+def normalize_local_id(value: str) -> str:
+    """Canonical form of a ``local:`` ID as typed (a leading ``/``, ``./`` or doubled slashes
+    are dropped). Purely lexical: the file system is checked by ``local.LocalBackend``."""
+    rest = value.strip()[len(LOCAL_PREFIX) :]
+    return local_id(posixpath.normpath("/" + rest).lstrip("/"))
+
+
 def folder_link(folder_id: str) -> str:
+    if is_local_id(folder_id):
+        return folder_id
     return f"https://drive.google.com/drive/folders/{folder_id}"
 
 
@@ -193,6 +221,8 @@ DRIVE_HOSTS = {"drive.google.com", "docs.google.com"}
 
 def drive_link(drive_id: str, kind: str) -> str:
     """The link stored for a source, rebuilt from its ID (never the text the user pasted)."""
+    if is_local_id(drive_id):
+        return drive_id
     if kind in {"folder", "shared_drive"}:
         return folder_link(drive_id)
     return f"https://drive.google.com/open?id={drive_id}"
@@ -211,8 +241,13 @@ def save_refreshed_token(token_file: Path, payload: str) -> bool:
 
 
 def parse_drive_link(link: str) -> str:
-    """Return the Drive ID from a folder, shared-drive, file, Docs/Sheets/Slides or open?id link."""
+    """Return the Drive ID from a folder, shared-drive, file, Docs/Sheets/Slides or open?id link.
+
+    A ``local:`` ID is returned in its canonical form, so every lookup by link or ID (read,
+    folder and file scopes, list_folders, sources) also takes local IDs."""
     value = link.strip()
+    if is_local_id(value):
+        return normalize_local_id(value)
     if _ID.fullmatch(value):
         return value
     parsed = urlparse(value)
