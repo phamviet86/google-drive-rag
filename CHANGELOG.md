@@ -2,6 +2,14 @@
 
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions follow [Semantic Versioning](https://semver.org/). The install guide for the owner is `README.md` (Vietnamese).
 
+## [Unreleased]
+
+Tóm tắt: chỉ sửa tài liệu, không đổi cách dịch vụ chạy. README giờ hướng dẫn kết nối cho Claude Code, Codex và Antigravity, và lời văn không còn gắn riêng với Claude.
+
+### Changed
+
+- Docs: setup for three MCP clients (Claude Code, OpenAI Codex, Google Antigravity) in README "Kết nối với agent", including the SSH tunnel for an agent on another computer; README, package description, `.env.example` and `docker-compose.yml` comments are agent-neutral. No behaviour change.
+
 ## [0.4.0] - 2026-11-19
 
 Tóm tắt: thêm nguồn là thư mục trên chính VPS (`local:`), thêm quy tắc `ignore` để loại thư mục hoặc tệp khỏi chỉ mục, ba công cụ nguồn (`add_source`, `remove_source`, `set_path_rules`) luôn có không cần `GDRAG_ADMIN_TOOLS`, và sửa các lỗi an toàn của bản 0.3.0. Cập nhật thêm migration 5 mà không đọc lại tệp nào và không tính lại dữ liệu ý nghĩa.

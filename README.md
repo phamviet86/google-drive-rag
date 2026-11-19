@@ -1,8 +1,8 @@
 # Cách cài google-drive-rag trên VPS
 
-google-drive-rag giúp Claude Code tìm và đọc tài liệu trong Google Drive của bạn. Sau khi cài, bạn chỉ cần hỏi Claude Code trên VPS, ví dụ "tìm hợp đồng thuê văn phòng năm 2025", và Claude trả lời kèm tên tệp, số trang và đường link Drive.
+google-drive-rag giúp trợ lý AI (gọi tắt là agent) như Claude Code, Codex hay Antigravity tìm và đọc tài liệu trong Google Drive của bạn. Sau khi cài, bạn chỉ cần hỏi agent, ví dụ "tìm hợp đồng thuê văn phòng năm 2025", và agent trả lời kèm tên tệp, số trang và đường link Drive.
 
-Dịch vụ chạy trong một Docker container trên chính VPS, chỉ nhận kết nối từ VPS đó (địa chỉ `127.0.0.1`), không mở ra Internet.
+Dịch vụ chạy trong một Docker container trên chính VPS, chỉ nhận kết nối từ VPS đó (địa chỉ `127.0.0.1`), không mở ra Internet. Về kỹ thuật, đây là một máy chủ MCP chuẩn, nên agent nào biết MCP cũng dùng được.
 
 > **Lưu ý:** Với Docker cũ hơn bản 28.0, cổng mở trên `127.0.0.1` vẫn có thể bị máy khác cùng mạng nội bộ truy cập; hãy dùng Docker 28.0 trở lên.
 
@@ -12,14 +12,14 @@ Dịch vụ chạy trong một Docker container trên chính VPS, chỉ nhận k
 - Chuẩn bị
 - Tạo quyền đọc Google Drive
 - Các bước cài đặt
-- Kết nối với Claude Code
+- Kết nối với agent
 - Kiểm tra kết quả
 - Tìm trong một thư mục hoặc một tệp
-- Thêm hoặc bớt nguồn ngay trong Claude
+- Thêm hoặc bớt nguồn ngay từ agent
 - Nguồn là thư mục trên VPS
 - Hạ thấp, ẩn hoặc loại tệp khỏi chỉ mục
 - Việc thường ngày
-- Quản trị từ Claude (tùy chọn)
+- Quản trị từ agent (tùy chọn)
 - Xử lý sự cố
 
 ## Dịch vụ làm gì
@@ -28,21 +28,21 @@ Dịch vụ chạy trong một Docker container trên chính VPS, chỉ nhận k
 - Hiểu Google Docs, Sheets, Slides, Word, Excel, PowerPoint (cả bản cũ `.doc`, `.xls`, `.ppt`), PDF (cả bản scan, nhờ nhận dạng chữ trong ảnh, gọi là OCR), ảnh chụp tài liệu (`.jpg`, `.png`, `.webp`), RTF, Markdown, văn bản, JSON, CSV và trang HTML.
 - Đọc được chữ tiếng Việt có dấu và tiếng Anh trong bản scan và ảnh chụp. Cách thêm ngôn ngữ khác ở phần "Việc thường ngày".
 - Cứ 15 phút kiểm tra Drive một lần: tệp mới được thêm, tệp sửa được đọc lại, tệp bị xóa hoặc thôi chia sẻ thì bị bỏ khỏi chỉ mục. Chỉ mục (index) là bản sao đã sắp xếp để tìm nhanh, nằm trên VPS.
-- Không muốn chờ 15 phút? Nói với Claude, ví dụ "Tôi vừa thêm tệp vào Drive, đọc lại Drive giúp tôi". Claude sẽ bảo dịch vụ đọc Drive ngay, rồi xem tiến độ. Mỗi phút chỉ nhận một yêu cầu như vậy, và lịch 15 phút vẫn chạy như cũ.
+- Không muốn chờ 15 phút? Nói với agent, ví dụ "Tôi vừa thêm tệp vào Drive, đọc lại Drive giúp tôi". Agent sẽ bảo dịch vụ đọc Drive ngay, rồi xem tiến độ. Mỗi phút chỉ nhận một yêu cầu như vậy, và lịch 15 phút vẫn chạy như cũ.
 - Chỉ đọc. Dịch vụ không bao giờ sửa hay xóa gì trên Drive.
 
 ## Chuẩn bị
 
 Khi cài, dịch vụ chỉ hỏi bạn ba thứ:
 
-1. **Khóa API cho tìm kiếm theo ý nghĩa** (không bắt buộc). Khóa API là một chuỗi bí mật để dịch vụ dùng tài khoản OpenRouter của bạn. Có khóa thì Claude tìm được cả câu hỏi diễn đạt khác chữ trong tài liệu. Không có khóa thì vẫn tìm theo từ, và bạn có thể thêm khóa sau. Tạo khóa tại trang **Keys** của OpenRouter (`openrouter.ai/settings/keys`).
+1. **Khóa API cho tìm kiếm theo ý nghĩa** (không bắt buộc). Khóa API là một chuỗi bí mật để dịch vụ dùng tài khoản OpenRouter của bạn. Có khóa thì agent tìm được cả câu hỏi diễn đạt khác chữ trong tài liệu. Không có khóa thì vẫn tìm theo từ, và bạn có thể thêm khóa sau. Tạo khóa tại trang **Keys** của OpenRouter (`openrouter.ai/settings/keys`).
 2. **Tệp quyền đọc Google Drive** (tệp JSON). Cách tạo ở phần sau.
 3. **Link Google Drive** của các thư mục hoặc tệp cần tìm. Mở thư mục trên Drive và chép địa chỉ trên thanh trình duyệt.
 
 Bạn cũng cần:
 
 - Một VPS Linux, đăng nhập được bằng SSH (ví dụ `ssh ten-ban@dia-chi-vps`).
-- Claude Code đã cài trên VPS đó.
+- Một agent đã cài trên VPS đó: Claude Code, Codex hoặc Antigravity (xem phần "Kết nối với agent"). Agent chạy trên máy khác cũng dùng được, nhưng cần thêm một bước nối (đường hầm SSH).
 - Thư mục mã nguồn `google-drive-rag` trên máy của bạn.
 
 ## Tạo quyền đọc Google Drive
@@ -135,7 +135,32 @@ Dùng khi bạn không muốn chia sẻ thư mục cho tài khoản dịch vụ.
 
 > **Lưu ý:** Không muốn trả lời câu hỏi? Chép `.env.example` thành `.env`, điền ba giá trị vào đó (đường dẫn tệp là `/secrets/google.json`), rồi chạy lại bước 5. Cách này chỉ đủ với tài khoản dịch vụ; đăng nhập Gmail vẫn cần bước 6 một lần.
 
-## Kết nối với Claude Code
+## Kết nối với agent
+
+Dịch vụ là một máy chủ MCP chuẩn. MCP là cách chung để một agent nói chuyện với công cụ bên ngoài. Địa chỉ của dịch vụ là:
+
+```text
+http://127.0.0.1:8765/mcp
+```
+
+Dịch vụ không có mật khẩu. Vì vậy nó chỉ nhận kết nối từ chính VPS, và bạn chỉ cần làm đúng một trong hai cách sau.
+
+- **Cách A (đơn giản nhất):** chạy agent ngay trên VPS (qua SSH). Dùng địa chỉ trên như đã ghi.
+- **Cách B:** agent chạy trên máy khác (laptop của bạn, hoặc Antigravity cài trên máy bạn). Trên máy đó, mở một cửa sổ dòng lệnh, chạy lệnh dưới đây và để cửa sổ mở:
+
+  ```bash
+  ssh -N -L 8765:127.0.0.1:8765 ten-ban@dia-chi-vps
+  ```
+
+  Lệnh này gọi là đường hầm SSH: cổng 8765 trên máy bạn được nối an toàn tới cổng 8765 trên VPS. Sau đó agent trên máy bạn vẫn dùng địa chỉ `http://127.0.0.1:8765/mcp`. Đóng cửa sổ là mất kết nối.
+
+> **Cảnh báo:** Không bao giờ mở cổng 8765 ra Internet (ví dụ bằng tường lửa của nhà cung cấp VPS hoặc sửa `docker-compose.yml`). Không có mật khẩu, nên ai chạm tới cổng này cũng đọc được toàn bộ tài liệu đã đưa vào chỉ mục.
+
+Nếu agent báo lỗi về tên máy (host) bị từ chối, nghĩa là bạn đang dùng một tên khác ngoài `127.0.0.1`, `localhost` và `[::1]`. Khi đó mới cần thêm tên đó vào `.env`, ví dụ `GDRAG_ALLOWED_HOSTS=ten-may:*` (nhiều tên thì ngăn cách bằng dấu phẩy), rồi chạy `sudo docker compose up -d`. Nếu bạn dùng địa chỉ như trên thì không cần làm gì.
+
+Chọn agent bạn dùng:
+
+### Claude Code
 
 Chạy lệnh này trên VPS, bằng tài khoản bạn dùng Claude Code:
 
@@ -143,9 +168,68 @@ Chạy lệnh này trên VPS, bằng tài khoản bạn dùng Claude Code:
 claude mcp add --transport http --scope user google-drive-rag http://127.0.0.1:8765/mcp
 ```
 
-MCP là cách Claude Code nói chuyện với công cụ bên ngoài. `--scope user` cho Claude dùng dịch vụ ở mọi thư mục dự án; bỏ phần này nếu chỉ muốn dùng trong thư mục hiện tại.
+`--scope user` cho Claude Code dùng dịch vụ ở mọi thư mục dự án; bỏ phần này nếu chỉ muốn dùng trong thư mục hiện tại.
 
-Kết quả: lệnh `claude mcp list` hiện dòng `google-drive-rag` với trạng thái đã kết nối.
+Cách kiểm tra: chạy `claude mcp list`. Kết quả: dòng `google-drive-rag` hiện trạng thái đã kết nối (`Connected`). Trong Claude Code, gõ `/mcp` cũng cho thấy danh sách này.
+
+Câu hỏi thử: "Dùng google-drive-rag tìm tài liệu về hợp đồng thuê văn phòng."
+
+### Codex (OpenAI)
+
+Chạy trên VPS, bằng tài khoản bạn dùng Codex (dòng lệnh `codex`, hoặc phần mở rộng cho trình soạn thảo, hai bản này dùng chung cấu hình). Theo tài liệu của Codex tại thời điểm viết, Codex nói chuyện được trực tiếp với máy chủ MCP kiểu này (gọi là Streamable HTTP), không cần chương trình trung gian.
+
+Cách 1, dùng lệnh:
+
+```bash
+codex mcp add google-drive-rag --url http://127.0.0.1:8765/mcp
+```
+
+Cách 2, sửa tệp cấu hình `~/.codex/config.toml` (tạo tệp nếu chưa có), thêm đoạn:
+
+```toml
+[mcp_servers.google-drive-rag]
+url = "http://127.0.0.1:8765/mcp"
+```
+
+Cả hai cách cho kết quả như nhau. Không cần khóa hay mật khẩu. Nếu Codex đang mở, hãy thoát rồi mở lại.
+
+Cách kiểm tra: chạy `codex mcp list`, dòng `google-drive-rag` phải có trong danh sách. Trong màn hình `codex`, gõ `/mcp` để xem các máy chủ đang hoạt động.
+
+Câu hỏi thử: "Dùng google-drive-rag tìm tài liệu về hợp đồng thuê văn phòng."
+
+> **Lưu ý:** Nếu bản Codex của bạn quá cũ nên không hiểu `url`, hãy cập nhật Codex. Các bước trên theo tài liệu của Codex, chưa được thử trên máy thật.
+
+### Antigravity (Google)
+
+Antigravity đọc cấu hình MCP từ tệp `mcp_config.json`. Theo tài liệu của Antigravity tại thời điểm viết, máy chủ từ xa kiểu này được khai báo bằng khóa `serverUrl` (đúng chữ hoa chữ thường). Antigravity thường được cài trên máy của bạn, không phải trên VPS. Khi đó hãy mở đường hầm SSH ở Cách B trước. Bản dòng lệnh (Antigravity CLI) chạy được ngay trên VPS (Cách A).
+
+1. Mở tệp cấu hình.
+   - Antigravity IDE: bấm dấu `…` ở đầu khung agent bên cạnh, chọn **MCP Servers**, rồi **Manage MCP Servers**, rồi **View raw config**.
+   - Antigravity App: bấm **Customizations** ở thanh bên, chọn **Installed**, tìm mục **MCP Servers**, bấm **Copy Config File Path** để lấy đường dẫn tệp, rồi mở tệp đó.
+   - Antigravity CLI: sửa tệp `~/.gemini/config/mcp_config.json` (dùng cho mọi dự án), hoặc `.agents/mcp_config.json` trong thư mục dự án (chỉ dùng cho dự án đó).
+2. Thêm đoạn sau. Nếu tệp đã có `mcpServers`, chỉ thêm dòng `google-drive-rag` vào trong đó:
+
+   ```json
+   {
+     "mcpServers": {
+       "google-drive-rag": {
+         "serverUrl": "http://127.0.0.1:8765/mcp"
+       }
+     }
+   }
+   ```
+
+3. Lưu tệp. Nếu Antigravity chưa nhận ra, bấm **Restart** ở mục máy chủ MCP (trong dấu `⋮` cạnh tên máy chủ), hoặc mở lại Antigravity.
+
+Cách kiểm tra: trong Antigravity App, mục **MCP Servers** hiện `google-drive-rag` với chấm xanh và số công cụ. Trong Antigravity CLI, gõ `/mcp` và nhấn Enter để xem trạng thái. Lần đầu agent gọi một công cụ, Antigravity hỏi bạn cho phép; hãy đọc rồi đồng ý.
+
+Câu hỏi thử: "Dùng google-drive-rag tìm tài liệu về hợp đồng thuê văn phòng."
+
+> **Lưu ý:** Đường dẫn tệp có thể khác giữa các bản Antigravity (một số hướng dẫn khác ghi `~/.gemini/antigravity/mcp_config.json`); hãy dùng đường dẫn mà chính ứng dụng của bạn hiện ra. Tài liệu của Antigravity không nói rõ có chấp nhận địa chỉ `http://` trên máy mình hay không, nên phần này chưa được thử trên máy thật. Nếu Antigravity không kết nối được, chạy `curl http://127.0.0.1:8765/healthz` trên máy đó: phải thấy `{"ok":true}`. Nếu thấy lỗi, đường hầm SSH chưa mở.
+
+### Agent khác
+
+Mọi agent hỗ trợ MCP kiểu Streamable HTTP đều dùng được. Chỉ cần đưa cho nó địa chỉ `http://127.0.0.1:8765/mcp`, không kèm khóa hay mật khẩu. Nếu agent chỉ hỗ trợ MCP chạy qua lệnh (stdio), có thể dùng chương trình trung gian `mcp-remote` mà nhiều agent khuyên dùng: khai báo lệnh `npx mcp-remote http://127.0.0.1:8765/mcp` (cần Node.js trên máy đó). Cách này chưa được thử với dịch vụ này.
 
 ## Kiểm tra kết quả
 
@@ -165,26 +249,26 @@ Kết quả: lệnh `claude mcp list` hiện dòng `google-drive-rag` với tr�
    sudo docker compose exec gdrive-rag gdrive-rag status --skipped
    ```
 
-2. Mở Claude Code và hỏi: "Dùng google-drive-rag tìm tài liệu về <chủ đề của bạn>".
+2. Mở agent của bạn và hỏi: "Dùng google-drive-rag tìm tài liệu về <chủ đề của bạn>".
 
-   Kết quả: Claude trả lời kèm tên tệp, vị trí (trang, trang chiếu hoặc trang tính) và link Drive.
+   Kết quả: agent trả lời kèm tên tệp, vị trí (trang, trang chiếu hoặc trang tính) và link Drive.
 
 ## Tìm trong một thư mục hoặc một tệp
 
-Bạn có thể bảo Claude chỉ tìm trong một thư mục (gồm cả các thư mục con bên trong) hoặc chỉ trong vài tệp. Cách này giúp kết quả gọn và đúng chỗ hơn. Hãy dán link Drive của thư mục hoặc tệp vào câu hỏi, hoặc gọi đúng tên thư mục.
+Bạn có thể bảo agent chỉ tìm trong một thư mục (gồm cả các thư mục con bên trong) hoặc chỉ trong vài tệp. Cách này giúp kết quả gọn và đúng chỗ hơn. Hãy dán link Drive của thư mục hoặc tệp vào câu hỏi, hoặc gọi đúng tên thư mục.
 
-Ví dụ câu hỏi trong Claude Code:
+Ví dụ câu hỏi cho agent:
 
 - "Dùng google-drive-rag tìm 'hạn thanh toán' chỉ trong thư mục https://drive.google.com/drive/folders/…"
-- "Trong thư mục Kế toán, tìm các báo cáo thuế năm 2025." Claude sẽ tự xem cây thư mục để biết thư mục Kế toán ở đâu.
+- "Trong thư mục Kế toán, tìm các báo cáo thuế năm 2025." Agent sẽ tự xem cây thư mục để biết thư mục Kế toán ở đâu.
 - "Chỉ tìm trong tệp https://docs.google.com/document/d/…/edit: điều khoản phạt hợp đồng là gì?"
 - "Thư mục Hợp đồng có những thư mục con nào?"
 
-Kết quả: Claude chỉ trả lời bằng tài liệu nằm trong thư mục hoặc tệp đó. Nếu thư mục hoặc tệp chưa được đọc vào chỉ mục, Claude báo rõ là không tìm thấy nó, thay vì trả về kết quả rỗng.
+Kết quả: agent chỉ trả lời bằng tài liệu nằm trong thư mục hoặc tệp đó. Nếu thư mục hoặc tệp chưa được đọc vào chỉ mục, agent báo rõ là không tìm thấy nó, thay vì trả về kết quả rỗng.
 
 Nguồn vừa thêm cần một lần đọc đầu tiên. Trong lúc đó bạn vẫn tìm được trong các tệp đã đọc xong, kèm một lời nhắc như `source 'Kế toán' is still on its first sync (120 of 433 files indexed)`, nghĩa là mới đọc 120 trên 433 tệp. Kết quả lúc này chưa đủ; hãy hỏi lại khi đọc xong.
 
-> **Lưu ý:** Thư mục mới thêm hoặc mới đổi tên trên Drive được cập nhật ở lần đọc Drive kế tiếp (tối đa 15 phút, hoặc ngay khi bạn nhờ Claude đọc lại Drive). Đổi tên hay chuyển thư mục không làm dịch vụ đọc lại nội dung tệp.
+> **Lưu ý:** Thư mục mới thêm hoặc mới đổi tên trên Drive được cập nhật ở lần đọc Drive kế tiếp (tối đa 15 phút, hoặc ngay khi bạn nhờ agent đọc lại Drive). Đổi tên hay chuyển thư mục không làm dịch vụ đọc lại nội dung tệp.
 
 Muốn tự thử trên VPS, chạy lệnh tìm kèm `--folder` (link thư mục) hoặc `--file` (link tệp, dùng nhiều lần được):
 
@@ -192,24 +276,24 @@ Muốn tự thử trên VPS, chạy lệnh tìm kèm `--folder` (link thư mục
 sudo docker compose exec gdrive-rag gdrive-rag search "báo cáo thuế" --folder "<link thư mục>"
 ```
 
-## Thêm hoặc bớt nguồn ngay trong Claude
+## Thêm hoặc bớt nguồn ngay từ agent
 
-Không cần gõ lệnh và không cần bật `GDRAG_ADMIN_TOOLS`. Ba công cụ sau luôn có sẵn trong Claude Code:
+Không cần gõ lệnh và không cần bật `GDRAG_ADMIN_TOOLS`. Ba công cụ sau luôn có sẵn cho agent:
 
 - `add_source`: thêm một link thư mục hoặc tệp Drive và bắt đầu đọc ngay.
-- `remove_source`: bỏ một nguồn. Claude báo trước sẽ bỏ bao nhiêu tài liệu khỏi chỉ mục, và chỉ làm khi bạn đồng ý.
+- `remove_source`: bỏ một nguồn. Agent báo trước sẽ bỏ bao nhiêu tài liệu khỏi chỉ mục, và chỉ làm khi bạn đồng ý.
 - `set_path_rules`: đặt quy tắc hạ thấp, ẩn hoặc loại tệp (xem hai phần dưới đây). Cũng báo trước, và chỉ làm khi bạn đồng ý.
 
-Ví dụ câu nói với Claude:
+Ví dụ câu nói với agent:
 
 - "Thêm thư mục Drive này làm nguồn: https://drive.google.com/drive/folders/…"
 - "Bỏ nguồn Kế toán đi."
 
-Kết quả: Claude nói rõ đã thêm hay bỏ gì. Nguồn mới được đọc ngay, và lúc đầu chỉ tìm được trong các tệp đã đọc xong.
+Kết quả: agent nói rõ đã thêm hay bỏ gì. Nguồn mới được đọc ngay, và lúc đầu chỉ tìm được trong các tệp đã đọc xong.
 
 Chỉ nguồn Google xác nhận là bạn có quyền mở mới được lưu. Lệnh `source add` trên VPS cũng vậy: nếu Google chưa cho mở, nguồn không được lưu. Sau khi thêm bằng lệnh, dịch vụ đọc nguồn ở lần đọc Drive kế tiếp, hoặc bạn chạy `sudo docker compose exec gdrive-rag gdrive-rag sync`.
 
-Các công cụ đổi quyền Google hay khóa tìm theo ý nghĩa thì vẫn tắt sẵn (xem phần "Quản trị từ Claude").
+Các công cụ đổi quyền Google hay khóa tìm theo ý nghĩa thì vẫn tắt sẵn (xem phần "Quản trị từ agent").
 
 ## Nguồn là thư mục trên VPS
 
@@ -235,7 +319,7 @@ Ngoài Drive, dịch vụ đọc được một thư mục nằm ngay trên VPS,
    sudo docker compose up -d
    ```
 
-4. Thêm một thư mục con của nó làm nguồn. Cách 1, nói với Claude: "Thêm nguồn local:hop-dong" (`hop-dong` là thư mục con trong thư mục gốc; `local:.` là cả thư mục gốc). Cách 2, dùng lệnh:
+4. Thêm một thư mục con của nó làm nguồn. Cách 1, nói với agent: "Thêm nguồn local:hop-dong" (`hop-dong` là thư mục con trong thư mục gốc; `local:.` là cả thư mục gốc). Cách 2, dùng lệnh:
 
    ```bash
    sudo docker compose exec gdrive-rag gdrive-rag source add local:hop-dong
@@ -253,15 +337,15 @@ Những điều nên biết:
 - Nếu chính thư mục nguồn bị xóa trong khi thư mục gốc vẫn bình thường, nguồn đó được dọn khỏi chỉ mục.
 - Drive hỏng hay thiếu quyền Google không ảnh hưởng nguồn trên VPS, và ngược lại.
 - Đổi tên một tệp thì tệp được đọc lại, nhưng không phải tính lại dữ liệu ý nghĩa (bản scan thì nhận dạng chữ lại).
-- Gỡ nguồn: nói "Bỏ nguồn local:hop-dong", Claude báo trước rồi hỏi bạn đồng ý (`remove_source`).
+- Gỡ nguồn: nói "Bỏ nguồn local:hop-dong", agent báo trước rồi hỏi bạn đồng ý (`remove_source`).
 
 ## Hạ thấp, ẩn hoặc loại tệp khỏi chỉ mục
 
-Đôi khi một thư mục chứa bản cũ hay bản gốc đính kèm (ví dụ thư mục `attachments`) và các bản này cứ đứng trên bài viết chính trong kết quả tìm. Bạn có thể đặt quy tắc cho từng nguồn, bằng lệnh dưới đây hoặc bằng cách nhờ Claude (công cụ `set_path_rules`). Có ba loại:
+Đôi khi một thư mục chứa bản cũ hay bản gốc đính kèm (ví dụ thư mục `attachments`) và các bản này cứ đứng trên bài viết chính trong kết quả tìm. Bạn có thể đặt quy tắc cho từng nguồn, bằng lệnh dưới đây hoặc bằng cách nhờ agent (công cụ `set_path_rules`). Có ba loại:
 
 - `demote` (hạ thấp): tệp khớp vẫn được tìm, nhưng mọi kết quả của tệp đó xếp sau 10 tệp khác đứng ngay dưới nó, nên bài viết chính lên trước.
-- `exclude` (ẩn): tệp khớp không hiện trong kết quả tìm. Tệp vẫn nằm trong chỉ mục; Claude vẫn đọc được tệp đó khi bạn đưa link, hoặc khi bạn bảo chỉ tìm trong đúng tệp đó.
-- `ignore` (loại khỏi chỉ mục): dịch vụ không đọc thư mục hoặc tệp đó nữa. Khác với `exclude`, tệp bị xóa khỏi chỉ mục, Claude không đọc được nữa, và dịch vụ không tải về hay xử lý nó. Dùng khi bạn không muốn dịch vụ chạm vào thư mục đó, ví dụ thư mục chứa ảnh nặng hoặc dữ liệu riêng tư.
+- `exclude` (ẩn): tệp khớp không hiện trong kết quả tìm. Tệp vẫn nằm trong chỉ mục; agent vẫn đọc được tệp đó khi bạn đưa link, hoặc khi bạn bảo chỉ tìm trong đúng tệp đó.
+- `ignore` (loại khỏi chỉ mục): dịch vụ không đọc thư mục hoặc tệp đó nữa. Khác với `exclude`, tệp bị xóa khỏi chỉ mục, agent không đọc được nữa, và dịch vụ không tải về hay xử lý nó. Dùng khi bạn không muốn dịch vụ chạm vào thư mục đó, ví dụ thư mục chứa ảnh nặng hoặc dữ liệu riêng tư.
 
 Chọn thế nào: muốn tệp vẫn tìm được nhưng xuống thấp, dùng `demote`. Muốn tệp biến mất khỏi kết quả nhưng vẫn mở được khi có link, dùng `exclude`. Muốn dịch vụ bỏ hẳn, dùng `ignore`.
 
@@ -293,7 +377,7 @@ Các bước:
 
 ### Loại thư mục hoặc tệp khỏi chỉ mục (`ignore`)
 
-Bạn nói với Claude, ví dụ "Đừng đọc thư mục https://drive.google.com/drive/folders/… nữa". Claude trước hết cho xem sẽ loại bao nhiêu tài liệu và thư mục, rồi chỉ làm khi bạn đồng ý. Hoặc dùng lệnh, đưa link thư mục (hoặc tệp), hay mẫu đường dẫn. Một mã Drive viết trơn chỉ được hiểu là mã khi dịch vụ đã biết nó; nếu chưa, hãy dán link hoặc viết `id:<mã>`. Mục nào chưa khớp gì, Claude sẽ cảnh báo để bạn kiểm tra lỗi gõ:
+Bạn nói với agent, ví dụ "Đừng đọc thư mục https://drive.google.com/drive/folders/… nữa". Agent trước hết cho xem sẽ loại bao nhiêu tài liệu và thư mục, rồi chỉ làm khi bạn đồng ý. Hoặc dùng lệnh, đưa link thư mục (hoặc tệp), hay mẫu đường dẫn. Một mã Drive viết trơn chỉ được hiểu là mã khi dịch vụ đã biết nó; nếu chưa, hãy dán link hoặc viết `id:<mã>`. Mục nào chưa khớp gì, agent sẽ cảnh báo để bạn kiểm tra lỗi gõ:
 
 ```bash
 sudo docker compose exec gdrive-rag gdrive-rag source rules <nguồn> --ignore "<link thư mục>"
@@ -301,7 +385,7 @@ sudo docker compose exec gdrive-rag gdrive-rag source rules <nguồn> --ignore "
 
 Với thư mục trên VPS, dùng `local:<đường dẫn>`, ví dụ `local:hop-dong/cu`. Kết quả:
 
-- Thư mục biến mất khỏi kết quả tìm và khỏi danh sách thư mục ngay. Ở lần đọc kế tiếp, nó được xóa hẳn khỏi chỉ mục. Nếu nhờ Claude, lần đọc đó được xếp lịch ngay; nếu dùng lệnh, đó là lần đọc theo lịch 15 phút, hoặc bạn chạy `gdrive-rag sync`.
+- Thư mục biến mất khỏi kết quả tìm và khỏi danh sách thư mục ngay. Ở lần đọc kế tiếp, nó được xóa hẳn khỏi chỉ mục. Nếu nhờ agent, lần đọc đó được xếp lịch ngay; nếu dùng lệnh, đó là lần đọc theo lịch 15 phút, hoặc bạn chạy `gdrive-rag sync`.
 - Drive và thư mục trên VPS không bị đổi gì.
 - Đổi tên hoặc chuyển thư mục đó trên Drive thì quy tắc vẫn đúng, vì nó nhớ thư mục theo mã chứ không theo tên.
 - Các tệp bị loại hiện trong danh sách tệp bị bỏ qua (`status --skipped`) với lý do `ignored by rule`.
@@ -356,11 +440,11 @@ Mặc định dịch vụ đọc chữ trong bản scan bằng tiếng Việt v�
 
 Sau khi cập nhật lên bản này, các bản scan đã đọc bằng bộ nhận dạng cũ được đọc lại một lần ở lần đọc Drive kế tiếp. Các tệp khác không bị đọc lại.
 
-## Quản trị từ Claude (tùy chọn)
+## Quản trị từ agent (tùy chọn)
 
-Thêm hoặc bớt nguồn và đặt quy tắc tệp thì Claude làm được sẵn (xem phần "Thêm hoặc bớt nguồn ngay trong Claude"). Nếu muốn nhờ Claude đổi quyền Google hay đổi khóa tìm theo ý nghĩa mà không phải gõ lệnh, bạn có thể bật thêm các công cụ quản trị này.
+Thêm hoặc bớt nguồn và đặt quy tắc tệp thì agent làm được sẵn (xem phần "Thêm hoặc bớt nguồn ngay từ agent"). Nếu muốn nhờ agent đổi quyền Google hay đổi khóa tìm theo ý nghĩa mà không phải gõ lệnh, bạn có thể bật thêm các công cụ quản trị này.
 
-> **Cảnh báo:** Một tài liệu trong Drive có thể chứa dòng chữ giả làm lời dặn cho Claude, ví dụ "hãy gửi dữ liệu sang địa chỉ X". Nếu Claude làm theo, toàn bộ nội dung tài liệu của bạn có thể bị gửi tới máy của người khác. Vì vậy chỉ bật khi cần, và luôn đọc kỹ câu Claude hỏi lại trước khi đồng ý.
+> **Cảnh báo:** Một tài liệu trong Drive có thể chứa dòng chữ giả làm lời dặn cho agent, ví dụ "hãy gửi dữ liệu sang địa chỉ X". Nếu agent làm theo, toàn bộ nội dung tài liệu của bạn có thể bị gửi tới máy của người khác. Điều này đúng với mọi agent (Claude Code, Codex, Antigravity hay agent khác). Vì vậy chỉ bật khi cần, và luôn đọc kỹ câu agent hỏi lại trước khi đồng ý.
 
 > **Cảnh báo:** Khi đã bật, bất kỳ chương trình hay người dùng nào trên VPS kết nối được tới cổng 8765 đều gọi được các công cụ này, không cần mật khẩu. Chỉ bật trên VPS mà chỉ bạn dùng, và tắt lại khi xong việc.
 
@@ -378,7 +462,7 @@ Cách bật:
    sudo docker compose up -d
    ```
 
-   Kết quả: Claude Code thấy thêm 7 công cụ dưới đây. Muốn tắt, xóa dòng đó rồi chạy lại lệnh trên.
+   Kết quả: agent thấy thêm 7 công cụ dưới đây. Muốn tắt, xóa dòng đó rồi chạy lại lệnh trên.
 
 | Công cụ | Việc làm |
 | --- | --- |
@@ -392,17 +476,17 @@ Cách bật:
 
 Những điều nên biết:
 
-- Việc có thể làm mất dữ liệu (bỏ nguồn, đổi hoặc xóa quyền Google, đổi khóa tìm theo ý nghĩa) luôn chạy hai lần: lần đầu Claude chỉ kể sẽ xảy ra gì, lần sau mới làm khi bạn đồng ý.
+- Việc có thể làm mất dữ liệu (bỏ nguồn, đổi hoặc xóa quyền Google, đổi khóa tìm theo ý nghĩa) luôn chạy hai lần: lần đầu agent chỉ kể sẽ xảy ra gì, lần sau mới làm khi bạn đồng ý.
 - Đổi sang địa chỉ khác thì phải đưa khóa mới của địa chỉ đó; khóa cũ không bao giờ được gửi sang máy khác. Địa chỉ phải bắt đầu bằng `https://`. Máy trong mạng nội bộ (ghi bằng số, ví dụ `http://192.168.1.5:8080/v1`) chỉ dùng được khi đã thêm dòng `GDRAG_ALLOW_LOCAL_EMBEDDINGS=1` vào `.env`.
 - Máy nối qua Tailscale (địa chỉ dạng `100.x.y.z`) hoặc mạng dùng chung kiểu CGNAT cũng được tính là mạng nội bộ, nên cũng cần dòng `GDRAG_ALLOW_LOCAL_EMBEDDINGS=1`.
-- Khóa đã lưu gắn với địa chỉ nó được tạo cho. Nếu bạn xóa dòng `GDRAG_EMBEDDING_BASE_URL` khỏi `.env` hoặc đổi sang địa chỉ khác, khóa đã lưu không được dùng nữa: dịch vụ chỉ tìm theo chữ, và `sync_status` kèm cảnh báo. Hãy khôi phục dòng đó, hoặc nhờ Claude đặt khóa mới bằng `set_embedding`. Khóa ghi trong `.env` (`GDRAG_EMBEDDING_API_KEY`) không bị ràng buộc như vậy. Khóa lưu từ bản cũ được gắn với địa chỉ đang dùng ở lần khởi động đầu tiên sau khi cập nhật.
+- Khóa đã lưu gắn với địa chỉ nó được tạo cho. Nếu bạn xóa dòng `GDRAG_EMBEDDING_BASE_URL` khỏi `.env` hoặc đổi sang địa chỉ khác, khóa đã lưu không được dùng nữa: dịch vụ chỉ tìm theo chữ, và `sync_status` kèm cảnh báo. Hãy khôi phục dòng đó, hoặc nhờ agent đặt khóa mới bằng `set_embedding`. Khóa ghi trong `.env` (`GDRAG_EMBEDDING_API_KEY`) không bị ràng buộc như vậy. Khóa lưu từ bản cũ được gắn với địa chỉ đang dùng ở lần khởi động đầu tiên sau khi cập nhật.
 - Xóa quyền Google chỉ xóa bản lưu trên VPS, không thu hồi quyền ở phía Google. Muốn thu hồi hẳn: với đăng nhập Gmail, gỡ ứng dụng tại https://myaccount.google.com/permissions; với tài khoản dịch vụ, xóa khóa của nó trong Google Cloud hoặc thôi chia sẻ thư mục.
 - Thư mục `secrets` chỉ nên chứa những tệp dịch vụ này cần (tệp quyền Google, tệp khóa tìm theo ý nghĩa). Đừng để ở đó khóa hay mật khẩu của việc khác.
-- Tệp khóa phải nằm trong thư mục `secrets`. Claude chỉ cần tên tệp, ví dụ `openrouter.key`, nên khóa không phải dán vào cuộc trò chuyện. Công cụ không đọc được tệp nằm ngoài thư mục này.
+- Tệp khóa phải nằm trong thư mục `secrets`. Agent chỉ cần tên tệp, ví dụ `openrouter.key`, nên khóa không phải dán vào cuộc trò chuyện. Công cụ không đọc được tệp nằm ngoài thư mục này.
 - Khóa và mã đăng nhập không bao giờ hiện trong câu trả lời, trong `sync_status` hay trong nhật ký.
 - Nếu `.env` đang ghi sẵn khóa, địa chỉ hay tệp Google, hãy chạy một lần `sudo docker compose exec gdrive-rag gdrive-rag config import-env`. Lệnh này lưu các giá trị đó vào dịch vụ (không in khóa ra) và liệt kê những dòng trong `.env` có thể để trống. Để trống các dòng đó rồi chạy `sudo docker compose up -d`.
-- Giá trị ghi trong `.env` luôn thắng. Nếu `.env` đã ghi một giá trị khác, công cụ từ chối và nói tên dòng cần xóa trong `.env`. Muốn quản lý một mục bằng Claude, hãy để trống dòng đó trong `.env` rồi dựng lại dịch vụ. `sync_status` cho biết mỗi mục lấy từ `.env` ("environment"), từ công cụ hoặc lệnh ("stored") hay mặc định ("default").
-- Sau khi đổi quyền Google, Drive chưa được đọc lại ngay. Hãy chia sẻ các thư mục cho tài khoản mới trước, rồi nhờ Claude gọi `sync_now`. Một thư mục mà tài khoản mới không mở được sẽ bị bỏ khỏi chỉ mục ở lần đọc kế tiếp.
+- Giá trị ghi trong `.env` luôn thắng. Nếu `.env` đã ghi một giá trị khác, công cụ từ chối và nói tên dòng cần xóa trong `.env`. Muốn quản lý một mục bằng agent, hãy để trống dòng đó trong `.env` rồi dựng lại dịch vụ. `sync_status` cho biết mỗi mục lấy từ `.env` ("environment"), từ công cụ hoặc lệnh ("stored") hay mặc định ("default").
+- Sau khi đổi quyền Google, Drive chưa được đọc lại ngay. Hãy chia sẻ các thư mục cho tài khoản mới trước, rồi nhờ agent gọi `sync_now`. Một thư mục mà tài khoản mới không mở được sẽ bị bỏ khỏi chỉ mục ở lần đọc kế tiếp.
 - Nguồn ghi trong `GDRAG_DRIVE_LINKS` không bỏ được bằng công cụ, vì lần khởi động sau nó sẽ được thêm lại.
 - Khi Drive đang được đọc, việc bỏ nguồn bị từ chối; hãy thử lại khi `sync_status` báo đã xong. Các thay đổi khác được lưu ngay và dùng từ bước đọc kế tiếp.
 
@@ -415,4 +499,4 @@ Những điều nên biết:
 | `Permission denied` khi đọc `/secrets/google.json` | Tệp chưa giao cho dịch vụ | Chạy lại bước 4 |
 | `status` báo tệp lỗi | Tệp hỏng, có mật khẩu hoặc quá 200 MB | Mở tệp trên Drive để kiểm tra; các tệp khác không bị ảnh hưởng |
 | `ocr_unavailable` lớn hơn 0 | Thiếu chương trình Tesseract hoặc dữ liệu của một ngôn ngữ trong `GDRAG_OCR_LANGS`, nên trang scan chưa có chữ | Kiểm tra mục "Đọc bản scan bằng ngôn ngữ khác", rồi dựng lại container bằng bước 5. Tệp sẽ được đọc lại khi OCR chạy được |
-| Claude Code không thấy công cụ | Dịch vụ chưa chạy hoặc chưa đăng ký | Chạy `sudo docker compose ps`, rồi lặp lại phần "Kết nối với Claude Code" |
+| Agent không thấy công cụ | Dịch vụ chưa chạy, agent chưa đăng ký dịch vụ, hoặc agent chạy trên máy khác mà chưa mở đường hầm SSH | Chạy `sudo docker compose ps` và `curl http://127.0.0.1:8765/healthz` trên máy chạy agent, rồi làm lại phần "Kết nối với agent" cho đúng agent của bạn |

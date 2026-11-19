@@ -1,6 +1,6 @@
 # CLAUDE.md
 
-google-drive-rag is a single-process RAG service over Google Drive: an MCP server (Streamable HTTP at `/mcp`, plus `/healthz`) and a background sync loop, packaged as one Docker container. The owner is not a programmer and reads Vietnamese; `README.md` is their install guide and must stay in Vietnamese.
+google-drive-rag is a single-process RAG service over Google Drive: a standard MCP server (Streamable HTTP at `/mcp`, plus `/healthz`) that serves any MCP client (Claude Code, OpenAI Codex, Google Antigravity, others) and a background sync loop, packaged as one Docker container. The README section "Kết nối với agent" holds the setup for each client; keep it agent-neutral. The owner is not a programmer and reads Vietnamese; `README.md` is their install guide and must stay in Vietnamese.
 
 ## Commands
 
