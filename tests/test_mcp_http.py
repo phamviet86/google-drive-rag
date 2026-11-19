@@ -85,6 +85,7 @@ def test_healthz(running: tuple[str, Service]) -> None:
 def test_tools_list(running: tuple[str, Service]) -> None:
     url, _ = running
     tools = {tool.name: tool for tool in call(url, "tools/list").tools}
+    source_tools = {"add_source", "remove_source", "set_path_rules"}  # always registered
     assert set(tools) == {
         "search",
         "read",
@@ -92,7 +93,10 @@ def test_tools_list(running: tuple[str, Service]) -> None:
         "list_folders",
         "sync_status",
         "sync_now",
+        *source_tools,
     }
+    for name in source_tools:
+        assert tools.pop(name).annotations.read_only_hint is False  # type: ignore[union-attr]
     for name, tool in tools.items():
         assert tool.title
         assert tool.annotations is not None

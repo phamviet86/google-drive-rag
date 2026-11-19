@@ -35,6 +35,7 @@ REFRESH = "1//REFRESHTOKENVALUE"
 CODE = "4/AUTHCODEVALUE"
 SECRETS = (API_KEY, "PRIVATEKEYMATERIAL", CLIENT_SECRET, REFRESH, CODE)
 READ_ONLY = {"search", "read", "list_sources", "list_folders", "sync_status", "sync_now"}
+SOURCE_TOOLS = {"add_source", "remove_source", "set_path_rules"}  # registered with the switch off
 ADMIN_TOOLS = {
     "add_source",
     "remove_source",
@@ -189,7 +190,7 @@ def test_admin_tools_are_off_by_default(tmp_path: Path, monkeypatch: pytest.Monk
 
     import anyio
 
-    assert anyio.run(names, create_server(service)) == READ_ONLY
+    assert anyio.run(names, create_server(service)) == READ_ONLY | SOURCE_TOOLS
     assert anyio.run(names, create_server(service, Admin(service))) == READ_ONLY | ADMIN_TOOLS
 
 
