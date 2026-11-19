@@ -199,6 +199,7 @@ def test_admin_listing_and_annotations(env: Env) -> None:
     assert set(tools) == READ_ONLY | ADMIN_TOOLS
     destructive = {
         "remove_source",
+        "set_path_rules",  # ignore entries remove indexed documents
         "set_google_service_account",
         "google_auth_finish",
         "remove_google_auth",
