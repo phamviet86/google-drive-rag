@@ -247,7 +247,9 @@ Những điều nên biết:
 
 - Tệp và thư mục có tên bắt đầu bằng dấu chấm (như `.git`) hoặc tệp khóa tạm của Word (`~$...`) bị bỏ qua.
 - Đường dẫn ngoài thư mục gốc bị từ chối, giống như không có.
-- Thư mục gốc trống, chưa gắn (ví dụ ổ đĩa chưa cắm) hoặc không đọc được: dịch vụ báo lỗi trong `sync_status` (mục `local_folder`) và không xóa gì khỏi chỉ mục. Cắm lại ổ đĩa là xong.
+- Thư mục `secrets` và thư mục dữ liệu của dịch vụ không bao giờ bị đọc, kể cả khi chúng nằm trong thư mục gốc. Tệp trông giống khóa bí mật (khóa riêng, tệp khóa Google, mã đăng nhập) cũng bị từ chối và hiện là tệp lỗi.
+- Tên tiếng Việt có dấu được nhận đúng, kể cả tên tệp chép từ máy Mac.
+- Thư mục gốc trống, chưa gắn (ví dụ ổ đĩa chưa cắm) hoặc không đọc được: dịch vụ báo lỗi trong `sync_status` (mục `local_folder`) và không xóa gì khỏi chỉ mục. Cắm lại ổ đĩa là xong. Điều này cũng đúng với một thư mục nguồn bên trong, ví dụ ổ USB: nếu nó bỗng trống trong khi đã có tài liệu, dịch vụ không xóa gì.
 - Nếu chính thư mục nguồn bị xóa trong khi thư mục gốc vẫn bình thường, nguồn đó được dọn khỏi chỉ mục.
 - Drive hỏng hay thiếu quyền Google không ảnh hưởng nguồn trên VPS, và ngược lại.
 - Đổi tên một tệp thì tệp được đọc lại, nhưng không phải tính lại dữ liệu ý nghĩa (bản scan thì nhận dạng chữ lại).
@@ -291,7 +293,7 @@ Các bước:
 
 ### Loại thư mục hoặc tệp khỏi chỉ mục (`ignore`)
 
-Bạn nói với Claude, ví dụ "Đừng đọc thư mục https://drive.google.com/drive/folders/… nữa". Claude trước hết cho xem sẽ loại bao nhiêu tài liệu và thư mục, rồi chỉ làm khi bạn đồng ý. Hoặc dùng lệnh, đưa link thư mục (hoặc tệp), hay mẫu đường dẫn:
+Bạn nói với Claude, ví dụ "Đừng đọc thư mục https://drive.google.com/drive/folders/… nữa". Claude trước hết cho xem sẽ loại bao nhiêu tài liệu và thư mục, rồi chỉ làm khi bạn đồng ý. Hoặc dùng lệnh, đưa link thư mục (hoặc tệp), hay mẫu đường dẫn. Một mã Drive viết trơn chỉ được hiểu là mã khi dịch vụ đã biết nó; nếu chưa, hãy dán link hoặc viết `id:<mã>`. Mục nào chưa khớp gì, Claude sẽ cảnh báo để bạn kiểm tra lỗi gõ:
 
 ```bash
 sudo docker compose exec gdrive-rag gdrive-rag source rules <nguồn> --ignore "<link thư mục>"
@@ -299,7 +301,7 @@ sudo docker compose exec gdrive-rag gdrive-rag source rules <nguồn> --ignore "
 
 Với thư mục trên VPS, dùng `local:<đường dẫn>`, ví dụ `local:hop-dong/cu`. Kết quả:
 
-- Thư mục biến mất khỏi kết quả tìm ngay. Ở lần đọc kế tiếp, nó được xóa hẳn khỏi chỉ mục. Nếu nhờ Claude, lần đọc đó được xếp lịch ngay; nếu dùng lệnh, đó là lần đọc theo lịch 15 phút, hoặc bạn chạy `gdrive-rag sync`.
+- Thư mục biến mất khỏi kết quả tìm và khỏi danh sách thư mục ngay. Ở lần đọc kế tiếp, nó được xóa hẳn khỏi chỉ mục. Nếu nhờ Claude, lần đọc đó được xếp lịch ngay; nếu dùng lệnh, đó là lần đọc theo lịch 15 phút, hoặc bạn chạy `gdrive-rag sync`.
 - Drive và thư mục trên VPS không bị đổi gì.
 - Đổi tên hoặc chuyển thư mục đó trên Drive thì quy tắc vẫn đúng, vì nó nhớ thư mục theo mã chứ không theo tên.
 - Các tệp bị loại hiện trong danh sách tệp bị bỏ qua (`status --skipped`) với lý do `ignored by rule`.
