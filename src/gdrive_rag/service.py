@@ -8,6 +8,10 @@ folder of each document, so "inside folder X or below" is an ID lookup.
 Deletion is conservative: a document leaves the index only when every source that held it was
 listed completely, or its source root is explicitly gone (404 / not shared). Auth, quota and
 network failures never delete anything.
+
+Local folder sources (``local.py``) go through the same pass with their own backend: each source
+uses the backend of its kind, so Google access missing or failing never stops local sources and
+a missing local mount never stops Drive sources.
 """
 
 from __future__ import annotations
@@ -15,10 +19,12 @@ from __future__ import annotations
 import contextlib
 import datetime as dt
 import fcntl
+import hashlib
 import json
 import logging
 import math
 import os
+import re
 import struct
 import threading
 import time
@@ -43,6 +49,8 @@ from .drive import (
     display_segment,
     drive_link,
     folder_link,
+    is_local_id,
+    local_id,
     parse_drive_link,
     split_supported,
     strip_data_images,
@@ -50,6 +58,7 @@ from .drive import (
 from .embeddings import EmbeddingClient, EmbeddingError
 from .extract import Extractor
 from .extraction_errors import ExtractionError
+from .local import LocalBackend, default_local_backend, is_local_input
 from .rules import EFFECTS, clean, effects
 from .search import EMBEDDING_IDENTITY_KEY, REVISION_KEY, SearchEngine
 
@@ -57,6 +66,8 @@ log = logging.getLogger("gdrive_rag")
 
 BackendFactory = Callable[[Settings], DriveBackend]
 EmbeddingFactory = Callable[[Settings], EmbeddingClient | None]
+LocalFactory = Callable[[Settings], LocalBackend]
+DRIVE, LOCAL = "drive", "local"  # backend families: a source uses the backend of its kind
 ERROR_RETRY_HOURS = 24
 DOWNLOAD_ERROR_PREFIX = "download: "  # download errors are retried on every sync
 EMBED_BATCH = 64
@@ -148,6 +159,7 @@ class Service:
         backend_factory: BackendFactory = default_backend,
         embedding_factory: EmbeddingFactory = default_embeddings,
         extractor_factory: Callable[[Settings], Extractor] = default_extractor,
+        local_factory: LocalFactory = default_local_backend,
     ):
         self._load = settings_loader
         self.settings = settings_loader()
@@ -157,6 +169,7 @@ class Service:
         self.backend_factory = backend_factory
         self.embedding_factory = embedding_factory
         self.extractor_factory = extractor_factory
+        self.local_factory = local_factory
         self.search_engine = SearchEngine(self.db, self._embeddings)
         # On-demand sync requests (MCP ``sync_now``), run by ``server.SyncLoop`` in its thread.
         self.wake = threading.Event()
@@ -180,6 +193,9 @@ class Service:
         backend: DriveBackend | None = None
         backend_error = ""
         for link in links:
+            if is_local_input(link):
+                results.append(self._add_local(link))
+                continue
             try:
                 root_id = parse_drive_link(link)
             except ValueError as exc:
@@ -203,30 +219,49 @@ class Service:
                     status, error = "error", str(exc)
                 except DriveSourceError as exc:
                     error = str(exc)
-            with self.db.transaction() as connection:
-                cursor = connection.execute(
-                    "INSERT INTO sources(link,root_id,kind,drive_id,name,last_status,last_error) "
-                    "VALUES(?,?,?,?,?,?,?)",
-                    (
-                        drive_link(root.id, root.kind),
-                        root.id,
-                        root.kind,
-                        root.drive_id,
-                        root.name,
-                        status,
-                        error,
-                    ),
-                )
-                if root.kind in {"folder", "shared_drive"} and status != "error":
-                    # known at once, so search(folder=<root>) works during the first sync
-                    _register_folders(
-                        connection,
-                        int(cursor.lastrowid or 0),
-                        [DriveFolder(root.id, root.name, "")],
-                    )
-            row = self._source_row(root_id)
+            row = self._insert_source(root, status, error)
             results.append({"link": link, "ok": status != "error", **(row or {})})
         return results
+
+    def _add_local(self, link: str) -> dict[str, Any]:
+        """A local source is stored only when the path exists inside the local root now.
+        Errors never repeat the path given (it may point outside the root)."""
+        try:
+            backend = self.local_factory(self.settings)
+            root_id = backend.parse(link)
+            existing = self._source_row(root_id)
+            if existing is not None:
+                return {"link": link, "ok": True, "already_added": True, **existing}
+            root = backend.resolve(root_id)
+        except (ValueError, DriveItemError, DriveSourceError) as exc:
+            return {"link": link, "ok": False, "error": str(exc)}
+        return {"link": link, "ok": True, **(self._insert_source(root, "pending", None) or {})}
+
+    def _insert_source(
+        self, root: DriveRoot, status: str, error: str | None
+    ) -> dict[str, Any] | None:
+        with self.db.transaction() as connection:
+            cursor = connection.execute(
+                "INSERT INTO sources(link,root_id,kind,drive_id,name,last_status,last_error) "
+                "VALUES(?,?,?,?,?,?,?)",
+                (
+                    drive_link(root.id, root.kind),
+                    root.id,
+                    root.kind,
+                    root.drive_id,
+                    root.name,
+                    status,
+                    error,
+                ),
+            )
+            if root.kind in {"folder", "shared_drive", "local_folder"} and status != "error":
+                # known at once, so search(folder=<root>) works during the first sync
+                _register_folders(
+                    connection,
+                    int(cursor.lastrowid or 0),
+                    [DriveFolder(root.id, root.name, "")],
+                )
+        return self._source_row(root.id)
 
     def discard_source(self, source_id: int) -> None:
         """Drop a just-added source that holds no documents yet (no sync lock needed)."""
@@ -319,6 +354,13 @@ class Service:
     def _find_source(self, value: str) -> dict[str, Any]:
         with contextlib.suppress(ValueError):
             value = parse_drive_link(value)
+        if value.startswith("/") and self.settings.local_root is not None:
+            # an absolute path inside the local root names that local source (lexically: the
+            # path itself may be gone, which is why the source is being removed)
+            root = os.path.realpath(self.settings.local_root)
+            inside = os.path.normpath(value)
+            if os.path.commonpath([root, inside]) == root:
+                value = local_id(os.path.relpath(inside, root).replace(os.sep, "/"))
         with self.db.read() as connection:
             row = connection.execute(
                 "SELECT * FROM sources WHERE CAST(id AS TEXT)=? OR root_id=? OR name=? "
@@ -481,11 +523,21 @@ class Service:
         # sources whose first sync has not finished: their documents and folders are linked
         # while the pass runs, so search can scope to them before the pass ends
         fresh = {s["id"] for s in sources if not s["first_sync_done"]}
-        try:
-            backend = self.backend_factory(self.settings)
-        except Exception as exc:
-            message = _message(exc)
+        # one backend per family, made only when a source of that family is synced: Google
+        # access not configured (or failing) leaves local sources alone, and the other way round
+        backends: dict[str, DriveBackend] = {}
+        unavailable: dict[str, str] = {}
+        for family in sorted({_family(s["root_id"]) for s in sources}):
+            try:
+                if family == LOCAL:
+                    backends[family] = self.local_factory(self.settings)
+                else:
+                    backends[family] = self.backend_factory(self.settings)
+            except Exception as exc:
+                unavailable[family] = _message(exc)
+        if not backends:
             for source in sources:
+                message = unavailable[_family(source["root_id"])]
                 self._set_source_status(source["id"], "error", message)
                 report["sources"].append({"name": source["name"], "ok": False, "error": message})
             return report
@@ -495,6 +547,14 @@ class Service:
         degraded: set[int] = {s["id"] for s in every} - {s["id"] for s in sources}
         for source in sources:
             outcome = {"name": source["name"], "ok": True}
+            family = _family(source["root_id"])
+            if family in unavailable:
+                degraded.add(source["id"])
+                self._set_source_status(source["id"], "error", unavailable[family])
+                outcome.update(ok=False, error=unavailable[family])
+                report["sources"].append(outcome)
+                continue
+            backend = backends[family]
             try:
                 root = DriveRoot(
                     source["root_id"], source["name"], source["kind"], source["drive_id"]
@@ -540,27 +600,31 @@ class Service:
                 unique.setdefault(item.id, item)
                 holders.setdefault(item.id, []).append(listed_by)
         extractor = self.extractor_factory(self.settings)
-        stop = ""
+        stopped: dict[str, str] = {}  # family -> why its pass stopped
         if progress is not None:
             progress.phase("extracting")
         for item in unique.values():
-            if stop:
-                break
+            family = _family(item.id)
+            if family in stopped:
+                continue
             try:
-                report[self._index_item(backend, extractor, item)] += 1
-            except DriveSourceError as exc:  # sign-in or connection: stop, delete nothing
-                stop = str(exc)
+                report[self._index_item(backends[family], extractor, item)] += 1
+            except DriveSourceError as exc:  # sign-in, connection or mount: stop, delete nothing
+                stopped[family] = str(exc)
                 report["failed"] += 1
             early = [h for h in holders[item.id] if h in fresh]
-            if early and not stop:
+            if early and family not in stopped:
                 self._link_early(item, early)
             if progress is not None:
                 for holder in holders[item.id]:
                     if entry := progress.source(holder):
                         entry["files_done"] += 1
                 progress.write()
-        if stop:
-            report["stopped"] = stop
+        if stopped:
+            report["stopped"] = "; ".join(stopped[f] for f in sorted(stopped))
+        # sources whose family stopped: their membership is kept as it is, like a failed source
+        root_ids = {s["id"]: str(s["root_id"]) for s in sources}
+        halted = {sid for sid in listings if _family(root_ids[sid]) in stopped}
         folders: dict[str, DriveFolder] = {}
         for found in listings.values():  # a folder seen as a root and as a child: keep the parent
             for folder in found.folders if found else ():
@@ -579,7 +643,12 @@ class Service:
                      parent_id=CASE WHEN excluded.parent_id='' AND ? THEN folders.parent_id
                                     ELSE excluded.parent_id END""",
                 [
-                    (f.id, f.name, f.parent_id, int(bool(stop or held.get(f.id, set()) & degraded)))
+                    (
+                        f.id,
+                        f.name,
+                        f.parent_id,
+                        int(bool(held.get(f.id, set()) & (degraded | halted))),
+                    )
                     for f in folders.values()
                 ],
             )
@@ -588,13 +657,13 @@ class Service:
                 for row in connection.execute("SELECT file_id, id FROM documents")
             }
             for source_id, found in listings.items():
-                if found is None or (found.complete and not stop):  # same rule as documents
+                if found is None or (found.complete and source_id not in halted):  # as documents
                     connection.execute("DELETE FROM folder_sources WHERE source_id=?", (source_id,))
                 connection.executemany(
                     "INSERT OR IGNORE INTO folder_sources VALUES(?,?)",
                     [(folder.id, source_id) for folder in (found.folders if found else ())],
                 )
-                if found is None or (found.complete and not stop):
+                if found is None or (found.complete and source_id not in halted):
                     connection.execute(
                         "DELETE FROM document_sources WHERE source_id=?", (source_id,)
                     )
@@ -613,7 +682,7 @@ class Service:
                         for f in (found.skipped if found else ())
                     ],
                 )
-                if found is not None and not stop:
+                if found is not None and source_id not in halted:
                     connection.execute(
                         "UPDATE sources SET first_synced_at=? "
                         "WHERE id=? AND first_synced_at IS NULL",
@@ -686,7 +755,7 @@ class Service:
                 data = download.data
                 if item.mime_type == GOOGLE_DOC:
                     data = strip_data_images(data)
-                temporary = self.settings.work_dir / f"{item.id}{download.suffix}"
+                temporary = self.settings.work_dir / f"{_temp_name(item.id)}{download.suffix}"
                 temporary.write_bytes(data)
                 document = extractor.extract(temporary)
             except Exception as exc:
@@ -1109,6 +1178,7 @@ class Service:
                 "warning": settings.embedding_warning,
             },
             "google_auth": settings.google_auth,
+            "local_folder": self._local_state(),
             "settings_from": setting_origins(settings.data_dir),
             "sync": {
                 "running": running,
@@ -1121,6 +1191,18 @@ class Service:
                 "last_report": json.loads(self.db.get_meta("last_sync_report") or "null"),
             },
         }
+
+    def _local_state(self) -> dict[str, Any]:
+        """Whether local sources can be read: GDRAG_LOCAL_ROOT set, mounted and not empty."""
+        try:
+            backend = self.local_factory(self.settings)
+        except DriveSourceError as exc:
+            return {"configured": False, "ok": False, "error": str(exc)}
+        try:
+            backend.check()
+        except DriveSourceError as exc:
+            return {"configured": True, "ok": False, "error": str(exc)}
+        return {"configured": True, "ok": True, "error": None}
 
 
 _SOURCE_SQL = """SELECT s.*,
@@ -1272,6 +1354,18 @@ def _locator_has_page(locator: str, page: int) -> bool:
         if int(start) <= page <= int(end or start):
             return True
     return False
+
+
+def _family(identifier: str) -> str:
+    """Which backend reads a source root or file: ``local`` for ``local:`` IDs, else ``drive``."""
+    return LOCAL if is_local_id(identifier) else DRIVE
+
+
+def _temp_name(identifier: str) -> str:
+    """A file name for the extraction copy: Drive IDs as they are, others (local paths) hashed."""
+    if re.fullmatch(r"[A-Za-z0-9_-]{1,128}", identifier):
+        return identifier
+    return hashlib.sha256(identifier.encode("utf-8")).hexdigest()[:32]
 
 
 def _message(exc: BaseException) -> str:

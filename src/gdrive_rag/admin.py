@@ -1,5 +1,7 @@
-"""Admin operations shared by the CLI and the optional admin MCP tools: Drive sources, Google
-access and the embedding endpoint.
+"""Admin operations shared by the CLI and the MCP tools: sources (Drive and local), search path
+rules, Google access and the embedding endpoint. The three source tools (``add_source``,
+``remove_source``, ``set_path_rules``) are always registered; the others only with
+``GDRAG_ADMIN_TOOLS``.
 
 Rules every operation follows:
 
@@ -10,7 +12,8 @@ Rules every operation follows:
 - Destructive operations take ``confirm``; without it they change nothing and say what would
   happen.
 - File inputs are names inside the secrets folder (``GDRAG_SECRETS_DIR``, ``/secrets`` in
-  Docker), resolved with symlinks and refused outside it.
+  Docker), resolved with symlinks and refused outside it. Local sources are paths inside the
+  local folder (``GDRAG_LOCAL_ROOT``, ``/local`` in Docker), confined the same way.
 - No result or error contains a key, token, client secret or file contents. The pasted OAuth
   redirect and the API key are never repeated.
 - Settings changes are saved at once: search uses them immediately, the sync loop from its next
@@ -51,6 +54,7 @@ from .config import (
 )
 from .drive import parse_drive_link
 from .embeddings import OpenAICompatibleEmbeddings
+from .local import is_local_input
 from .rules import clean
 from .search import EMBEDDING_IDENTITY_KEY
 from .service import Service, SyncBusy
@@ -140,9 +144,15 @@ class Admin:
             raise AdminRefused("cannot read that file (check its owner and mode)") from None
 
     # -- sources -------------------------------------------------------------------------------
-    def add_source(self, link: str) -> dict[str, Any]:
+    def add_source(self, link: str, queue: bool = True) -> dict[str, Any]:
+        """Add a Drive link (stored only when Google confirms it) or a local path (stored only
+        when it exists inside the local folder). ``queue`` asks this process's sync loop to read
+        it now; the CLI passes False (the server picks it up at its next scheduled sync)."""
+        local = is_local_input(link)
         result = self.service.add_sources([link])[0]
-        if "id" not in result:  # not a Drive link: nothing was stored
+        if "id" not in result:  # nothing was stored
+            if local:  # these messages never repeat the path given
+                raise AdminRefused(f"could not add: {result.get('error')}")
             raise AdminRefused("could not add: not a Google Drive folder or file link")
         answer = {"applied": not result.get("already_added"), "source": _source(result)}
         if result.get("already_added"):
@@ -156,6 +166,12 @@ class Admin:
                 "Google did not confirm that link or ID (not found, not shared with the Google "
                 "account in use, or Google access is not set up); nothing was added"
             )
+        if not queue:
+            answer["message"] = (
+                "Source added. The server reads it at its next scheduled sync; to read it now, "
+                "run: gdrive-rag sync"
+            )
+            return answer
         answer["sync"] = self.service.queue_sync(int(result["id"]))
         answer["message"] = "Source added; it is read in the background. Check sync_status."
         return answer
@@ -167,9 +183,10 @@ class Admin:
                 "this source is listed in GDRAG_DRIVE_LINKS and would come back at the next "
                 "restart; remove it from .env first"
             )
+        where = "The local files are" if preview["root_id"].startswith("local:") else "Drive is"
         message = (
             f"Removing source {preview['name']!r} drops {preview['documents_removed']} documents "
-            "from the index (documents another source also holds stay). Drive is not changed."
+            f"from the index (documents another source also holds stay). {where} not changed."
         )
         if not confirm:
             return {"applied": False, "confirm_needed": True, "would": message, **preview}

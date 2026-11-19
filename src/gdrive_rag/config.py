@@ -25,7 +25,9 @@ DEFAULT_DIMENSIONS = 1024
 DEFAULT_QUERY_INSTRUCTION = (
     "Given a search question, retrieve relevant passages from documents that answer it"
 )
-DERIVED_FIELDS = {"data_dir", "embedding_key_from_env"}  # never stored in config.json
+# never stored in config.json; local_root comes from GDRAG_LOCAL_ROOT only
+DERIVED_FIELDS = {"data_dir", "embedding_key_from_env", "local_root"}
+LOCAL_ROOT_ENV = "GDRAG_LOCAL_ROOT"
 AUTH_METHODS = ("none", "service_account", "oauth")
 
 # Environment variable -> config field. Values from the environment win over config.json.
@@ -58,6 +60,9 @@ class Settings:
     chunk_chars: int = 1500
     chunk_overlap: int = 200
     embedding_key_from_env: bool = False  # derived: GDRAG_EMBEDDING_API_KEY is set
+    # derived: the folder local sources live in (GDRAG_LOCAL_ROOT, environment only, like
+    # GDRAG_SECRETS_DIR); None = local sources are not available
+    local_root: Path | None = None
 
     @property
     def db_path(self) -> Path:
@@ -160,6 +165,9 @@ def load_settings(data_dir: str | Path | None = None, *, use_env: bool = True) -
         if key in stored:
             values[key] = stored[key]
     if use_env:
+        local_root = os.environ.get(LOCAL_ROOT_ENV, "").strip()
+        if local_root:
+            values["local_root"] = Path(local_root).expanduser()
         for env_name, key in ENV_FIELDS.items():
             raw = os.environ.get(env_name)
             if raw is not None and raw.strip():
