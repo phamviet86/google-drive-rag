@@ -76,8 +76,8 @@ def test_cgnat_needs_the_local_flag(url: str, monkeypatch: pytest.MonkeyPatch) -
 
 def test_public_and_mapped_public_addresses_still_pass() -> None:
     netcheck.check("https://93.184.216.34/v1", allow_local=False)
-    # IPv4-mapped IPv6 literals stay refused (the ::/8 block is reserved), whatever they wrap
-    for mapped in ("::ffff:8.8.8.8", "::ffff:127.0.0.1", "::ffff:100.64.0.1"):
+    # IPv4 inside IPv6 (mapped or compatible) is refused whatever it wraps, on every Python version
+    for mapped in ("::ffff:8.8.8.8", "::ffff:127.0.0.1", "::ffff:100.64.0.1", "::8.8.8.8"):
         with pytest.raises(netcheck.DestinationRefused):
             netcheck.check(f"https://[{mapped}]/v1", allow_local=True)
     with pytest.raises(netcheck.DestinationRefused, match="metadata"):

@@ -116,14 +116,24 @@ def is_local(address: IP) -> bool:
     return not _public(address)
 
 
+def _ipv4_compatible(address: IP) -> bool:
+    """A deprecated IPv4-compatible IPv6 address (``::a.b.c.d``, not ``::`` or ``::1``)."""
+    if address.version != 6:
+        return False
+    value = int(address)
+    return value >> 32 == 0 and value > 1
+
+
 def check_address(address: IP, allow_local: bool) -> None:
     if address.is_link_local or address in _METADATA_NETS:
         raise DestinationRefused("base_url points at a link-local or cloud metadata address")
+    # IPv4 inside IPv6 (::ffff:a.b.c.d mapped, ::a.b.c.d compatible) is refused outright: newer
+    # Python versions judge a mapped address by the IPv4 inside instead of calling it reserved,
+    # so this must not depend on ``is_reserved``.
+    if getattr(address, "ipv4_mapped", None) is not None or _ipv4_compatible(address):
+        raise DestinationRefused("base_url points at an address that is not a server")
     if address.is_unspecified or address.is_multicast or address.is_reserved:
         raise DestinationRefused("base_url points at an address that is not a server")
-    mapped = getattr(address, "ipv4_mapped", None)
-    if mapped is not None:
-        check_address(mapped, allow_local)
     if not _public(address) and not allow_local:
         raise DestinationRefused(
             f"base_url points at a loopback or private address; allowed only with {LOCAL_ENV}=1"
