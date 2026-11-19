@@ -303,7 +303,7 @@ Những điều nên biết:
 | Xem nhật ký | `sudo docker compose logs --tail 100 gdrive-rag` |
 | Cập nhật mã mới | Chép mã mới lên VPS, rồi `sudo docker compose up -d --build` |
 
-Dữ liệu chỉ mục nằm trong ổ Docker tên `gdrive-rag-data`, nên vẫn còn khi bạn dựng lại container. Cập nhật lên bản 0.3.0 không làm dịch vụ đọc lại tệp hay tính lại dữ liệu ý nghĩa.
+Dữ liệu chỉ mục nằm trong ổ Docker tên `gdrive-rag-data`, nên vẫn còn khi bạn dựng lại container. Cập nhật lên bản 0.4.0 không làm dịch vụ đọc lại tệp hay tính lại dữ liệu ý nghĩa.
 
 ### Đọc bản scan bằng ngôn ngữ khác
 

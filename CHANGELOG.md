@@ -2,7 +2,7 @@
 
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions follow [Semantic Versioning](https://semver.org/). The install guide for the owner is `README.md` (Vietnamese).
 
-## [Unreleased]
+## [0.4.0] - 2026-11-19
 
 Tóm tắt: thêm/bớt nguồn, quy tắc đường dẫn và loại trừ theo ID không còn cần công cụ quản trị; đọc được tệp trên máy (local); chỉ quyền Google và khóa embedding còn là công cụ quản trị. Cập nhật không đọc lại tệp nào.
 
