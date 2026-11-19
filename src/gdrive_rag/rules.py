@@ -1,7 +1,8 @@
-"""Per-source path rules for search: ``demote`` moves a file's hits ``DEMOTE_PLACES`` places
-down the ranked list (its score is lowered to just below the hit now above it), ``exclude``
-leaves it out of search results. Rules are applied at query time only; the file stays indexed
-and readable by its ID, and changing rules never re-extracts or re-embeds anything.
+"""Per-source path rules for search: ``demote`` puts all of a file's hits below the next
+``DEMOTE_PLACES`` other files in the ranked list (their scores are lowered to just below that
+file's best hit), ``exclude`` leaves it out of search results. Rules are applied at query time
+only; the file stays indexed and readable by its ID, and changing rules never re-extracts or
+re-embeds anything.
 
 A pattern is a glob over the file's ``path`` as search results show it (inside the source
 folder), compared without case or Vietnamese accents:
@@ -29,11 +30,24 @@ from typing import Any
 from .db import fts_fold
 
 EFFECTS = ("demote", "exclude")
-DEMOTE_PLACES = 10  # a demoted hit moves this many places down the fused order
+DEMOTE_PLACES = 10  # a demoted file goes below this many other files of the fused order
 MAX_PATTERNS = 20  # per effect and source (keeps list_sources under the wire cap)
 MAX_PATTERN_CHARS = 100
-# a pattern matching all of these matches any path, so it would demote or hide everything
-MATCH_ALL_PROBES = ("a", "b.txt", "x/y", "x/y/z.docx", "k/l/m/n.pdf", "q.r/s")
+# A pattern matching all of these matches any path, so it would demote or hide everything.
+# Every name is longer than a pattern can be, so "?" runs ("**??", "?*?") that only skip very
+# short names are caught too; an exact length ("**/??") still matches none of them.
+_PROBE = 2 * 60  # > MAX_PATTERN_CHARS
+MATCH_ALL_PROBES = tuple(
+    "/".join(letter * _PROBE + suffix for letter, suffix in shape)
+    for shape in (
+        (("a", ""),),  # a Google Doc at the top: no extension
+        (("b", ".txt"),),
+        (("c", ""), ("d", "")),
+        (("e", ""), ("f", ""), ("g", ".docx")),
+        (("h", ""), ("i", ""), ("j", ""), ("k", ".pdf")),
+        (("l", ".m"), ("n", "")),  # a folder name with a dot
+    )
+)
 
 
 def fold(text: str) -> str:
@@ -161,10 +175,16 @@ def demote(
     demoted: set[int],
     scores: dict[int, float],
 ) -> list[int]:
-    """Move every hit of each demoted document below the best hit of the next
-    ``DEMOTE_PLACES`` other (not demoted) documents after its own best hit, and lower those
-    scores to just below the hit now above, so scores stay in order. ``order`` is chunk ids,
-    best first; ``document_of`` maps them to document ids; ``demoted`` holds document ids.
+    """Put every hit of each demoted document below the best hit of the next
+    ``DEMOTE_PLACES`` other (not demoted) documents after its own best hit (below all of them
+    when fewer follow), and return the order by the new scores. ``order`` is chunk ids, best
+    first; ``document_of`` maps them to document ids; ``demoted`` holds document ids.
+
+    A demoted hit's score is lowered to just below that anchor hit, or kept when it is already
+    lower, so its weaker hits stay where their own score puts them instead of moving with the
+    best one past stronger hits of other files. Other hits keep their scores and order; ties
+    keep the old order. Scores are therefore in order, and the result does not depend on how
+    many hits are shown.
 
     By document, not by chunk: a file with many matching chunks must drop as a whole. A fixed
     shift, not a multiplier: an old copy whose name matches the query keeps far more signals
@@ -173,25 +193,22 @@ def demote(
     for position, chunk_id in enumerate(order):
         first.setdefault(document_of.get(chunk_id, -chunk_id), position)
     others = sorted(p for d, p in first.items() if d not in demoted)
-    keys: dict[int, tuple[int, int, int]] = {}
-    for position, chunk_id in enumerate(order):
+    kept = [c for c in order if document_of.get(c, -c) not in demoted]
+    if not kept:
+        return order
+    lowest = scores[kept[-1]]
+    for chunk_id in order:
         document = document_of.get(chunk_id, -chunk_id)
-        if document in demoted:
-            after = bisect.bisect_right(others, first[document])
-            anchor = (
-                others[after + DEMOTE_PLACES - 1]
-                if after + DEMOTE_PLACES <= len(others)
-                else len(order)
-            )
-            keys[chunk_id] = (anchor, 1, position)
+        if document not in demoted:
+            continue
+        after = bisect.bisect_right(others, first[document])
+        if after + DEMOTE_PLACES <= len(others):
+            anchor = scores[order[others[after + DEMOTE_PLACES - 1]]]
         else:
-            keys[chunk_id] = (position, 0, position)
-    result = sorted(order, key=keys.__getitem__)
-    lowered = {c for c in order if document_of.get(c, -c) in demoted}
-    for above, chunk_id in zip(result, result[1:], strict=False):
-        if chunk_id in lowered and scores[chunk_id] >= scores[above]:
-            scores[chunk_id] = math.nextafter(scores[above], 0.0)
-    return result
+            anchor = lowest
+        scores[chunk_id] = min(scores[chunk_id], math.nextafter(anchor, 0.0))
+    place = {chunk_id: index for index, chunk_id in enumerate(order)}
+    return sorted(order, key=lambda chunk_id: (-scores[chunk_id], place[chunk_id]))
 
 
 def matches(pattern: str, path: str) -> bool:

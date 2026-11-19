@@ -22,8 +22,11 @@ Scope filters (source, folder with all subfolders, specific files) are applied t
 and the vector candidates before fusion, so a narrow scope still fills ``limit``.
 
 Per-source path rules (``rules.py``) apply only when a source has some: ``exclude`` is one more
-scope condition (files named in ``files`` are never excluded) and ``demote`` multiplies the
-position by ``rules.DEMOTE_PLACES`` places. With no rules the code path is the same as before.
+scope condition (files named in ``files`` are never excluded) and ``demote`` puts a file's hits
+below the next ``rules.DEMOTE_PLACES`` other files. When demoted files take places in the
+candidate lists, the lists are topped up with the candidates ``exclude`` would have found, so
+the files that take their places are there to be found. With no rules the code path is the same
+as before.
 A scope on a source still on its first sync gets a warning with its progress instead of a
 silent empty result.
 """
@@ -31,6 +34,7 @@ silent empty result.
 from __future__ import annotations
 
 import json
+import math
 import threading
 from collections.abc import Callable
 from typing import Any
@@ -99,6 +103,7 @@ class SearchEngine:
         pool = max(limit * 5, 40)
         lexical, phrases, query_terms, weights = self._full_text(terms, scope, pool)
         semantic: list[tuple[int, float]] = []
+        ranked: Ranked | None = None
         client = self.embeddings()
         mode = "full_text"
         if client is not None:
@@ -106,10 +111,16 @@ class SearchEngine:
                 warnings.append("vectors are being rebuilt for the configured model; FTS only")
             else:
                 try:
-                    semantic = self._semantic(client, query, scope, pool)
+                    ranked = self._rank_vectors(client, query)
+                    semantic = pick(ranked, [self._allowed(scope)], pool)
                     mode = "hybrid"
                 except Exception as exc:  # network/key problems must not break search
                     warnings.append(f"semantic search unavailable ({exc}); FTS only")
+        demoted = {d for d, (e, _) in rules.items() if e == "demote"}
+        if demoted:
+            lexical, phrases, semantic = self._top_up(
+                terms, scope, pool, demoted, (lexical, phrases, semantic), ranked
+            )
         candidates = {c for c, _, _ in lexical} | {c for c, _ in semantic}
         titles = self._title_scores(candidates, query_terms, weights)
         scores = fuse(lexical, semantic, titles, phrases)
@@ -223,6 +234,40 @@ class SearchEngine:
         if len(memo) > 4 * len(documents) + 1000:  # forget rows of renamed or removed files
             self._rule_cache = (key, {row: memo[row] for row in documents})
         return combine(rows)
+
+    def _top_up(
+        self,
+        terms: list[str],
+        scope: tuple[str, list[Any]],
+        pool: int,
+        demoted: set[int],
+        found: tuple[list[tuple[int, float, float]], set[int], list[tuple[int, float]]],
+        ranked: Ranked | None,
+    ) -> tuple[list[tuple[int, float, float]], set[int], list[tuple[int, float]]]:
+        """When chunks of demoted documents hold places in the text or vector candidates, add
+        the candidates found with those documents left out (what ``exclude`` would find), so
+        the files that should take their places are in the fusion at all. Each list stays in
+        its own score order over the union, so a rank is still a position by that signal: the
+        first lists keep their order, and a chunk found only without the demoted documents
+        ranks below the chunks that score higher on that signal."""
+        lexical, phrases, semantic = found
+        first = [c for c, _, _ in lexical] + [c for c, _ in semantic]
+        if not demoted & set(self._documents_of(first).values()):
+            return found
+        condition = "c.document_id NOT IN (SELECT value FROM json_each(?))"
+        without = (
+            f"{scope[0]} AND {condition}" if scope[0] else condition,
+            [*scope[1], json.dumps(sorted(demoted))],
+        )
+        more, more_phrases, _, _ = self._full_text(terms, without, pool)
+        merged = {c: (score, bm25) for c, score, bm25 in lexical}
+        for c, score, bm25 in more:
+            merged.setdefault(c, (score, bm25))
+        lexical = [(c, score, bm25) for c, (score, bm25) in merged.items()]
+        lexical.sort(key=lambda item: (-item[1], item[2]))
+        if ranked is not None:
+            semantic = pick(ranked, [self._allowed(scope), self._allowed(without)], pool)
+        return lexical, phrases | more_phrases, semantic
 
     def _documents_of(self, chunk_ids: list[int]) -> dict[int, int]:
         output: dict[int, int] = {}
@@ -372,35 +417,29 @@ class SearchEngine:
                     output[int(row[0])] = title_score(query, weights, f"{row[1]} {row[2]}")
         return output
 
-    def _semantic(
-        self, client: EmbeddingClient, query: str, scope: tuple[str, list[Any]], pool: int
-    ) -> list[tuple[int, float]]:
+    def _rank_vectors(self, client: EmbeddingClient, query: str) -> Ranked | None:
+        """Stored chunk ids, their cosine with the query and the best-first order; None when
+        nothing is embedded (the query is then not embedded either)."""
         ids, matrix = self._load_matrix()
         if not ids:
-            return []
+            return None
         vector = np.asarray(client.embed_query(query), dtype=np.float32)
         if vector.shape[0] != matrix.shape[1]:
             raise RuntimeError("query vector has a different dimension than stored vectors")
         scores = matrix @ vector
-        allowed: set[int] | None = None
-        if scope[0]:
-            with self.db.read() as connection:
-                allowed = {
-                    int(row[0])
-                    for row in connection.execute(
-                        f"SELECT c.id FROM chunks c WHERE {scope[0]}", scope[1]
-                    )
-                }
-        order = np.argsort(-scores)
-        output: list[tuple[int, float]] = []
-        for index in order:
-            chunk_id = ids[int(index)]
-            if allowed is not None and chunk_id not in allowed:
-                continue
-            output.append((chunk_id, float(scores[int(index)])))
-            if len(output) >= pool:
-                break
-        return output
+        return ids, scores, np.argsort(-scores)
+
+    def _allowed(self, scope: tuple[str, list[Any]]) -> set[int] | None:
+        """The chunk ids inside ``scope``; None for no scope."""
+        if not scope[0]:
+            return None
+        with self.db.read() as connection:
+            return {
+                int(row[0])
+                for row in connection.execute(
+                    f"SELECT c.id FROM chunks c WHERE {scope[0]}", scope[1]
+                )
+            }
 
     def _load_matrix(self) -> tuple[list[int], Any]:
         revision = self.db.get_meta(REVISION_KEY) or "0"
@@ -443,19 +482,28 @@ class SearchEngine:
                     batch,
                 ):
                     rows[int(row["id"])] = row
-        present = [chunk_id for chunk_id in ordered if chunk_id in rows]
-        chosen: list[int] = []
+        capped: list[int] = []
+        overflow: list[int] = []
         per_document: dict[int, int] = {}
-        for chunk_id in present:  # at most PER_DOCUMENT hits per file first ...
+        for chunk_id in ordered:  # at most PER_DOCUMENT hits per file first ...
+            if chunk_id not in rows:
+                continue
             document = int(rows[chunk_id]["document_id"])
-            if per_document.get(document, 0) < PER_DOCUMENT and len(chosen) < limit:
-                per_document[document] = per_document.get(document, 0) + 1
-                chosen.append(chunk_id)
-        if len(chosen) < limit:  # ... then fill from the same files when the scope is narrow
-            taken = set(chosen)
-            chosen += [c for c in present if c not in taken][: limit - len(chosen)]
-            chosen.sort(key=lambda chunk_id: scores[chunk_id], reverse=True)
-        return [self._hit(rows[chunk_id], scores[chunk_id]) for chunk_id in chosen]
+            seen = per_document.get(document, 0)
+            per_document[document] = seen + 1
+            (capped if seen < PER_DOCUMENT else overflow).append(chunk_id)
+        # ... then more from the same files when the scope is narrow. They come after every
+        # capped hit whatever the limit, so a smaller limit shows the start of a larger one;
+        # one that outscores the hit above it gets a score just below that hit.
+        output: list[dict[str, Any]] = []
+        previous = math.inf
+        for chunk_id in (capped + overflow)[:limit]:
+            score = scores[chunk_id]
+            if score > previous:
+                score = math.nextafter(previous, 0.0)
+            output.append(self._hit(rows[chunk_id], score))
+            previous = score
+        return output
 
     @staticmethod
     def _hit(row: Any, score: float) -> dict[str, Any]:
@@ -499,6 +547,33 @@ def first_sync_note(row: Any) -> str:
 
 def _round(value: float | None) -> float | None:
     return None if value is None else round(value, 4)
+
+
+Ranked = tuple[list[int], Any, Any]  # chunk ids, cosine per id, indexes best first
+
+
+def pick(
+    ranked: Ranked | None, scopes: list[set[int] | None], pool: int
+) -> list[tuple[int, float]]:
+    """``(chunk id, cosine)`` best first: the first ``pool`` chunks inside each scope (None is
+    no scope), merged into one list in cosine order."""
+    if ranked is None:
+        return []
+    ids, scores, order = ranked
+    counts = [0] * len(scopes)
+    output: list[tuple[int, float]] = []
+    for index in order:
+        chunk_id = ids[int(index)]
+        taken = False
+        for n, allowed in enumerate(scopes):
+            if counts[n] < pool and (allowed is None or chunk_id in allowed):
+                counts[n] += 1
+                taken = True
+        if taken:
+            output.append((chunk_id, float(scores[int(index)])))
+            if min(counts) >= pool:
+                break
+    return output
 
 
 def fuse(
