@@ -132,10 +132,12 @@ def cmd_source_remove(args: argparse.Namespace) -> int:
 
 
 def cmd_source_rules(args: argparse.Namespace) -> int:
-    # the same rules and validation as the set_path_rules tool; without options it only shows
+    # the same rules and validation as the set_path_rules tool; without options it only shows.
+    # No sync is queued in this process (like source add): the server applies an ignore change
+    # at its next scheduled sync, or run `gdrive-rag sync`.
     change = any(v is not None for v in (args.demote, args.exclude, args.ignore))
     result = _admin(args).set_path_rules(
-        args.source, args.demote, args.exclude, change, ignore=args.ignore
+        args.source, args.demote, args.exclude, change, ignore=args.ignore, queue=False
     )
     _print(result, args.json)
     return 0

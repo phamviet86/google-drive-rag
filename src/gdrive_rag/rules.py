@@ -21,11 +21,11 @@ Files named in search's ``files`` filter are never excluded (but an ignored file
 download, ``ignore_listing`` drops matching files and folders from the listing (they are stored
 as skipped files with the reason ``ignored by rule: <entry>``), so the normal membership
 replacement removes what was indexed. An ignore entry is a glob like the others, or a file or
-folder ID stored as ``id:<ID>`` (from a Drive link, a bare ID, or ``id:`` written out; any
-backend's opaque ID works the same way). A folder entry covers everything below it through the
-listing's parent IDs, so it survives renames and moves. A file listed by several sources is
-ignored when any of them ignores it. Until the next sync removes them, search hides ignored
-documents like ``exclude`` does.
+folder ID stored as ``id:<ID>`` (from a Drive link, a bare ID the source already lists, or
+``id:`` written out; any backend's opaque ID works the same way). A folder entry covers
+everything below it through the listing's parent IDs, so it survives renames and moves. A file
+listed by several sources is ignored when any of them ignores it. Until the next sync removes
+them, search hides ignored documents like ``exclude`` does.
 """
 
 from __future__ import annotations
@@ -33,7 +33,6 @@ from __future__ import annotations
 import bisect
 import functools
 import math
-import re
 import unicodedata
 from collections.abc import Callable, Collection, Iterable
 from dataclasses import replace
@@ -55,7 +54,6 @@ ID_PREFIX = "id:"  # an ignore entry naming a file or folder by ID, not a path
 IGNORED_REASON = "ignored by rule: "  # skipped_files.reason prefix (+ the entry), own rule
 OTHER_SOURCE_REASON = "ignored by a rule of another source that lists this file"
 IGNORED_GLOB = "ignored by rule: *"  # SQL GLOB for rows ignored by their own source's rule
-_DRIVE_ID = re.compile(r"[A-Za-z0-9_-]{19,}")
 DEMOTE_PLACES = 10  # a demoted file goes below this many other files of the fused order
 MAX_PATTERNS = 20  # per effect and source (keeps list_sources under the wire cap)
 MAX_PATTERN_CHARS = 100
@@ -118,21 +116,11 @@ def is_id(entry: str) -> bool:
     return entry.startswith(ID_PREFIX)
 
 
-def looks_like_drive_id(value: str) -> bool:
-    """A bare Drive ID: 19+ ID characters mixing upper case, lower case and digits (a folder
-    name written like ``bao-cao-2025`` is not one; ``id:`` forces an ID)."""
-    return (
-        _DRIVE_ID.fullmatch(value) is not None
-        and any(c.isupper() for c in value)
-        and any(c.islower() for c in value)
-        and any(c.isdigit() for c in value)
-    )
-
-
 def clean_ignore(values: Any, known: Callable[[str], bool] = lambda _: False) -> list[str]:
     """Validated ignore entries in their stored form: ``id:<ID>`` for a Drive link, an
-    ``id:`` entry, a ``local:`` ID, a value ``known`` says is an ID, or a bare Drive ID; a glob
-    otherwise (same checks as ``clean``). Messages never repeat a value."""
+    ``id:`` entry, a ``local:`` ID, or a bare value ``known`` says is an ID of the source (an
+    indexed or skipped file, a folder: a name like ``BaoCaoTaiChinh2025Q1`` that is not one stays
+    a glob); a glob otherwise (same checks as ``clean``). Messages never repeat a value."""
     if not isinstance(values, list | tuple):
         raise ValueError("ignore must be a list of path patterns, Drive links or IDs")
     result: list[str] = []
@@ -158,7 +146,7 @@ def clean_ignore(values: Any, known: Callable[[str], bool] = lambda _: False) ->
                 raise ValueError(
                     "ignore: a link is not a Google Drive folder or file link"
                 ) from None
-        elif entry and (known(entry) or looks_like_drive_id(entry)):
+        elif entry and known(entry):
             stored = ID_PREFIX + entry
         else:
             stored = _check_glob(entry, "ignore")

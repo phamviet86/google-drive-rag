@@ -59,7 +59,15 @@ from .embeddings import EmbeddingClient, EmbeddingError
 from .extract import Extractor
 from .extraction_errors import ExtractionError
 from .local import LocalBackend, default_local_backend, is_local_input
-from .rules import EFFECTS, IGNORED_GLOB, clean, clean_ignore, effects, ignore_listing
+from .rules import (
+    EFFECTS,
+    IGNORED_GLOB,
+    OTHER_SOURCE_REASON,
+    clean,
+    clean_ignore,
+    effects,
+    ignore_listing,
+)
 from .search import EMBEDDING_IDENTITY_KEY, REVISION_KEY, SearchEngine
 
 log = logging.getLogger("gdrive_rag")
@@ -316,6 +324,9 @@ class Service:
                 "ON fs.folder_id=f.folder_id WHERE fs.source_id=?",
                 (source_id,),
             ).fetchall()
+            skipped_rows = connection.execute(
+                "SELECT file_id, path FROM skipped_files WHERE source_id=?", (source_id,)
+            ).fetchall()
             others = connection.execute(
                 "SELECT s.id, s.name, ds.document_id FROM document_sources ds "
                 "JOIN sources s ON s.id=ds.source_id WHERE ds.source_id<>? ORDER BY s.id",
@@ -335,25 +346,32 @@ class Service:
             output[effect] = per_pattern
         # the same filter a sync applies, over what the index holds for this source
         listing = Listing(
-            [DriveItem(str(r[2]), "", "", str(r[1]), "", "", None, "", str(r[3])) for r in rows],
+            [DriveItem(str(r[2]), "", "", str(r[1]), "", "", None, "", str(r[3])) for r in rows]
+            + [  # unsupported or already ignored files: an entry hitting one is not a typo
+                DriveItem(str(r[0]), "", "", str(r[1]), "", "", None, "", "") for r in skipped_rows
+            ],
             folders=[DriveFolder(str(r[0]), str(r[1]), str(r[2])) for r in folder_rows],
         )
         by_file = {str(row[2]): int(row[0]) for row in rows}
         folder_ids = {str(row[0]) for row in folder_rows}
 
-        def ignored(entries: list[str]) -> tuple[set[int], int]:
+        def ignored(entries: list[str]) -> tuple[set[int], int, int]:
             _, left_out = ignore_listing(listing, entries)
-            return {by_file[i] for i in left_out if i in by_file}, len(left_out & folder_ids)
+            documents_hit = {by_file[i] for i in left_out if i in by_file}
+            return documents_hit, len(left_out & folder_ids), len(left_out)
 
         output["ignore"] = {}
+        output["ignore_matches_nothing"] = []  # no indexed file, skipped file or folder: a typo?
         for entry in rules.get("ignore", []):
-            gone_here, folders = ignored([entry])
+            gone_here, folders, anything = ignored([entry])
+            if not anything:
+                output["ignore_matches_nothing"].append(entry)
             output["ignore"][entry] = {
                 "documents": len(gone_here),
                 "folders": folders,
                 "examples": [path for d, path, _ in documents if d in gone_here][:3],
             }
-        gone, gone_folders = ignored(list(rules.get("ignore", [])))
+        gone, gone_folders, _ = ignored(list(rules.get("ignore", [])))
         combined = effects(
             [(source_id, e, p) for e in ("demote", "exclude") for p in rules.get(e, [])],
             documents,
@@ -379,7 +397,8 @@ class Service:
             root = connection.execute(
                 "SELECT root_id FROM sources WHERE id=?", (source_id,)
             ).fetchone()
-            known = {
+            known = {str(root[0])} if root is not None else set()
+            known |= {
                 str(row[0])
                 for row in connection.execute(
                     "SELECT d.file_id FROM documents d JOIN document_sources ds "
@@ -396,12 +415,15 @@ class Service:
             )
         return entries
 
-    def set_path_rules(self, source_id: int, rules: dict[str, list[str]]) -> dict[str, Any]:
+    def set_path_rules(
+        self, source_id: int, rules: dict[str, list[str]], queue: bool = True
+    ) -> dict[str, Any]:
         """Replace the source's rules. demote and exclude are search-time only: no document,
         chunk or vector changes. When the ignore entries change, the source's 'ignored by rule'
         skipped files are dropped (the next sync lists them under the new entries) and a sync
         of every source is queued: it removes newly ignored files from the index (from every
-        source that lists them) and indexes files no longer ignored."""
+        source that lists them) and indexes files no longer ignored. ``queue=False`` (the CLI:
+        this process is short-lived) leaves the sync to the server's next scheduled one."""
         cleaned = {effect: clean(rules.get(effect, []), effect) for effect in ("demote", "exclude")}
         cleaned["ignore"] = self.ignore_entries(source_id, rules.get("ignore", []))
         changed = cleaned["ignore"] != self.path_rules(source_id)["ignore"]
@@ -416,7 +438,10 @@ class Service:
                     "DELETE FROM skipped_files WHERE source_id=? AND reason GLOB ?",
                     (source_id, IGNORED_GLOB),
                 )
-        return {"sync": self.queue_sync() if changed else None}
+        return {
+            "changed": changed,
+            "sync": self.queue_sync() if changed and queue else None,
+        }
 
     def skipped_files(self, limit: int = SKIPPED_PAGE) -> dict[str, Any]:
         with self.db.read() as connection:
@@ -758,6 +783,16 @@ class Service:
                         )
                 if found is None or found.complete:
                     connection.execute("DELETE FROM skipped_files WHERE source_id=?", (source_id,))
+                else:  # a file listed and not ignored is no longer "ignored by rule", however
+                    # incomplete the listing (it may have moved out of an ignored folder)
+                    connection.executemany(
+                        "DELETE FROM skipped_files WHERE source_id=? AND file_id=? "
+                        "AND (reason GLOB ? OR reason=?)",
+                        [
+                            (source_id, item.id, IGNORED_GLOB, OTHER_SOURCE_REASON)
+                            for item in found.items
+                        ],
+                    )
                 connection.executemany(
                     "INSERT OR REPLACE INTO skipped_files VALUES(?,?,?,?,?,?)",
                     [
@@ -1087,6 +1122,11 @@ class Service:
         if offset < 0:
             raise ValueError("offset must be >= 0")
         source_id = self.search_engine.source_id(source) if source else None
+        # what an ignore entry covers is hidden at once, like in search (the next sync drops it)
+        hidden_documents = json.dumps(sorted(self.search_engine.ignored_documents()))
+        hidden_folder_ids = self.search_engine.ignored_folders()
+        hidden_folders = json.dumps(sorted(hidden_folder_ids))
+        not_hidden_folder = "{}.folder_id NOT IN (SELECT value FROM json_each(?))"
         with self.db.read() as connection:
             parent_row = None
             values: list[Any]
@@ -1097,6 +1137,8 @@ class Service:
                 ).fetchone()
                 if parent_row is None:
                     raise ValueError(f"unknown or not indexed folder: {parent}")
+                if parent_id in hidden_folder_ids:
+                    raise ValueError(f"folder {parent} is ignored by a path rule; not indexed")
                 where, values = "f.parent_id=?", [parent_id]
             elif source_id is not None:
                 where, values = "f.folder_id=(SELECT root_id FROM sources WHERE id=?)", [source_id]
@@ -1107,6 +1149,8 @@ class Service:
                     " AND f.folder_id IN (SELECT folder_id FROM folder_sources WHERE source_id=?)"
                 )
                 values.append(source_id)
+            where += " AND " + not_hidden_folder.format("f")
+            values.append(hidden_folders)
             folder_total = int(
                 connection.execute(
                     f"SELECT count(*) FROM folders f WHERE {where}", values
@@ -1119,13 +1163,15 @@ class Service:
                     " AND d.id IN (SELECT document_id FROM document_sources WHERE source_id=?)"
                 )
                 count_values.append(source_id)
+            count_values += [hidden_documents, hidden_folders]
             folders = connection.execute(
                 f"""SELECT f.folder_id, f.name, f.path,
                       (SELECT count(*) FROM document_folders df
                        JOIN documents d ON d.id=df.document_id
-                       WHERE df.folder_id=f.folder_id AND d.status='indexed'{in_source})
-                       documents,
-                      (SELECT count(*) FROM folders c WHERE c.parent_id=f.folder_id) subfolders
+                       WHERE df.folder_id=f.folder_id AND d.status='indexed'{in_source}
+                       AND d.id NOT IN (SELECT value FROM json_each(?))) documents,
+                      (SELECT count(*) FROM folders c WHERE c.parent_id=f.folder_id
+                       AND {not_hidden_folder.format("c")}) subfolders
                     FROM folders f WHERE {where} ORDER BY f.name, f.folder_id
                     LIMIT ? OFFSET ?""",
                 [*count_values, *values, LIST_PAGE, offset],
@@ -1133,8 +1179,11 @@ class Service:
             documents: list[Any] = []
             document_total = 0
             if include_documents and parent_row is not None:
-                sql = "SELECT * FROM documents d WHERE d.parent_id=?"
-                params: list[Any] = [parent_row["folder_id"]]
+                sql = (
+                    "SELECT * FROM documents d WHERE d.parent_id=? "
+                    "AND d.id NOT IN (SELECT value FROM json_each(?))"
+                )
+                params: list[Any] = [parent_row["folder_id"], hidden_documents]
                 if source_id is not None:
                     sql += (
                         " AND d.id IN (SELECT document_id FROM document_sources WHERE source_id=?)"

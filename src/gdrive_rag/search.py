@@ -43,7 +43,7 @@ from typing import Any
 import numpy as np
 
 from .db import TERM, Database, fts_fold
-from .drive import parse_drive_link
+from .drive import DriveFolder, Listing, parse_drive_link
 from .embeddings import EmbeddingClient
 from .ranking import contains_phrase, idf, lexical_score, title_score, tokens
 from .rules import (
@@ -53,6 +53,7 @@ from .rules import (
     combine,
     demote,
     group,
+    ignore_listing,
     is_id,
     row_effect,
 )
@@ -276,18 +277,47 @@ class SearchEngine:
                 {"source": source_id, "id": ident},
             ):
                 rows.append((int(row[0]), ("ignore", pattern)))
-        if any(effect == "ignore" for _, effect, _ in rules):
+        # A skipped row only counts while the entry that made it still exists on its source: a
+        # file that no entry hits any more (moved out of an ignored folder, entry removed) is not
+        # hidden by the row an older listing left behind.
+        current = {(sid, pattern) for sid, effect, pattern in rules if effect == "ignore"}
+        if current:
             for row in connection.execute(
-                "SELECT d.id, k.reason FROM skipped_files k JOIN documents d "
+                "SELECT d.id, k.source_id, k.reason FROM skipped_files k JOIN documents d "
                 "ON d.file_id=k.file_id WHERE k.reason GLOB ?",
                 (IGNORED_GLOB,),
             ):
-                rows.append((int(row[0]), ("ignore", str(row[1])[len(IGNORED_REASON) :])))
+                entry = str(row[2])[len(IGNORED_REASON) :]
+                if (int(row[1]), entry) in current:
+                    rows.append((int(row[0]), ("ignore", entry)))
         return rows
 
     def ignored_documents(self) -> set[int]:
         """Document ids an ignore rule hits (hidden now, removed by the next sync)."""
         return {d for d, (effect, _) in self._rule_effects().items() if effect == "ignore"}
+
+    def ignored_folders(self) -> set[str]:
+        """Drive IDs of the folders an ignore entry covers (the folder itself, or a glob matching
+        everything below it) among those the index holds: hidden now, dropped by the next sync."""
+        with self.db.read() as connection:
+            entries: dict[int, list[str]] = {}
+            for source_id, pattern in connection.execute(
+                "SELECT source_id, pattern FROM path_rules WHERE effect='ignore' ORDER BY rowid"
+            ):
+                entries.setdefault(int(source_id), []).append(str(pattern))
+            hidden: set[str] = set()
+            for source_id, patterns in entries.items():
+                folders = [
+                    DriveFolder(str(row[0]), str(row[1]), str(row[2]))
+                    for row in connection.execute(
+                        "SELECT f.folder_id, f.name, f.parent_id FROM folders f "
+                        "JOIN folder_sources fs ON fs.folder_id=f.folder_id "
+                        "WHERE fs.source_id=?",
+                        (source_id,),
+                    )
+                ]
+                hidden |= ignore_listing(Listing([], folders=folders), patterns)[1]
+        return hidden
 
     def _ignored_notes(self, document_ids: list[int]) -> list[str]:
         if not document_ids:

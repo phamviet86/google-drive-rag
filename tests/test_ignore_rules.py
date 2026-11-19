@@ -7,6 +7,7 @@ from __future__ import annotations
 import itertools
 import json
 import time
+from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
@@ -79,7 +80,10 @@ def test_entries_are_globs_or_ids_and_errors_never_echo() -> None:
         [
             f"https://drive.google.com/drive/folders/{OLD}?usp=sharing",
             f"https://docs.google.com/document/d/{F_NEW}/edit",
-            DEEP,  # a bare Drive ID (mixed case and digits)
+            DEEP,  # a bare value the source lists as an ID (known below)
+            "BaoCaoTaiChinh2025Q1",  # CamelCase names are globs unless the source lists them
+            "HopDong_2024_BanChinhThuc",
+            "KeHoach-Quy3-2025-final",
             "id:some-opaque-id",
             "local:/hop-dong/./2025/",
             "id:local:Kế toán/cũ",  # a local path may have spaces
@@ -87,11 +91,15 @@ def test_entries_are_globs_or_ids_and_errors_never_echo() -> None:
             "bao-cao-2025-ban-cu-khong-dung",  # looks like a name, not an ID: a glob
             " *.md ",
             "*.md",
-        ]
+        ],
+        {DEEP}.__contains__,
     ) == [
         f"id:{OLD}",
         f"id:{F_NEW}",
         f"id:{DEEP}",
+        "BaoCaoTaiChinh2025Q1",
+        "HopDong_2024_BanChinhThuc",
+        "KeHoach-Quy3-2025-final",
         "id:some-opaque-id",
         "id:local:hop-dong/2025",
         "id:local:Kế toán/cũ",
@@ -99,6 +107,7 @@ def test_entries_are_globs_or_ids_and_errors_never_echo() -> None:
         "bao-cao-2025-ban-cu-khong-dung",
         "*.md",
     ]
+    assert clean_ignore(["fileOldLedger0001"]) == ["fileOldLedger0001"]  # unknown: a glob
     assert clean_ignore(["fileOldLedger0001"], {"fileOldLedger0001"}.__contains__) == [
         "id:fileOldLedger0001"
     ]
@@ -383,3 +392,107 @@ def test_cli_source_rules_ignore(
     capsys.readouterr()
     service.sync()
     assert stored(service) == {"hoa-don.txt", "cu.txt"}
+
+
+# -- review fixes -------------------------------------------------------------------------------
+def test_a_stale_ignored_row_does_not_hide_a_file_no_entry_hits(tmp_path: Path) -> None:
+    drive, service = setup(tmp_path)
+    ignore(service, "cu/")
+    service.finish_request()
+    service.sync()
+    assert "so-cai-cu.txt" not in stored(service)
+    assert skipped(service)["cu/so-cai-cu.txt"] == "ignored by rule: cu/"
+    # the file moves out of the ignored folder; every following listing is incomplete
+    drive.put(SRC, F_OLD, "so-cai-cu.txt", "Sổ cái doanh thu cũ".encode(), parent=KEEP)
+    original = drive.list_files
+    drive.list_files = lambda root: replace(  # type: ignore[method-assign]
+        original(root), complete=False, errors=["x"]
+    )
+    service.sync()
+    assert "so-cai-cu.txt" in stored(service)
+    assert "moi/so-cai-cu.txt" not in skipped(service)
+    assert "cu/so-cai-cu.txt" not in skipped(service)  # the stale row is gone at once
+    assert "so-cai-cu.txt" in found(service)
+    assert service.read(F_OLD)["file_name"] == "so-cai-cu.txt"
+
+
+def test_query_time_hiding_needs_the_entry_to_exist(tmp_path: Path) -> None:
+    # a leftover row (an entry replaced while listings keep failing) never hides on its own
+    _, service = setup(tmp_path)
+    ignore(service, "cu/")
+    service.sync()
+    with service.db.transaction() as connection:
+        connection.execute(
+            "INSERT OR REPLACE INTO skipped_files SELECT 1, file_id, path, 'text/plain', 1, "
+            "'ignored by rule: gone/' FROM documents WHERE name='so-cai-moi.txt'"
+        )
+    assert "so-cai-moi.txt" in found(service)
+    ignore(service, "cu/", "moi/")  # a new entry hides at once, before any sync
+    assert "so-cai-moi.txt" not in found(service)
+
+
+def test_list_folders_hides_what_an_ignore_entry_covers_before_the_sync(tmp_path: Path) -> None:
+    _, service = setup(tmp_path)
+    ignore(service, folder_link(OLD), "*.md")
+    service.finish_request()
+    top = service.list_folders(parent=SRC, include_documents=True)
+    assert [f["name"] for f in top["folders"]] == ["moi"]
+    assert [d["file_name"] for d in top["documents"]] == ["luong.txt"]  # nhap.md is ignored
+    assert top["total"] == 2
+    assert [f["name"] for f in service.list_folders(source=SRC)["folders"]] == ["Kế toán"]
+    root = service.list_folders(source=SRC)["folders"][0]
+    assert root["documents"] == 2 and root["subfolders"] == 1  # luong + so-cai-moi; moi
+    with pytest.raises(ValueError, match="ignored by a path rule"):
+        service.list_folders(parent=OLD)
+    ignore(service, "cu/")  # a glob covering the folder: the same
+    assert [f["name"] for f in service.list_folders(parent=SRC)["folders"]] == ["moi"]
+    service.sync()  # after the sync the answer is the same
+    assert [f["name"] for f in service.list_folders(parent=SRC)["folders"]] == ["moi"]
+
+
+def test_cli_ignore_does_not_claim_a_queued_sync(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    from gdrive_rag.cli import main
+
+    for name in CLEARED:
+        monkeypatch.delenv(name, raising=False)
+    drive = FakeDrive()
+    drive.add_root(ROOT, "Kế toán")
+    drive.add_folder(OLD, "cu", ROOT)
+    drive.put(ROOT, "doc1111111111111", "a.txt", b"x z")
+    drive.put(ROOT, "doc2222222222222", "cu.txt", b"x y", parent=OLD)
+    service = build_service(tmp_path, drive)
+    service.add_sources([ROOT])
+    service.sync()
+    args = ["--data-dir", str(tmp_path), "--json", "source", "rules", ROOT]
+    assert main([*args, "--ignore", folder_link(OLD)]) == 0
+    out = json.loads(capsys.readouterr().out)
+    assert out["applied"] is True and "sync" not in out
+    assert "next scheduled sync" in out["message"] and "gdrive-rag sync" in out["message"]
+    assert "queued" not in out["message"]
+    assert service.take_request() is None  # nothing is waiting in a long-running service
+
+
+def test_bare_ids_are_ids_only_when_the_source_lists_them(tmp_path: Path) -> None:
+    drive, service = setup(tmp_path)
+    drive.add_folder("BaoCaoTaiChinh2025Q1", "BaoCaoTaiChinh2025Q1", SRC)
+    drive.put(SRC, "fileBaoCao000001", "bao-cao.txt", b"doanh thu", parent="BaoCaoTaiChinh2025Q1")
+    service.sync()
+    names = ["HopDong_2024_BanChinhThuc", "KeHoach-Quy3-2025-final"]
+    assert service.ignore_entries(1, [*names, OLD, "fileBaoCao000001"]) == [
+        *names,
+        f"id:{OLD}",
+        "id:fileBaoCao000001",
+    ]
+    # a CamelCase folder name is a glob unless the source lists it as an ID
+    assert service.ignore_entries(1, ["NotAnIdAtAllButCamelCase1"]) == ["NotAnIdAtAllButCamelCase1"]
+    preview = Admin(service).set_path_rules(SRC, ignore=[*names, "nhap.md"])
+    assert preview["matches"]["ignore_matches_nothing"] == names
+    assert "match no indexed file" in preview["warning"] and names[0] in preview["warning"]
+    assert (
+        Admin(service).set_path_rules(SRC, ignore=["nhap.md"])["matches"]["ignore_matches_nothing"]
+        == []
+    )
+    saved = Admin(service).set_path_rules(SRC, confirm=True, ignore=names)
+    assert "Warning" in saved["message"]

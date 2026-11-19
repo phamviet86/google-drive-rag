@@ -205,11 +205,14 @@ class Admin:
         exclude: list[str] | None = None,
         confirm: bool = False,
         ignore: list[str] | None = None,
+        queue: bool = True,
     ) -> dict[str, Any]:
         """Set a source's path rules. An omitted list keeps the current entries; an empty list
         clears them. Without confirm it only previews how many documents (and, for ignore,
         folders) each entry hits. demote and exclude are search-time only; ignore keeps files
-        out of the index: hidden from search at once, removed by the sync it queues."""
+        out of the index: hidden from search at once, removed by the sync it queues. ``queue``
+        False (the CLI, whose process ends) queues nothing: the server's next scheduled sync
+        applies the change."""
         preview = self.service.source_preview(source)
         source_id = int(preview["id"])
         current = self.service.path_rules(source_id)
@@ -248,6 +251,15 @@ class Admin:
                 "use narrower patterns, or remove_source to drop the source"
             )
         ignore_changed = wanted["ignore"] != current["ignore"]
+        nothing = [e for e in found["ignore_matches_nothing"] if e not in current["ignore"]]
+        if nothing:
+            answer["warning"] = (
+                f"{len(nothing)} ignore entries match no indexed file, skipped file or folder of "
+                "this source yet: " + "; ".join(nothing) + ". Check them for typos. A bare "
+                "value is a file or folder ID only when this source already lists it (otherwise "
+                "it is a path pattern); write id:<ID> or a Drive link to name an ID not yet "
+                "listed."
+            )
         if not confirm:
             answer["would"] = (
                 "Search would use these rules for this source: demote lowers a file's score, "
@@ -262,7 +274,7 @@ class Admin:
                 else " Nothing is re-indexed."
             )
             return {"applied": False, "confirm_needed": True, **answer}
-        saved = self.service.set_path_rules(source_id, wanted)
+        saved = self.service.set_path_rules(source_id, wanted, queue=queue)
         message = "Path rules saved; search uses them now."
         if saved["sync"] is not None:
             answer["sync"] = saved["sync"]
@@ -270,6 +282,14 @@ class Admin:
                 " Ignored files are hidden now; a sync was queued to remove them from the index "
                 "(and to index files no longer ignored)."
             )
+        elif saved["changed"]:  # the CLI: this process queues nothing
+            message += (
+                " Ignored files are hidden now. The server removes them from the index (and "
+                "indexes files no longer ignored) at its next scheduled sync; to do it now, run: "
+                "gdrive-rag sync"
+            )
+        if "warning" in answer:
+            message += " Warning: " + answer["warning"]
         return {"applied": True, "message": message, **answer}
 
     # -- Google access -------------------------------------------------------------------------
