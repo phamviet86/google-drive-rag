@@ -15,14 +15,16 @@ Dịch vụ chạy trong một Docker container trên chính VPS, chỉ nhận k
 - Kết nối với Claude Code
 - Kiểm tra kết quả
 - Tìm trong một thư mục hoặc một tệp
-- Hạ thấp hoặc ẩn tệp trong kết quả tìm
+- Thêm hoặc bớt nguồn ngay trong Claude
+- Nguồn là thư mục trên VPS
+- Hạ thấp, ẩn hoặc loại tệp khỏi chỉ mục
 - Việc thường ngày
 - Quản trị từ Claude (tùy chọn)
 - Xử lý sự cố
 
 ## Dịch vụ làm gì
 
-- Đọc các thư mục, tệp hoặc bộ nhớ dùng chung (shared drive) mà bạn đưa link.
+- Đọc các thư mục, tệp hoặc bộ nhớ dùng chung (shared drive) mà bạn đưa link. Cũng đọc được thư mục nằm ngay trên VPS (phần "Nguồn là thư mục trên VPS").
 - Hiểu Google Docs, Sheets, Slides, Word, Excel, PowerPoint (cả bản cũ `.doc`, `.xls`, `.ppt`), PDF (cả bản scan, nhờ nhận dạng chữ trong ảnh, gọi là OCR), ảnh chụp tài liệu (`.jpg`, `.png`, `.webp`), RTF, Markdown, văn bản, JSON, CSV và trang HTML.
 - Đọc được chữ tiếng Việt có dấu và tiếng Anh trong bản scan và ảnh chụp. Cách thêm ngôn ngữ khác ở phần "Việc thường ngày".
 - Cứ 15 phút kiểm tra Drive một lần: tệp mới được thêm, tệp sửa được đọc lại, tệp bị xóa hoặc thôi chia sẻ thì bị bỏ khỏi chỉ mục. Chỉ mục (index) là bản sao đã sắp xếp để tìm nhanh, nằm trên VPS.
@@ -190,12 +192,76 @@ Muốn tự thử trên VPS, chạy lệnh tìm kèm `--folder` (link thư mục
 sudo docker compose exec gdrive-rag gdrive-rag search "báo cáo thuế" --folder "<link thư mục>"
 ```
 
-## Hạ thấp hoặc ẩn tệp trong kết quả tìm
+## Thêm hoặc bớt nguồn ngay trong Claude
 
-Đôi khi một thư mục chứa bản cũ hay bản gốc đính kèm (ví dụ thư mục `attachments`) và các bản này cứ đứng trên bài viết chính trong kết quả tìm. Bạn có thể đặt quy tắc theo đường dẫn cho từng nguồn:
+Không cần gõ lệnh và không cần bật `GDRAG_ADMIN_TOOLS`. Ba công cụ sau luôn có sẵn trong Claude Code:
+
+- `add_source`: thêm một link thư mục hoặc tệp Drive và bắt đầu đọc ngay.
+- `remove_source`: bỏ một nguồn. Claude báo trước sẽ bỏ bao nhiêu tài liệu khỏi chỉ mục, và chỉ làm khi bạn đồng ý.
+- `set_path_rules`: đặt quy tắc hạ thấp, ẩn hoặc loại tệp (xem hai phần dưới đây). Cũng báo trước, và chỉ làm khi bạn đồng ý.
+
+Ví dụ câu nói với Claude:
+
+- "Thêm thư mục Drive này làm nguồn: https://drive.google.com/drive/folders/…"
+- "Bỏ nguồn Kế toán đi."
+
+Kết quả: Claude nói rõ đã thêm hay bỏ gì. Nguồn mới được đọc ngay, và lúc đầu chỉ tìm được trong các tệp đã đọc xong.
+
+Chỉ nguồn Google xác nhận là bạn có quyền mở mới được lưu. Lệnh `source add` trên VPS cũng vậy: nếu Google chưa cho mở, nguồn không được lưu. Sau khi thêm bằng lệnh, dịch vụ đọc nguồn ở lần đọc Drive kế tiếp, hoặc bạn chạy `sudo docker compose exec gdrive-rag gdrive-rag sync`.
+
+Các công cụ đổi quyền Google hay khóa tìm theo ý nghĩa thì vẫn tắt sẵn (xem phần "Quản trị từ Claude").
+
+## Nguồn là thư mục trên VPS
+
+Ngoài Drive, dịch vụ đọc được một thư mục nằm ngay trên VPS, ví dụ thư mục chứa hợp đồng bạn tải về. Dịch vụ chỉ đọc, không sửa hay xóa gì trong thư mục đó.
+
+1. Chọn thư mục gốc. Mở tệp `.env` trong `~/google-drive-rag` và thêm dòng, thay bằng đường dẫn của bạn:
+
+   ```text
+   GDRAG_LOCAL_HOST_DIR=/home/ten-ban/tai-lieu
+   ```
+
+   Để trống thì dịch vụ dùng thư mục `./local` nằm cạnh `docker-compose.yml`. Trong container, thư mục này hiện ra là `/local`, chỉ đọc. Đừng tự đặt `GDRAG_LOCAL_ROOT` trong `.env`.
+
+2. Cho dịch vụ quyền đọc tệp. Tệp cần quyền 644 và thư mục cần quyền 755, để người dùng của container (số 10001) đọc được:
+
+   ```bash
+   sudo chmod -R a+rX /home/ten-ban/tai-lieu
+   ```
+
+3. Chạy lại dịch vụ:
+
+   ```bash
+   sudo docker compose up -d
+   ```
+
+4. Thêm một thư mục con của nó làm nguồn. Cách 1, nói với Claude: "Thêm nguồn local:hop-dong" (`hop-dong` là thư mục con trong thư mục gốc; `local:.` là cả thư mục gốc). Cách 2, dùng lệnh:
+
+   ```bash
+   sudo docker compose exec gdrive-rag gdrive-rag source add local:hop-dong
+   ```
+
+   Kết quả: nguồn hiện trong `source list`, rồi được đọc ở lần đọc kế tiếp (tối đa 15 phút, hoặc chạy `gdrive-rag sync`).
+
+Những điều nên biết:
+
+- Tệp và thư mục có tên bắt đầu bằng dấu chấm (như `.git`) hoặc tệp khóa tạm của Word (`~$...`) bị bỏ qua.
+- Đường dẫn ngoài thư mục gốc bị từ chối, giống như không có.
+- Thư mục gốc trống, chưa gắn (ví dụ ổ đĩa chưa cắm) hoặc không đọc được: dịch vụ báo lỗi trong `sync_status` (mục `local_folder`) và không xóa gì khỏi chỉ mục. Cắm lại ổ đĩa là xong.
+- Nếu chính thư mục nguồn bị xóa trong khi thư mục gốc vẫn bình thường, nguồn đó được dọn khỏi chỉ mục.
+- Drive hỏng hay thiếu quyền Google không ảnh hưởng nguồn trên VPS, và ngược lại.
+- Đổi tên một tệp thì tệp được đọc lại, nhưng không phải tính lại dữ liệu ý nghĩa (bản scan thì nhận dạng chữ lại).
+- Gỡ nguồn: nói "Bỏ nguồn local:hop-dong", Claude báo trước rồi hỏi bạn đồng ý (`remove_source`).
+
+## Hạ thấp, ẩn hoặc loại tệp khỏi chỉ mục
+
+Đôi khi một thư mục chứa bản cũ hay bản gốc đính kèm (ví dụ thư mục `attachments`) và các bản này cứ đứng trên bài viết chính trong kết quả tìm. Bạn có thể đặt quy tắc cho từng nguồn, bằng lệnh dưới đây hoặc bằng cách nhờ Claude (công cụ `set_path_rules`). Có ba loại:
 
 - `demote` (hạ thấp): tệp khớp vẫn được tìm, nhưng mọi kết quả của tệp đó xếp sau 10 tệp khác đứng ngay dưới nó, nên bài viết chính lên trước.
 - `exclude` (ẩn): tệp khớp không hiện trong kết quả tìm. Tệp vẫn nằm trong chỉ mục; Claude vẫn đọc được tệp đó khi bạn đưa link, hoặc khi bạn bảo chỉ tìm trong đúng tệp đó.
+- `ignore` (loại khỏi chỉ mục): dịch vụ không đọc thư mục hoặc tệp đó nữa. Khác với `exclude`, tệp bị xóa khỏi chỉ mục, Claude không đọc được nữa, và dịch vụ không tải về hay xử lý nó. Dùng khi bạn không muốn dịch vụ chạm vào thư mục đó, ví dụ thư mục chứa ảnh nặng hoặc dữ liệu riêng tư.
+
+Chọn thế nào: muốn tệp vẫn tìm được nhưng xuống thấp, dùng `demote`. Muốn tệp biến mất khỏi kết quả nhưng vẫn mở được khi có link, dùng `exclude`. Muốn dịch vụ bỏ hẳn, dùng `ignore`.
 
 Quy tắc là mẫu đường dẫn, so với cột `path` trong kết quả tìm, không phân biệt chữ hoa và dấu tiếng Việt:
 
@@ -223,7 +289,25 @@ Các bước:
 
    Kết quả: câu trả lời có `"applied": true` và số tệp mỗi mẫu khớp. Lần tìm kế tiếp đã dùng quy tắc mới.
 
-Mỗi lần ghi `--demote` hay `--exclude` là thay cả danh sách đó. Ghi `--demote` mà không kèm mẫu nào là xóa hết quy tắc hạ thấp. Đặt hay đổi quy tắc không làm dịch vụ đọc lại tệp nào. `source list` cho thấy quy tắc của mỗi nguồn, và lệnh tìm kèm `--explain` cho thấy kết quả nào bị hạ thấp bởi mẫu nào.
+### Loại thư mục hoặc tệp khỏi chỉ mục (`ignore`)
+
+Bạn nói với Claude, ví dụ "Đừng đọc thư mục https://drive.google.com/drive/folders/… nữa". Claude trước hết cho xem sẽ loại bao nhiêu tài liệu và thư mục, rồi chỉ làm khi bạn đồng ý. Hoặc dùng lệnh, đưa link thư mục (hoặc tệp), hay mẫu đường dẫn:
+
+```bash
+sudo docker compose exec gdrive-rag gdrive-rag source rules <nguồn> --ignore "<link thư mục>"
+```
+
+Với thư mục trên VPS, dùng `local:<đường dẫn>`, ví dụ `local:hop-dong/cu`. Kết quả:
+
+- Thư mục biến mất khỏi kết quả tìm ngay. Ở lần đọc kế tiếp, nó được xóa hẳn khỏi chỉ mục. Nếu nhờ Claude, lần đọc đó được xếp lịch ngay; nếu dùng lệnh, đó là lần đọc theo lịch 15 phút, hoặc bạn chạy `gdrive-rag sync`.
+- Drive và thư mục trên VPS không bị đổi gì.
+- Đổi tên hoặc chuyển thư mục đó trên Drive thì quy tắc vẫn đúng, vì nó nhớ thư mục theo mã chứ không theo tên.
+- Các tệp bị loại hiện trong danh sách tệp bị bỏ qua (`status --skipped`) với lý do `ignored by rule`.
+- Một tệp nằm trong hai nguồn mà một nguồn loại nó thì cả hai nguồn đều bỏ nó.
+- Dịch vụ từ chối quy tắc làm trống cả nguồn; khi đó hãy bỏ nguồn.
+- Muốn đọc lại: bỏ mục đó khỏi danh sách `--ignore`. Lần đọc kế tiếp đưa tệp trở lại.
+
+Mỗi lần ghi `--demote`, `--exclude` hay `--ignore` là thay cả danh sách đó. Ghi `--demote` mà không kèm mẫu nào là xóa hết quy tắc hạ thấp. Đổi `demote` hay `exclude` không làm dịch vụ đọc lại tệp nào; đổi `ignore` thì có một lần đọc lại đầy đủ để áp dụng. `source list` cho thấy quy tắc của mỗi nguồn, và lệnh tìm kèm `--explain` cho thấy kết quả nào bị hạ thấp bởi mẫu nào.
 
 ## Việc thường ngày
 
@@ -232,7 +316,8 @@ Mỗi lần ghi `--demote` hay `--exclude` là thay cả danh sách đó. Ghi `-
 | Thêm thư mục Drive | `sudo docker compose exec gdrive-rag gdrive-rag source add <link>` |
 | Xem danh sách nguồn | `sudo docker compose exec gdrive-rag gdrive-rag source list` |
 | Bỏ một nguồn | `sudo docker compose exec gdrive-rag gdrive-rag source remove <số thứ tự hoặc tên>` |
-| Hạ thấp hoặc ẩn tệp khi tìm | `sudo docker compose exec gdrive-rag gdrive-rag source rules <nguồn> --demote "<mẫu>"` (xem phần trên) |
+| Thêm thư mục trên VPS | `sudo docker compose exec gdrive-rag gdrive-rag source add local:<đường dẫn>` (xem phần trên) |
+| Hạ thấp, ẩn hoặc loại tệp | `sudo docker compose exec gdrive-rag gdrive-rag source rules <nguồn> --demote "<mẫu>"` (hoặc `--exclude`, `--ignore`; xem phần trên) |
 | Xem tệp bị bỏ qua | `sudo docker compose exec gdrive-rag gdrive-rag status --skipped` |
 | Đọc lại Drive ngay | `sudo docker compose exec gdrive-rag gdrive-rag sync` |
 | Thử tìm một câu | `sudo docker compose exec gdrive-rag gdrive-rag search "<câu tìm>"` |
@@ -244,7 +329,7 @@ Mỗi lần ghi `--demote` hay `--exclude` là thay cả danh sách đó. Ghi `-
 | Xem nhật ký | `sudo docker compose logs --tail 100 gdrive-rag` |
 | Cập nhật mã mới | Chép mã mới lên VPS, rồi `sudo docker compose up -d --build` |
 
-Dữ liệu chỉ mục nằm trong ổ Docker tên `gdrive-rag-data`, nên vẫn còn khi bạn dựng lại container. Cập nhật lên bản 0.3.0 không làm dịch vụ đọc lại tệp hay tính lại dữ liệu ý nghĩa.
+Dữ liệu chỉ mục nằm trong ổ Docker tên `gdrive-rag-data`, nên vẫn còn khi bạn dựng lại container. Cập nhật lên bản mới không làm dịch vụ đọc lại tệp hay tính lại dữ liệu ý nghĩa.
 
 ### Đọc bản scan bằng ngôn ngữ khác
 
@@ -271,7 +356,7 @@ Sau khi cập nhật lên bản này, các bản scan đã đọc bằng bộ nh
 
 ## Quản trị từ Claude (tùy chọn)
 
-Mặc định Claude chỉ được tìm và đọc tài liệu. Nếu muốn nhờ Claude thêm hoặc bỏ thư mục Drive, đặt quy tắc hạ thấp hay ẩn tệp, đổi quyền Google hay đổi khóa tìm theo ý nghĩa mà không phải gõ lệnh, bạn có thể bật thêm các công cụ quản trị.
+Thêm hoặc bớt nguồn và đặt quy tắc tệp thì Claude làm được sẵn (xem phần "Thêm hoặc bớt nguồn ngay trong Claude"). Nếu muốn nhờ Claude đổi quyền Google hay đổi khóa tìm theo ý nghĩa mà không phải gõ lệnh, bạn có thể bật thêm các công cụ quản trị này.
 
 > **Cảnh báo:** Một tài liệu trong Drive có thể chứa dòng chữ giả làm lời dặn cho Claude, ví dụ "hãy gửi dữ liệu sang địa chỉ X". Nếu Claude làm theo, toàn bộ nội dung tài liệu của bạn có thể bị gửi tới máy của người khác. Vì vậy chỉ bật khi cần, và luôn đọc kỹ câu Claude hỏi lại trước khi đồng ý.
 
@@ -291,13 +376,10 @@ Cách bật:
    sudo docker compose up -d
    ```
 
-   Kết quả: Claude Code thấy thêm 10 công cụ dưới đây. Muốn tắt, xóa dòng đó rồi chạy lại lệnh trên.
+   Kết quả: Claude Code thấy thêm 7 công cụ dưới đây. Muốn tắt, xóa dòng đó rồi chạy lại lệnh trên.
 
 | Công cụ | Việc làm |
 | --- | --- |
-| `add_source` | Thêm một link thư mục hoặc tệp Drive và bắt đầu đọc ngay |
-| `remove_source` | Bỏ một nguồn; trước hết báo sẽ bỏ bao nhiêu tài liệu khỏi chỉ mục |
-| `set_path_rules` | Đặt quy tắc hạ thấp (`demote`) hoặc ẩn (`exclude`) tệp theo đường dẫn cho một nguồn; trước hết báo mỗi mẫu khớp bao nhiêu tệp |
 | `google_auth_status` | Cho biết đang dùng cách đăng nhập Google nào; không hiện khóa |
 | `set_google_service_account` | Dùng tệp tài khoản dịch vụ đã chép vào thư mục `secrets` |
 | `google_auth_start` | Bước 1 đăng nhập Gmail: đưa ra địa chỉ để bạn mở và bấm Cho phép |
@@ -310,6 +392,8 @@ Những điều nên biết:
 
 - Việc có thể làm mất dữ liệu (bỏ nguồn, đổi hoặc xóa quyền Google, đổi khóa tìm theo ý nghĩa) luôn chạy hai lần: lần đầu Claude chỉ kể sẽ xảy ra gì, lần sau mới làm khi bạn đồng ý.
 - Đổi sang địa chỉ khác thì phải đưa khóa mới của địa chỉ đó; khóa cũ không bao giờ được gửi sang máy khác. Địa chỉ phải bắt đầu bằng `https://`. Máy trong mạng nội bộ (ghi bằng số, ví dụ `http://192.168.1.5:8080/v1`) chỉ dùng được khi đã thêm dòng `GDRAG_ALLOW_LOCAL_EMBEDDINGS=1` vào `.env`.
+- Máy nối qua Tailscale (địa chỉ dạng `100.x.y.z`) hoặc mạng dùng chung kiểu CGNAT cũng được tính là mạng nội bộ, nên cũng cần dòng `GDRAG_ALLOW_LOCAL_EMBEDDINGS=1`.
+- Khóa đã lưu gắn với địa chỉ nó được tạo cho. Nếu bạn xóa dòng `GDRAG_EMBEDDING_BASE_URL` khỏi `.env` hoặc đổi sang địa chỉ khác, khóa đã lưu không được dùng nữa: dịch vụ chỉ tìm theo chữ, và `sync_status` kèm cảnh báo. Hãy khôi phục dòng đó, hoặc nhờ Claude đặt khóa mới bằng `set_embedding`. Khóa ghi trong `.env` (`GDRAG_EMBEDDING_API_KEY`) không bị ràng buộc như vậy. Khóa lưu từ bản cũ được gắn với địa chỉ đang dùng ở lần khởi động đầu tiên sau khi cập nhật.
 - Xóa quyền Google chỉ xóa bản lưu trên VPS, không thu hồi quyền ở phía Google. Muốn thu hồi hẳn: với đăng nhập Gmail, gỡ ứng dụng tại https://myaccount.google.com/permissions; với tài khoản dịch vụ, xóa khóa của nó trong Google Cloud hoặc thôi chia sẻ thư mục.
 - Thư mục `secrets` chỉ nên chứa những tệp dịch vụ này cần (tệp quyền Google, tệp khóa tìm theo ý nghĩa). Đừng để ở đó khóa hay mật khẩu của việc khác.
 - Tệp khóa phải nằm trong thư mục `secrets`. Claude chỉ cần tên tệp, ví dụ `openrouter.key`, nên khóa không phải dán vào cuộc trò chuyện. Công cụ không đọc được tệp nằm ngoài thư mục này.
