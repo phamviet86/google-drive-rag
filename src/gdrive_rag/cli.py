@@ -122,8 +122,11 @@ def cmd_source_remove(args: argparse.Namespace) -> int:
 
 def cmd_source_rules(args: argparse.Namespace) -> int:
     # the same rules and validation as the set_path_rules tool; without options it only shows
-    change = args.demote is not None or args.exclude is not None
-    _print(_admin(args).set_path_rules(args.source, args.demote, args.exclude, change), args.json)
+    change = any(v is not None for v in (args.demote, args.exclude, args.ignore))
+    result = _admin(args).set_path_rules(
+        args.source, args.demote, args.exclude, change, ignore=args.ignore
+    )
+    _print(result, args.json)
     return 0
 
 
@@ -317,14 +320,22 @@ def build_parser() -> argparse.ArgumentParser:
     remove.set_defaults(func=cmd_source_remove)
     rules = source.add_parser(
         "rules",
-        help="show or set search path rules of a source (demote / exclude glob patterns)",
-        description="Without --demote/--exclude: show the rules and what they match. "
+        help="show or set path rules of a source (demote / exclude / ignore)",
+        description="Without --demote/--exclude/--ignore: show the rules and what they match. "
         "Each option replaces that list; give it with no patterns to clear it. "
+        "--ignore keeps files out of the index (removed at the next sync; a folder link "
+        "covers everything below it). "
         "Example: source rules 1 --demote 'attachments/**'",
     )
     rules.add_argument("source", help="source id, name or link")
     rules.add_argument("--demote", nargs="*", metavar="PATTERN", help="files that rank lower")
     rules.add_argument("--exclude", nargs="*", metavar="PATTERN", help="files left out of search")
+    rules.add_argument(
+        "--ignore",
+        nargs="*",
+        metavar="ENTRY",
+        help="patterns, or Drive folder/file links or IDs, whose files are not indexed at all",
+    )
     rules.set_defaults(func=cmd_source_rules)
 
     auth = commands.add_parser("auth", help="Google credentials").add_subparsers(

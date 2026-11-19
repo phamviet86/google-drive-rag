@@ -136,6 +136,21 @@ MIGRATIONS = [
       PRIMARY KEY (source_id, file_id)
     );
     """,
+    # The ``ignore`` path-rule effect (files kept out of the index). SQLite cannot change a
+    # CHECK constraint in place, so the table is rebuilt with every row and its rowid (rules
+    # are read in rowid order). No other table is touched.
+    """
+    CREATE TABLE path_rules_v5 (
+      source_id INTEGER NOT NULL REFERENCES sources(id) ON DELETE CASCADE,
+      effect TEXT NOT NULL CHECK (effect IN ('demote', 'exclude', 'ignore')),
+      pattern TEXT NOT NULL,
+      PRIMARY KEY (source_id, effect, pattern)
+    );
+    INSERT INTO path_rules_v5(rowid, source_id, effect, pattern)
+      SELECT rowid, source_id, effect, pattern FROM path_rules;
+    DROP TABLE path_rules;
+    ALTER TABLE path_rules_v5 RENAME TO path_rules;
+    """,
 ]
 
 

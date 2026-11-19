@@ -187,16 +187,23 @@ class Admin:
         demote: list[str] | None = None,
         exclude: list[str] | None = None,
         confirm: bool = False,
+        ignore: list[str] | None = None,
     ) -> dict[str, Any]:
-        """Set a source's search path rules. An omitted list keeps the current patterns; an
-        empty list clears them. Without confirm it only previews how many documents each
-        pattern hits. Search-time only: nothing is re-extracted or re-embedded."""
+        """Set a source's path rules. An omitted list keeps the current entries; an empty list
+        clears them. Without confirm it only previews how many documents (and, for ignore,
+        folders) each entry hits. demote and exclude are search-time only; ignore keeps files
+        out of the index: hidden from search at once, removed by the sync it queues."""
         preview = self.service.source_preview(source)
         source_id = int(preview["id"])
         current = self.service.path_rules(source_id)
         wanted = {
             "demote": current["demote"] if demote is None else clean(demote, "demote"),
             "exclude": current["exclude"] if exclude is None else clean(exclude, "exclude"),
+            "ignore": (
+                current["ignore"]
+                if ignore is None
+                else self.service.ignore_entries(source_id, ignore)
+            ),
         }
         answer: dict[str, Any] = {
             "source": {"id": source_id, "name": preview["name"]},
@@ -205,19 +212,48 @@ class Admin:
             "matches": self.service.rule_matches(source_id, wanted),
         }
         found = answer["matches"]
-        if wanted["exclude"] and found["documents"] and found["excluded"] == found["documents"]:
+        everything = found["documents"]
+        if wanted["ignore"] and everything and found["ignored"] == everything:
+            raise AdminRefused(
+                "these ignore entries would remove every document of this source from the "
+                "index; use narrower entries, or remove_source to drop the source"
+            )
+        if wanted["ignore"] and found["empties_sources"]:
+            raise AdminRefused(
+                "these ignore entries would remove every document of another source ("
+                + ", ".join(found["empties_sources"])
+                + ") from the index, because a file any source ignores is not indexed; use "
+                "narrower entries, or remove_source to drop that source"
+            )
+        if wanted["exclude"] and everything and found["excluded"] + found["ignored"] == everything:
             raise AdminRefused(
                 "these exclude patterns would hide every document of this source from search; "
                 "use narrower patterns, or remove_source to drop the source"
             )
+        ignore_changed = wanted["ignore"] != current["ignore"]
         if not confirm:
             answer["would"] = (
                 "Search would use these rules for this source: demote lowers a file's score, "
-                "exclude leaves it out of results (still readable by ID). Nothing is re-indexed."
+                "exclude leaves it out of results (still readable by ID)."
+            ) + (
+                f" ignore: {found['ignored']} indexed documents and {found['ignored_folders']} "
+                "folders would be hidden from search at once and removed from the index by the "
+                "next sync, also where another source lists them (Drive is not changed); files "
+                "under an ignore entry are never downloaded or read. Removing an entry later "
+                "indexes those files again."
+                if ignore_changed
+                else " Nothing is re-indexed."
             )
             return {"applied": False, "confirm_needed": True, **answer}
-        self.service.set_path_rules(source_id, wanted)
-        return {"applied": True, "message": "Path rules saved; search uses them now.", **answer}
+        saved = self.service.set_path_rules(source_id, wanted)
+        message = "Path rules saved; search uses them now."
+        if saved["sync"] is not None:
+            answer["sync"] = saved["sync"]
+            message += (
+                " Ignored files are hidden now; a sync was queued to remove them from the index "
+                "(and to index files no longer ignored)."
+            )
+        return {"applied": True, "message": message, **answer}
 
     # -- Google access -------------------------------------------------------------------------
     def google_status(self) -> dict[str, Any]:

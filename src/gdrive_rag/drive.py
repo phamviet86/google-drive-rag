@@ -140,13 +140,15 @@ class Listing:
 
 @dataclass(frozen=True)
 class SkippedFile:
-    """A listed file that is not indexed because no extractor handles its type."""
+    """A listed file that is not indexed: no extractor handles its type, or a path rule
+    ignores it."""
 
     id: str
     path: str
     mime_type: str
     size: int | None
     reason: str
+    parent_id: str = ""  # folder it was listed in, so a folder ignore rule covers it too
 
 
 SHORTCUT_MIME = "application/vnd.google-apps.shortcut"
@@ -170,7 +172,9 @@ def split_supported(items: Sequence[DriveItem]) -> tuple[list[DriveItem], list[S
     for item in items:
         reason = skip_reason(item)
         if reason:
-            skipped.append(SkippedFile(item.id, item.path, item.mime_type, item.size, reason))
+            skipped.append(
+                SkippedFile(item.id, item.path, item.mime_type, item.size, reason, item.parent_id)
+            )
         else:
             kept.append(item)
     return kept, skipped

@@ -50,7 +50,7 @@ from .drive import (
 from .embeddings import EmbeddingClient, EmbeddingError
 from .extract import Extractor
 from .extraction_errors import ExtractionError
-from .rules import EFFECTS, clean, effects
+from .rules import EFFECTS, IGNORED_GLOB, clean, clean_ignore, effects, ignore_listing
 from .search import EMBEDDING_IDENTITY_KEY, REVISION_KEY, SearchEngine
 
 log = logging.getLogger("gdrive_rag")
@@ -266,19 +266,30 @@ class Service:
             return _rules_by_source(connection).get(source_id) or {e: [] for e in EFFECTS}
 
     def rule_matches(self, source_id: int, rules: dict[str, list[str]]) -> dict[str, Any]:
-        """How many of the source's documents each pattern hits, with a few example paths."""
+        """How many of the source's documents each pattern hits, with a few example paths. For
+        ignore entries also the folders, and which other sources lose documents with them (a
+        file any source ignores leaves the index)."""
         with self.db.read() as connection:
-            documents = [
-                (int(row[0]), str(row[1]), source_id)
-                for row in connection.execute(
-                    "SELECT d.id, d.path FROM documents d JOIN document_sources ds "
-                    "ON ds.document_id=d.id WHERE ds.source_id=? ORDER BY d.path",
-                    (source_id,),
-                )
-            ]
+            rows = connection.execute(
+                "SELECT d.id, d.path, d.file_id, d.parent_id FROM documents d "
+                "JOIN document_sources ds ON ds.document_id=d.id WHERE ds.source_id=? "
+                "ORDER BY d.path",
+                (source_id,),
+            ).fetchall()
+            folder_rows = connection.execute(
+                "SELECT f.folder_id, f.name, f.parent_id FROM folders f JOIN folder_sources fs "
+                "ON fs.folder_id=f.folder_id WHERE fs.source_id=?",
+                (source_id,),
+            ).fetchall()
+            others = connection.execute(
+                "SELECT s.id, s.name, ds.document_id FROM document_sources ds "
+                "JOIN sources s ON s.id=ds.source_id WHERE ds.source_id<>? ORDER BY s.id",
+                (source_id,),
+            ).fetchall()
+        documents = [(int(row[0]), str(row[1]), source_id) for row in rows]
         paths = {document_id: path for document_id, path, _ in documents}
         output: dict[str, Any] = {}
-        for effect in EFFECTS:
+        for effect in ("demote", "exclude"):
             per_pattern: dict[str, Any] = {}
             for pattern in rules.get(effect, []):
                 hit = effects([(source_id, effect, pattern)], documents)
@@ -287,23 +298,90 @@ class Service:
                     "examples": [paths[d] for d in list(hit)[:3]],
                 }
             output[effect] = per_pattern
+        # the same filter a sync applies, over what the index holds for this source
+        listing = Listing(
+            [DriveItem(str(r[2]), "", "", str(r[1]), "", "", None, "", str(r[3])) for r in rows],
+            folders=[DriveFolder(str(r[0]), str(r[1]), str(r[2])) for r in folder_rows],
+        )
+        by_file = {str(row[2]): int(row[0]) for row in rows}
+        folder_ids = {str(row[0]) for row in folder_rows}
+
+        def ignored(entries: list[str]) -> tuple[set[int], int]:
+            _, left_out = ignore_listing(listing, entries)
+            return {by_file[i] for i in left_out if i in by_file}, len(left_out & folder_ids)
+
+        output["ignore"] = {}
+        for entry in rules.get("ignore", []):
+            gone_here, folders = ignored([entry])
+            output["ignore"][entry] = {
+                "documents": len(gone_here),
+                "folders": folders,
+                "examples": [path for d, path, _ in documents if d in gone_here][:3],
+            }
+        gone, gone_folders = ignored(list(rules.get("ignore", [])))
         combined = effects(
-            [(source_id, e, p) for e in EFFECTS for p in rules.get(e, [])], documents
+            [(source_id, e, p) for e in ("demote", "exclude") for p in rules.get(e, [])],
+            documents,
         )
         output["documents"] = len(documents)
-        output["demoted"] = sum(1 for e, _ in combined.values() if e == "demote")
-        output["excluded"] = sum(1 for e, _ in combined.values() if e == "exclude")
+        for key, effect in (("demoted", "demote"), ("excluded", "exclude")):
+            output[key] = sum(1 for d, (e, _) in combined.items() if e == effect and d not in gone)
+        output["ignored"] = len(gone)
+        output["ignored_folders"] = gone_folders
+        held: dict[int, tuple[str, set[int]]] = {}
+        for row in others:
+            held.setdefault(int(row[0]), (str(row[1]), set()))[1].add(int(row[2]))
+        output["ignored_in_other_sources"] = {
+            name: len(ids & gone) for name, ids in held.values() if ids & gone
+        }
+        output["empties_sources"] = [name for name, ids in held.values() if ids <= gone][:10]
         return output
 
-    def set_path_rules(self, source_id: int, rules: dict[str, list[str]]) -> None:
-        """Replace the source's rules. Search-time only: no document, chunk or vector changes."""
-        cleaned = {effect: clean(rules.get(effect, []), effect) for effect in EFFECTS}
+    def ignore_entries(self, source_id: int, values: Any) -> list[str]:
+        """``rules.clean_ignore`` knowing the source's file and folder IDs, so a bare ID of one
+        is stored as an ID. An entry naming the source root itself is refused."""
+        with self.db.read() as connection:
+            root = connection.execute(
+                "SELECT root_id FROM sources WHERE id=?", (source_id,)
+            ).fetchone()
+            known = {
+                str(row[0])
+                for row in connection.execute(
+                    "SELECT d.file_id FROM documents d JOIN document_sources ds "
+                    "ON ds.document_id=d.id WHERE ds.source_id=? "
+                    "UNION SELECT folder_id FROM folder_sources WHERE source_id=? "
+                    "UNION SELECT file_id FROM skipped_files WHERE source_id=?",
+                    (source_id, source_id, source_id),
+                )
+            }
+        entries = clean_ignore(values, known.__contains__)
+        if root is not None and f"id:{root[0]}" in entries:
+            raise ValueError(
+                "ignore: an entry names the source itself; remove_source drops a whole source"
+            )
+        return entries
+
+    def set_path_rules(self, source_id: int, rules: dict[str, list[str]]) -> dict[str, Any]:
+        """Replace the source's rules. demote and exclude are search-time only: no document,
+        chunk or vector changes. When the ignore entries change, the source's 'ignored by rule'
+        skipped files are dropped (the next sync lists them under the new entries) and a sync
+        of every source is queued: it removes newly ignored files from the index (from every
+        source that lists them) and indexes files no longer ignored."""
+        cleaned = {effect: clean(rules.get(effect, []), effect) for effect in ("demote", "exclude")}
+        cleaned["ignore"] = self.ignore_entries(source_id, rules.get("ignore", []))
+        changed = cleaned["ignore"] != self.path_rules(source_id)["ignore"]
         with self.db.transaction() as connection:
             connection.execute("DELETE FROM path_rules WHERE source_id=?", (source_id,))
             connection.executemany(
                 "INSERT INTO path_rules(source_id, effect, pattern) VALUES(?,?,?)",
                 [(source_id, e, p) for e in EFFECTS for p in cleaned[e]],
             )
+            if changed:
+                connection.execute(
+                    "DELETE FROM skipped_files WHERE source_id=? AND reason GLOB ?",
+                    (source_id, IGNORED_GLOB),
+                )
+        return {"sync": self.queue_sync() if changed else None}
 
     def skipped_files(self, limit: int = SKIPPED_PAGE) -> dict[str, Any]:
         with self.db.read() as connection:
@@ -493,6 +571,8 @@ class Service:
         # failed, incomplete or left out of this pass (a one-source sync): such a source may
         # still hold a folder with its parent, so that parent is kept
         degraded: set[int] = {s["id"] for s in every} - {s["id"] for s in sources}
+        ignore = {s["id"]: s["path_rules"]["ignore"] for s in sources}
+        left_out: dict[int, set[str]] = {}  # IDs each listing's own ignore entries dropped
         for source in sources:
             outcome = {"name": source["name"], "ok": True}
             try:
@@ -504,6 +584,8 @@ class Service:
                     self._update_root(source["id"], root)
                     outcome["name"] = root.name
                 listing = backend.list_files(root)
+                # ignore rules: never downloaded, not listed membership, folders not registered
+                listing, left_out[source["id"]] = ignore_listing(listing, ignore[source["id"]])
                 kept, skipped = split_supported(listing.items)  # also for backends that list all
                 listing = Listing(
                     kept,
@@ -533,6 +615,7 @@ class Service:
                 self._set_source_status(source["id"], "error", _message(exc))
                 outcome.update(ok=False, error=_message(exc))
             report["sources"].append(outcome)
+        self._ignore_everywhere(listings, left_out)
         unique: dict[str, DriveItem] = {}
         holders: dict[str, list[int]] = {}
         for listed_by, found in listings.items():
@@ -624,6 +707,29 @@ class Service:
             _gc_vectors(connection)
             _bump(connection)
         return report
+
+    def _ignore_everywhere(
+        self, listings: dict[int, Listing | None], left_out: dict[int, set[str]]
+    ) -> None:
+        """A file or folder that one source's ignore entries dropped is dropped from every
+        listing of this pass, and so is a file a source left out of this pass ignored when it
+        was last listed (its 'ignored by rule' skipped rows)."""
+        listed = sorted(listings)
+        with self.db.read() as connection:
+            remembered = {
+                str(row[0])
+                for row in connection.execute(
+                    "SELECT file_id FROM skipped_files WHERE reason GLOB ? "
+                    f"AND source_id NOT IN ({','.join('?' for _ in listed)})",
+                    [IGNORED_GLOB, *listed],
+                )
+            }
+        everywhere = remembered.union(*left_out.values())
+        if not everywhere:
+            return
+        for source_id, found in listings.items():
+            if found is not None:
+                listings[source_id], _ = ignore_listing(found, (), everywhere)
 
     def _link_early(self, item: DriveItem, source_ids: list[int]) -> None:
         """During a first sync: link a processed file to its sources and ancestor folders now
@@ -1024,6 +1130,9 @@ class Service:
                 "SELECT ordinal, text, locator FROM chunks WHERE document_id=? ORDER BY ordinal",
                 (document["id"],),
             ).fetchall()
+        if int(document["id"]) in self.search_engine.ignored_documents():
+            # being removed by the next sync: already treated as not indexed
+            raise ValueError(f"document {document_id} is ignored by a path rule; not indexed")
         if page is not None:
             matching = [r for r in rows if _locator_has_page(str(r["locator"]), page)]
             start_chunk = int(matching[0]["ordinal"]) if matching else len(rows)

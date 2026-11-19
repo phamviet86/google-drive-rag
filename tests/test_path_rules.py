@@ -251,17 +251,21 @@ def test_set_path_rules_tool_previews_then_applies(env: Env) -> None:
     assert preview["applied"] is False and preview["confirm_needed"] is True
     assert preview["matches"]["demote"]["*.txt"] == {"documents": 1, "examples": ["hoa-don.txt"]}
     assert preview["matches"]["demoted"] == 1
-    assert env.tool("list_sources")["sources"][0]["path_rules"] == {"demote": [], "exclude": []}
+    assert env.tool("list_sources")["sources"][0]["path_rules"] == {
+        "demote": [],
+        "exclude": [],
+        "ignore": [],
+    }
 
     applied = env.tool("set_path_rules", source=ROOT, demote=["*.txt"], confirm=True)
     assert applied["applied"] is True
     rules = env.tool("list_sources")["sources"][0]["path_rules"]
-    assert rules == {"demote": ["*.txt"], "exclude": []}
+    assert rules == {"demote": ["*.txt"], "exclude": [], "ignore": []}
 
     kept = env.tool("set_path_rules", source=ROOT, exclude=["old/"], confirm=True)
-    assert kept["rules"] == {"demote": ["*.txt"], "exclude": ["old/"]}  # omitted list kept
+    assert kept["rules"] == {"demote": ["*.txt"], "exclude": ["old/"], "ignore": []}  # kept
     cleared = env.tool("set_path_rules", source=ROOT, demote=[], exclude=[], confirm=True)
-    assert cleared["rules"] == {"demote": [], "exclude": []}
+    assert cleared["rules"] == {"demote": [], "exclude": [], "ignore": []}
 
 
 def test_set_path_rules_tool_refuses_bad_arguments(env: Env) -> None:
@@ -295,7 +299,11 @@ def test_cli_source_rules(
     args = ["--data-dir", str(tmp_path), "--json", "source", "rules", ROOT]
     assert main(args) == 0  # no options: show only
     shown = json.loads(capsys.readouterr().out)
-    assert shown["applied"] is False and shown["rules"] == {"demote": [], "exclude": []}
+    assert shown["applied"] is False and shown["rules"] == {
+        "demote": [],
+        "exclude": [],
+        "ignore": [],
+    }
     assert main([*args, "--demote", "*.txt", "attachments/**"]) == 0
     assert json.loads(capsys.readouterr().out)["applied"] is True
     assert service.list_sources()[0]["path_rules"]["demote"] == ["*.txt", "attachments/**"]

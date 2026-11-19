@@ -103,10 +103,13 @@ class SourceInfo(BaseModel):
     first_sync_done: bool = Field(
         default=True, description="False until the first sync of this source has finished."
     )
-    skipped: int = Field(default=0, description="Listed files with no supported extractor.")
+    skipped: int = Field(
+        default=0, description="Listed files not indexed: unsupported type or ignored by rule."
+    )
     path_rules: dict[str, list[str]] = Field(
         default_factory=dict,
-        description="Search path patterns: demote lowers the score, exclude hides from search.",
+        description="Path rules: demote lowers the score, exclude hides from search, ignore "
+        "keeps files out of the index (globs, or id:<Drive ID> for a folder or file).",
     )
     path_rules_truncated: bool = Field(
         default=False, description="Some patterns were left out to fit the response."
@@ -166,7 +169,8 @@ class SyncNowOutput(BaseModel):
 class StatusOutput(BaseModel):
     sources: list[SourceInfo]
     skipped: dict[str, int] = Field(
-        default_factory=dict, description="Files not indexed because their type is unsupported."
+        default_factory=dict,
+        description="Files not indexed: unsupported type, or ignored by a path rule.",
     )
     skipped_files: list[dict[str, Any]] | None = Field(
         default=None, description="With include_skipped: the first skipped files."
@@ -230,7 +234,7 @@ def _fit_rules(value: dict[str, Any], sources: list[dict[str, Any]]) -> dict[str
 def _fit_rule_preview(value: dict[str, Any]) -> dict[str, Any]:
     """A set_path_rules result: drop example paths, then the old rules, to fit the wire."""
     if wire_size(value) > MAX_WIRE_CHARS:
-        for effect in ("demote", "exclude"):
+        for effect in ("demote", "exclude", "ignore"):
             for entry in value.get("matches", {}).get(effect, {}).values():
                 entry["examples"] = []
         value["truncated"] = True
@@ -503,14 +507,21 @@ def register_admin_tools(
         "matching files, exclude leaves them out of search (they stay indexed and readable by "
         "ID). Globs over the path shown in results: * within a name, ** across folders, a "
         "pattern without a leading / matches at any depth (attachments/** or *.bak). An omitted "
-        "list keeps the current patterns, an empty list clears them. Nothing is re-indexed. "
-        "Without confirm it previews how many documents each pattern hits.",
+        "list keeps the current patterns, an empty list clears them. demote and exclude "
+        "re-index nothing. ignore keeps files out of the index entirely (never downloaded or "
+        "read; hidden from search at once, removed by the sync it queues; removing the entry "
+        "indexes them again): a pattern like the others, or a Drive folder or file link (or "
+        "ID), where a folder covers everything below it even after a rename or move. Without "
+        "confirm it previews how many documents (and folders, for ignore) each entry hits.",
     )
     def set_path_rules(
         source: Annotated[Any, loose("string", "Source name, id or link.")] = None,
         demote: Annotated[Any, loose("array", "Patterns whose files rank lower.")] = None,
         exclude: Annotated[Any, loose("array", "Patterns whose files are left out.")] = None,
         confirm: Annotated[Any, loose("boolean", CONFIRM_TEXT)] = False,
+        ignore: Annotated[
+            Any, loose("array", "Patterns, folder or file links whose files are not indexed.")
+        ] = None,
     ) -> Annotated[CallToolResult, AdminOutput]:
         return run(
             lambda: _fit_rule_preview(
@@ -519,6 +530,7 @@ def register_admin_tools(
                     _patterns(demote, "demote"),
                     _patterns(exclude, "exclude"),
                     _flag(confirm),
+                    ignore=_patterns(ignore, "ignore"),
                 )
             )
         )

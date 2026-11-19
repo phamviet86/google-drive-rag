@@ -25,8 +25,9 @@ Per-source path rules (``rules.py``) apply only when a source has some: ``exclud
 scope condition (files named in ``files`` are never excluded) and ``demote`` puts a file's hits
 below the next ``rules.DEMOTE_PLACES`` other files. When demoted files take places in the
 candidate lists, the lists are topped up with the candidates ``exclude`` would have found, so
-the files that take their places are there to be found. With no rules the code path is the same
-as before.
+the files that take their places are there to be found. ``ignore`` (files kept out of the index;
+the next sync removes them) is hidden the same way until then, also when named in ``files``,
+which then gets a warning. With no rules the code path is the same as before.
 A scope on a source still on its first sync gets a warning with its progress instead of a
 silent empty result.
 """
@@ -45,7 +46,16 @@ from .db import TERM, Database, fts_fold
 from .drive import parse_drive_link
 from .embeddings import EmbeddingClient
 from .ranking import contains_phrase, idf, lexical_score, title_score, tokens
-from .rules import combine, demote, group, row_effect
+from .rules import (
+    ID_PREFIX,
+    IGNORED_GLOB,
+    IGNORED_REASON,
+    combine,
+    demote,
+    group,
+    is_id,
+    row_effect,
+)
 
 CANDIDATES = 200  # FTS candidates re-scored per query
 RRF_K = 60
@@ -87,13 +97,21 @@ class SearchEngine:
             raise ValueError("query must contain at least one word")
         warnings: list[str] = []
         try:
-            scope, named = self._scope(source, folder, files)
+            scope, named, notes = self._scope(source, folder, files)
         except NotIndexedYet as exc:
             return {"mode": "full_text", "warnings": [str(exc)], "results": []}
-        warnings += self._first_sync_notes(source, folder)
+        warnings += self._first_sync_notes(source, folder) + notes
         rules = self._rule_effects()
         if rules:
-            excluded = sorted(d for d, (e, _) in rules.items() if e == "exclude" and d not in named)
+            # ignored files are not indexed: hidden even when named in ``files``
+            excluded = sorted(
+                d
+                for d, (e, _) in rules.items()
+                if e == "ignore" or e == "exclude" and d not in named
+            )
+            warnings += self._ignored_notes(
+                sorted(d for d in named if rules.get(d, ("",))[0] == "ignore")
+            )
             if excluded:
                 condition = "c.document_id NOT IN (SELECT value FROM json_each(?))"
                 scope = (
@@ -218,6 +236,7 @@ class SearchEngine:
                     sources,
                 )
             ]
+            ignored = self._ignored_rows(connection, rules)
         # Memo per membership row (document, path, source) under these rules, read fresh on
         # every query: files linked or renamed during a sync get their rules at once, without
         # an index_revision bump (which would reload the vector matrix).
@@ -233,7 +252,60 @@ class SearchEngine:
             rows.append((row[0], memo[row]))
         if len(memo) > 4 * len(documents) + 1000:  # forget rows of renamed or removed files
             self._rule_cache = (key, {row: memo[row] for row in documents})
-        return combine(rows)
+        return combine([*rows, *ignored])
+
+    @staticmethod
+    def _ignored_rows(
+        connection: Any, rules: list[tuple[int, str, str]]
+    ) -> list[tuple[int, tuple[str, str] | None]]:
+        """Documents still in the index that ``id:`` ignore entries hit (the file itself, or a
+        folder of the same source above it), and documents a source's last listing ignored
+        (``skipped_files``): the next sync removes them; until then they are hidden."""
+        rows: list[tuple[int, tuple[str, str] | None]] = []
+        for source_id, effect, pattern in rules:
+            if effect != "ignore" or not is_id(pattern):
+                continue
+            ident = pattern[len(ID_PREFIX) :]
+            for row in connection.execute(
+                """SELECT ds.document_id FROM document_sources ds
+                   JOIN documents d ON d.id=ds.document_id
+                   WHERE ds.source_id=:source AND (d.file_id=:id OR (
+                     d.id IN (SELECT document_id FROM document_folders WHERE folder_id=:id)
+                     AND EXISTS (SELECT 1 FROM folder_sources
+                                 WHERE folder_id=:id AND source_id=:source)))""",
+                {"source": source_id, "id": ident},
+            ):
+                rows.append((int(row[0]), ("ignore", pattern)))
+        if any(effect == "ignore" for _, effect, _ in rules):
+            for row in connection.execute(
+                "SELECT d.id, k.reason FROM skipped_files k JOIN documents d "
+                "ON d.file_id=k.file_id WHERE k.reason GLOB ?",
+                (IGNORED_GLOB,),
+            ):
+                rows.append((int(row[0]), ("ignore", str(row[1])[len(IGNORED_REASON) :])))
+        return rows
+
+    def ignored_documents(self) -> set[int]:
+        """Document ids an ignore rule hits (hidden now, removed by the next sync)."""
+        return {d for d, (effect, _) in self._rule_effects().items() if effect == "ignore"}
+
+    def _ignored_notes(self, document_ids: list[int]) -> list[str]:
+        if not document_ids:
+            return []
+        with self.db.read() as connection:
+            names = [
+                str(row[0])
+                for row in connection.execute(
+                    "SELECT name FROM documents "
+                    f"WHERE id IN ({','.join('?' for _ in document_ids)}) ORDER BY name",
+                    document_ids,
+                )
+            ]
+        return [
+            f"file {name} is ignored by a path rule of its source: it is not indexed and is "
+            "left out"
+            for name in names
+        ]
 
     def _top_up(
         self,
@@ -284,12 +356,15 @@ class SearchEngine:
 
     def _scope(
         self, source: str | None, folder: str | None, files: list[str] | None
-    ) -> tuple[tuple[str, list[Any]], set[int]]:
-        """SQL condition on ``c.document_id`` (``""`` for no scope) with its parameters, and the
-        document ids named in ``files``. An unknown source, folder or file is an error naming
-        it, never an empty result; a folder unknown while a first sync runs is ``NotIndexedYet``."""
+    ) -> tuple[tuple[str, list[Any]], set[int], list[str]]:
+        """SQL condition on ``c.document_id`` (``""`` for no scope) with its parameters, the
+        document ids named in ``files``, and warnings. An unknown source, folder or file is an
+        error naming it, never an empty result; a folder unknown while a first sync runs is
+        ``NotIndexedYet``; a file an ignore rule kept out of the index is a warning (and adds
+        nothing to the scope)."""
         conditions: list[str] = []
         values: list[Any] = []
+        notes: list[str] = []
         if source:
             conditions.append(
                 "c.document_id IN (SELECT document_id FROM document_sources WHERE source_id=?)"
@@ -325,10 +400,23 @@ class SearchEngine:
                     raise ValueError(f"at most {MAX_FILES} files can be given")
                 ids: list[int] = []
                 for value in files:
+                    file_id = parse_drive_link(value)
                     row = connection.execute(
                         "SELECT id, name, status, error FROM documents WHERE file_id=?",
-                        (parse_drive_link(value),),
+                        (file_id,),
                     ).fetchone()
+                    if (
+                        row is None
+                        and connection.execute(
+                            "SELECT 1 FROM skipped_files WHERE file_id=? AND reason GLOB ?",
+                            (file_id, "ignored *"),  # by its own source's rule or another's
+                        ).fetchone()
+                    ):
+                        notes.append(
+                            f"file {value} is ignored by a path rule of its source: it is not "
+                            "indexed and is left out"
+                        )
+                        continue
                     if row is None:
                         raise ValueError(f"unknown or not indexed file: {value}")
                     if row["status"] != "indexed":
@@ -337,7 +425,7 @@ class SearchEngine:
                 conditions.append(f"c.document_id IN ({','.join('?' for _ in ids)})")
                 values.extend(ids)
         named = set(ids) if files else set()
-        return (" AND ".join(conditions), values), named
+        return (" AND ".join(conditions), values), named, notes
 
     def _full_text(
         self, terms: list[str], scope: tuple[str, list[Any]], pool: int
