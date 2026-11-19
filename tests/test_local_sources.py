@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import json
 import os
+import unicodedata
 from pathlib import Path
 from typing import Any
 
@@ -15,7 +16,7 @@ from helpers import FakeDrive, FakeEmbeddings, make_service
 from gdrive_rag.admin import ADMIN_ENV, Admin, AdminRefused
 from gdrive_rag.cli import main
 from gdrive_rag.config import load_settings
-from gdrive_rag.drive import Download, DriveItem, DriveSourceError
+from gdrive_rag.drive import Download, DriveDownloadError, DriveItem, DriveSourceError
 from gdrive_rag.local import LocalBackend, local_mime
 from gdrive_rag.service import Service
 
@@ -152,10 +153,10 @@ def test_sync_search_read_and_folder_scope(tmp_path: Path) -> None:
     (root / "thu-muc-lien-ket").symlink_to(root / "hop-dong")
     service.add_sources(["local:."])
     report = service.sync()
-    assert report["failed"] == 0 and report["indexed"] == 4, report
+    assert report["failed"] == 0 and report["indexed"] == 3, report
     assert names(service, "đồng") == {"thue.txt", "mau.md"}
     assert names(service, "dong", folder="local:hop-dong/2025") == {"thue.txt"}
-    assert names(service, "giao ban") == {"ghi-chu.txt", "lien-ket.txt"}
+    assert names(service, "giao ban") == {"ghi-chu.txt"}  # the link is a duplicate: skipped
     assert names(service, "giao ban", files=["local:ghi-chu.txt"]) == {"ghi-chu.txt"}
     assert names(service, "outside text") == set()
     assert names(service, "hidden") == set()
@@ -173,8 +174,9 @@ def test_sync_search_read_and_folder_scope(tmp_path: Path) -> None:
     assert [f["name"] for f in inner["folders"]] == ["2025"]
     assert [d["document_id"] for d in inner["documents"]] == ["local:hop-dong/mau.md"]
     skipped = {f["path"]: f["reason"] for f in service.skipped_files()["files"]}
-    assert set(skipped) == {"bang.xyz", "ra-ngoai.txt", "thu-muc-lien-ket"}
+    assert set(skipped) == {"bang.xyz", "ra-ngoai.txt", "thu-muc-lien-ket", "lien-ket.txt"}
     assert "outside" in skipped["ra-ngoai.txt"] and "folder" in skipped["thu-muc-lien-ket"]
+    assert "duplicate" in skipped["lien-ket.txt"]
     status = service.status()
     assert status["local_folder"] == {"configured": True, "ok": True, "error": None}
     assert status["sources"][0]["first_sync_done"] is True
@@ -421,3 +423,194 @@ def test_local_mime_is_deterministic() -> None:
     assert local_mime("a.docx").endswith("wordprocessingml.document")
     assert local_mime("a.xlsb") == "application/vnd.ms-excel.sheet.binary.macroenabled.12"
     assert local_mime("a.unknownext") == "application/octet-stream"
+
+
+# -- review fixes: secrets, races, NFC/NFD, skipped IDs, empty mounts, links --------------------
+SERVICE_ACCOUNT = (
+    '{"type": "service_account", "private_key": "-----BEGIN PRIVATE KEY-----\\nMIIEvQIBADANBgkq"}'
+)
+
+
+def test_secrets_and_data_folders_under_the_root_are_never_indexed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = tmp_path / "home"  # the owner mounted their whole home folder as /local
+    write(root / "project" / "secrets" / "sa.json", SERVICE_ACCOUNT)
+    write(root / "Documents" / "x.txt", "tài liệu thường")
+    monkeypatch.setenv("GDRAG_SECRETS_DIR", str(root / "project" / "secrets"))
+    service = make_service(root / "gdrive-data", local_root=root)  # the data folder is inside too
+    [added] = service.add_sources(["local:."])
+    assert added["ok"]
+    for hidden in ("local:project/secrets", "local:project/secrets/sa.json", "local:gdrive-data"):
+        [refused] = service.add_sources([hidden])
+        assert not refused["ok"] and "inside the local folder" in refused["error"]
+    report = service.sync()
+    assert report["failed"] == 0
+    assert names(service, "private_key service_account") == set()
+    assert names(service, "thường") == {"x.txt"}
+    with service.db.read() as connection:
+        paths = {r[0] for r in connection.execute("SELECT path FROM documents")}
+        skipped = {r[0]: r[1] for r in connection.execute("SELECT path, reason FROM skipped_files")}
+    assert paths == {"Documents/x.txt"}
+    assert skipped["project/secrets"].startswith("protected folder")
+    assert "gdrive-data" in skipped  # one row per protected folder, never its files
+    assert not any("sa.json" in path or "private" in reason for path, reason in skipped.items())
+
+
+def test_protected_folder_is_matched_by_device_and_inode(tmp_path: Path) -> None:
+    """The same host folder mounted at two places has two real paths but one inode."""
+    root = tmp_path / "local"
+    write(root / "ok.txt", "an ordinary note")
+    write(root / "mirror" / "key.txt", "secret mirror text")
+    info = (root / "mirror").stat()
+
+    class Mounted(LocalBackend):
+        def _protected_keys(self):  # type: ignore[no-untyped-def]
+            return [tmp_path / "elsewhere"], {(info.st_dev, info.st_ino)}
+
+    backend = Mounted(root)
+    with pytest.raises(ValueError):
+        backend.parse("local:mirror/key.txt")
+    listing = backend.list_files(backend.resolve("local:."))
+    assert [i.id for i in listing.items] == ["local:ok.txt"]
+    assert [s.id for s in listing.skipped] == ["local:mirror"]
+
+
+def test_credential_files_are_refused_even_outside_the_secrets_folder(tmp_path: Path) -> None:
+    root = tmp_path / "local"
+    write(root / "notes" / "sa-copy.json", SERVICE_ACCOUNT)
+    write(root / "notes" / "token.txt", "refresh GOCSPX-abcdefghijklmnopqrstuvwx1234")
+    write(root / "notes" / "ok.txt", "how to create a service account in a nutshell")
+    service = make_service(tmp_path / "data", local_root=root)
+    service.add_sources(["local:."])
+    report = service.sync()
+    assert report["failed"] == 2 and report["indexed"] == 1
+    assert names(service, "service account") == {"ok.txt"}
+    assert names(service, "MIIEvQIBADANBgkq") == set()
+    errors = {f["path"]: f["error"] for f in service.status()["recent_failures"]}
+    assert all("credential" in e and "MIIE" not in e for e in errors.values())
+
+
+def test_download_refuses_a_folder_swapped_for_a_link_after_the_check(tmp_path: Path) -> None:
+    root = tmp_path / "local"
+    write(root / "d" / "note.txt", "harmless note")
+    secret = write(tmp_path / "outside" / "d" / "note.txt", "SECRET-KEY-123")
+
+    class Racy(LocalBackend):
+        def _path(self, identifier: str, base: Path) -> Path:
+            checked = super()._path(identifier, base)
+            if identifier == "local:d/note.txt" and not (root / "d").is_symlink():
+                os.rename(root / "d", tmp_path / "d-old")
+                (root / "d").symlink_to(secret.parent)  # swapped after the check
+            return checked
+
+    service = make_service(tmp_path / "data", local_root=root)
+    service.local_factory = lambda settings: Racy(root)
+    service.add_sources(["local:."])
+    report = service.sync()
+    assert report["failed"] == 1 and report["indexed"] == 0
+    assert service.search("SECRET-KEY-123")["results"] == []
+    assert "link changed" in service.status()["recent_failures"][0]["error"]
+
+
+def test_last_component_link_is_not_followed_at_download(tmp_path: Path) -> None:
+    root = tmp_path / "local"
+    write(root / "a.txt", "plain alpha")
+    outside = write(tmp_path / "outside.txt", "OUTSIDE-TEXT")
+    backend = LocalBackend(root)
+    item = backend.list_files(backend.resolve("local:.")).items[0]
+    (root / "a.txt").unlink()
+    (root / "a.txt").symlink_to(outside)  # replaced by a link between listing and reading
+    with pytest.raises(DriveDownloadError):
+        backend.download(item)
+
+
+def test_nfc_typed_names_find_nfd_names_on_disk(tmp_path: Path) -> None:
+    root = tmp_path / "local"
+    nfd = unicodedata.normalize("NFD", "Hợp đồng")
+    write(root / nfd / "a.txt", "hop dong thue kho")
+    write(root / "k.txt", "other")
+    service = make_service(tmp_path / "data", local_root=root)
+    [added] = service.add_sources(["local:Hợp đồng"])  # typed in NFC
+    assert added["ok"] and added["root_id"] == "local:Hợp đồng" and added["name"] == "Hợp đồng"
+    [again] = service.add_sources([f"local:{nfd}"])  # the NFD spelling is the same source
+    assert again["already_added"]
+    [by_path] = service.add_sources([str(root / nfd / "a.txt")])
+    assert by_path["ok"] and by_path["root_id"] == "local:Hợp đồng/a.txt"
+    assert service.sync()["failed"] == 0
+    for typed in ("local:Hợp đồng/a.txt", f"local:{nfd}/a.txt"):
+        assert service.read(typed)["file_name"] == "a.txt"
+        assert names(service, "thue kho", files=[typed]) == {"a.txt"}
+    for typed in ("local:Hợp đồng", f"local:{nfd}"):
+        assert names(service, "thue kho", folder=typed) == {"a.txt"}
+    assert "removed" in service.remove_source(f"local:{nfd}/a.txt")
+
+
+def test_skipped_ids_are_relative_to_the_local_root(tmp_path: Path) -> None:
+    root = tmp_path / "local"
+    write(root / "docs" / "a.txt", "alpha text")
+    write(root / "out.txt", "a real out file")
+    write(root / "docs" / "100%" / "b.xyz", "unsupported")
+    (root / "docs" / "ra-ngoai").symlink_to(tmp_path)  # link to a folder outside
+    service = make_service(tmp_path / "data", local_root=root)
+    service.add_sources(["local:docs"])
+    service.sync()
+    with service.db.read() as connection:
+        rows = {r[0]: r[1] for r in connection.execute("SELECT file_id, path FROM skipped_files")}
+    assert rows == {"local:docs/ra-ngoai": "ra-ngoai", "local:docs/100%/b.xyz": "100%25/b.xyz"}
+
+
+def test_empty_source_folder_with_documents_is_a_mount_problem(tmp_path: Path) -> None:
+    root = tmp_path / "local"
+    write(root / "keep.txt", "keep me")
+    write(root / "usb" / "a.txt", "usb alpha")
+    write(root / "usb" / "b.txt", "usb beta")
+    (root / "vazio").mkdir()
+    service = make_service(tmp_path / "data", local_root=root)
+    service.add_sources(["local:usb", "local:vazio"])
+    assert service.sync()["indexed"] == 2
+    for path in (root / "usb").iterdir():  # the disk is unplugged: an empty mount point stays
+        path.rename(tmp_path / path.name)
+    (root / "usb" / ".hidden").write_text("hidden does not count")
+    report = service.sync()
+    usb = next(s for s in report["sources"] if s["name"] == "usb")
+    assert not usb["ok"] and "empty" in usb["error"] and report.get("removed", 0) == 0
+    assert service.status()["documents"]["indexed"] == 2
+    assert next(s for s in report["sources"] if s["name"] == "vazio")["ok"]  # always empty: fine
+    for path in tmp_path.glob("[ab].txt"):  # the disk is back
+        path.rename(root / "usb" / path.name)
+    assert service.sync()["unchanged"] == 2
+    assert "removed" in service.remove_source("local:usb")  # clearing it on purpose still works
+
+
+def test_remove_source_by_absolute_path_when_the_root_is_a_symlink(tmp_path: Path) -> None:
+    real = tree(tmp_path / "real-local")
+    link = tmp_path / "mnt-local"
+    link.symlink_to(real)
+    service = make_service(tmp_path / "data", local_root=link)
+    [added] = service.add_sources([str(link / "hop-dong")])
+    assert added["ok"] and added["root_id"] == "local:hop-dong"
+    assert "removed" in service.remove_source(str(link / "hop-dong"))
+    service.add_sources(["local:hop-dong"])
+    assert "removed" in service.remove_source(str(real / "hop-dong"))
+
+
+def test_symlink_to_a_file_the_source_lists_is_skipped_as_duplicate(tmp_path: Path) -> None:
+    root = tmp_path / "local"
+    write(root / "docs" / "a.txt", "alpha unique text")
+    write(root / "other" / "b.txt", "beta unique text")
+    (root / "docs" / "a-link.txt").symlink_to(root / "docs" / "a.txt")
+    (root / "docs" / "b-link.txt").symlink_to(root / "other" / "b.txt")  # not listed by docs
+    (root / "docs" / "hidden-link.txt").symlink_to(write(root / ".h" / "c.txt", "gamma hidden"))
+    service = make_service(tmp_path / "data", local_root=root)
+    service.add_sources(["local:docs"])
+    service.sync()
+    assert names(service, "unique") == {"a.txt", "b-link.txt"}
+    assert names(service, "gamma") == set()
+    with service.db.read() as connection:
+        skipped = {
+            r[0]: r[1] for r in connection.execute("SELECT file_id, reason FROM skipped_files")
+        }
+    assert "duplicate" in skipped["local:docs/a-link.txt"]
+    assert "hidden" in skipped["local:docs/hidden-link.txt"]
+    assert "local:docs/b-link.txt" not in skipped

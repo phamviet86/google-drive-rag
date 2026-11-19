@@ -54,13 +54,12 @@ from .config import (
 )
 from .drive import parse_drive_link
 from .embeddings import OpenAICompatibleEmbeddings
-from .local import is_local_input
+from .local import SECRETS_ENV, is_local_input
 from .rules import clean
 from .search import EMBEDDING_IDENTITY_KEY
 from .service import Service, SyncBusy
 
 ADMIN_ENV = "GDRAG_ADMIN_TOOLS"
-SECRETS_ENV = "GDRAG_SECRETS_DIR"
 GOOGLE_ENV = ("GDRAG_GOOGLE_AUTH", "GDRAG_GOOGLE_CREDENTIALS")
 OAUTH_EXPIRY_SECONDS = 600
 MAX_SECRET_FILE_BYTES = 1_000_000
