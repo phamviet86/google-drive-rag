@@ -190,8 +190,9 @@ def is_local_id(value: str) -> bool:
 
 
 def local_id(relative: str) -> str:
-    """``local:<relative path>``; the local root itself is ``local:.``."""
-    return LOCAL_PREFIX + (relative.strip("/") or ".")
+    """``local:<relative path>``; the local root itself is ``local:.``. Always NFC, so a name
+    typed in NFC finds the same ID as one stored from an NFD name on disk (macOS copies)."""
+    return LOCAL_PREFIX + (unicodedata.normalize("NFC", relative).strip("/") or ".")
 
 
 def normalize_local_id(value: str) -> str:

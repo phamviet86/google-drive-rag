@@ -454,14 +454,35 @@ class Service:
             ).fetchall()
         return {"total": total, "files": [dict(row) for row in rows]}
 
+    def _refuse_vanished_folder(self, source: dict[str, Any], listing: Listing) -> None:
+        """A local folder source that lists nothing at all while it holds indexed documents is
+        most likely an unplugged disk or a failed mount that left an empty mount point: stop
+        (``DriveSourceError``, nothing deleted) instead of clearing it. A folder that was always
+        empty, and one that still lists subfolders, is fine."""
+        if source["kind"] != "local_folder" or listing.items or listing.skipped:
+            return
+        if not listing.complete or len(listing.folders) > 1:
+            return
+        with self.db.read() as connection:
+            held = connection.execute(
+                "SELECT 1 FROM document_sources WHERE source_id=? LIMIT 1", (source["id"],)
+            ).fetchone()
+        if held is not None:
+            raise DriveSourceError(
+                "this local folder is empty now, which usually means the disk or mount is "
+                "missing; nothing is removed from the index until it has files again (remove "
+                "the source to clear it on purpose)"
+            )
+
     def _find_source(self, value: str) -> dict[str, Any]:
         with contextlib.suppress(ValueError):
             value = parse_drive_link(value)
         if value.startswith("/") and self.settings.local_root is not None:
             # an absolute path inside the local root names that local source (lexically: the
             # path itself may be gone, which is why the source is being removed)
+            # resolved like LocalBackend.parse does, so a root reached through a link works
             root = os.path.realpath(self.settings.local_root)
-            inside = os.path.normpath(value)
+            inside = os.path.realpath(value)
             if os.path.commonpath([root, inside]) == root:
                 value = local_id(os.path.relpath(inside, root).replace(os.sep, "/"))
         with self.db.read() as connection:
@@ -669,6 +690,7 @@ class Service:
                     self._update_root(source["id"], root)
                     outcome["name"] = root.name
                 listing = backend.list_files(root)
+                self._refuse_vanished_folder(source, listing)
                 # ignore rules: never downloaded, not listed membership, folders not registered
                 listing, left_out[source["id"]] = ignore_listing(listing, ignore[source["id"]])
                 kept, skipped = split_supported(listing.items)  # also for backends that list all
