@@ -210,6 +210,23 @@ class Glob:
         self.tokens = tokens
         self._closures: dict[int, frozenset[int]] = {}
         self._below: dict[frozenset[int], bool] = {}
+        # The longest run of literal characters every match must contain: a cheap substring
+        # test before running the NFA over many paths. Tokens a skip can jump over are
+        # optional, and a run breaks where a skip lands.
+        optional: set[int] = set()
+        targets: set[int] = set()
+        for index, (kind, value) in enumerate(tokens):
+            if kind == "skip":
+                optional.update(range(index + 1, int(value)))
+                targets.add(int(value))
+        runs, run = [""], ""
+        for index, (kind, value) in enumerate(tokens):
+            if kind != "lit" or index in optional or index in targets:
+                runs.append(run)
+                run = ""
+            if kind == "lit" and index not in optional:
+                run += str(value)
+        self.needle = max([*runs, run], key=len)
 
     def _closure(self, state: int) -> frozenset[int]:
         known = self._closures.get(state)
@@ -439,13 +456,16 @@ def ignore_listing(
             return named[item_id]
         if parent_id in why:
             return why[parent_id]
+        folded = fold(path)
         above, states = state.get(parent_id, ("", []))
         if parent_id in state and (not above or path.startswith(f"{above}/")):
             rest = fold(path[len(above) + 1 :] if above else path)
             pairs = zip(globs, states, strict=True)
-            return next((e for (e, g), s in pairs if g.accepts(g.advance(s, rest))), None)
-        folded = fold(path)
-        return next((e for e, g in globs if g.match(folded)), None)
+            return next(
+                (e for (e, g), s in pairs if g.needle in folded and g.accepts(g.advance(s, rest))),
+                None,
+            )
+        return next((e for e, g in globs if g.needle in folded and g.match(folded)), None)
 
     def reason(entry: str) -> str:
         return IGNORED_REASON + entry if entry else OTHER_SOURCE_REASON
