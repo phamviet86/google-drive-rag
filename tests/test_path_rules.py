@@ -473,10 +473,14 @@ def test_hits_beyond_the_per_file_cap_come_after_every_capped_hit(tmp_path: Path
     drive.put(SOURCE, "fileBig000000001", "big.txt", big.encode())
     drive.put(SOURCE, "fileSmall0000001", "small.txt", "Phí giữ xe cũ.".encode())
     drive.put(SOURCE, "fileSmall0000002", "other.txt", "Bảng giữ xe.".encode())
+    drive.add_folder("folderArch000001", "archive", SOURCE)
+    drive.put(SOURCE, "fileArch00000001", "x.txt", "Lịch họp.".encode(), parent="folderArch000001")
     service = make_service(tmp_path, drive, None, chunk_chars=100, chunk_overlap=0)
     service.add_sources([SOURCE])
     service.sync()
-    full = consistent_over_limits(service, "phí giữ xe tháng")  # no rules
+    # a rule that touches none of the hits; without any rule the old fill order is kept
+    service.set_path_rules(1, {"demote": ["archive/"], "exclude": []})
+    full = consistent_over_limits(service, "phí giữ xe tháng")
     files = [hit["file_name"] for hit in full]
     assert files.count("big.txt") > 3 and "small.txt" in files and "other.txt" in files
     assert files[:3] == ["big.txt"] * 3  # its best hits first, then the other files ...

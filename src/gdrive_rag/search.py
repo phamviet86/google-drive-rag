@@ -136,7 +136,7 @@ class SearchEngine:
             if applied:
                 demoted = {document_of[c] for c in applied}
                 ordered = demote(ordered, document_of, demoted, scores)
-        results = self._rows(ordered, scores, limit)
+        results = self._rows(ordered, scores, limit, ruled=bool(rules))
         if explain:
             fts = {c: (rank, score, bm25) for rank, (c, score, bm25) in enumerate(lexical, 1)}
             vec = {c: (rank, score) for rank, (c, score) in enumerate(semantic, 1)}
@@ -460,7 +460,7 @@ class SearchEngine:
             return ids, matrix
 
     def _rows(
-        self, ordered: list[int], scores: dict[int, float], limit: int
+        self, ordered: list[int], scores: dict[int, float], limit: int, ruled: bool = False
     ) -> list[dict[str, Any]]:
         if not ordered:
             return []
@@ -482,6 +482,20 @@ class SearchEngine:
                     batch,
                 ):
                     rows[int(row["id"])] = row
+        if not ruled:  # unchanged without path rules (the ranking was tuned on this)
+            present = [chunk_id for chunk_id in ordered if chunk_id in rows]
+            chosen: list[int] = []
+            counts: dict[int, int] = {}
+            for chunk_id in present:  # at most PER_DOCUMENT hits per file first ...
+                document = int(rows[chunk_id]["document_id"])
+                if counts.get(document, 0) < PER_DOCUMENT and len(chosen) < limit:
+                    counts[document] = counts.get(document, 0) + 1
+                    chosen.append(chunk_id)
+            if len(chosen) < limit:  # ... then fill from the same files when the scope is narrow
+                taken = set(chosen)
+                chosen += [c for c in present if c not in taken][: limit - len(chosen)]
+                chosen.sort(key=lambda chunk_id: scores[chunk_id], reverse=True)
+            return [self._hit(rows[chunk_id], scores[chunk_id]) for chunk_id in chosen]
         capped: list[int] = []
         overflow: list[int] = []
         per_document: dict[int, int] = {}
@@ -492,9 +506,9 @@ class SearchEngine:
             seen = per_document.get(document, 0)
             per_document[document] = seen + 1
             (capped if seen < PER_DOCUMENT else overflow).append(chunk_id)
-        # ... then more from the same files when the scope is narrow. They come after every
-        # capped hit whatever the limit, so a smaller limit shows the start of a larger one;
-        # one that outscores the hit above it gets a score just below that hit.
+        # ... then more from the same files when the scope is narrow. With path rules they
+        # come after every capped hit whatever the limit, so a smaller limit shows the start of
+        # a larger one; one that outscores the hit above it gets a score just below that hit.
         output: list[dict[str, Any]] = []
         previous = math.inf
         for chunk_id in (capped + overflow)[:limit]:
