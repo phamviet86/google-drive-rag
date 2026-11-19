@@ -18,6 +18,10 @@ services:
       - gdrive-rag-data:/data
       # Put the Google JSON file here (owned by uid 10001, mode 600); mounted read-only.
       - ./secrets:/secrets:ro
+      # Local folder sources: this host folder is seen as /local inside the container
+      # (read-only; files must be readable by uid 10001, e.g. mode 644 / folders 755).
+      # Change the host folder with GDRAG_LOCAL_HOST_DIR in .env.
+      - ${GDRAG_LOCAL_HOST_DIR:-./local}:/local:ro
 
 volumes:
   gdrive-rag-data:

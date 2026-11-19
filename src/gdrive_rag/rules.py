@@ -40,7 +40,14 @@ from dataclasses import replace
 from typing import Any
 
 from .db import fts_fold
-from .drive import Listing, SkippedFile, display_segment, parse_drive_link
+from .drive import (
+    Listing,
+    SkippedFile,
+    display_segment,
+    is_local_id,
+    normalize_local_id,
+    parse_drive_link,
+)
 
 EFFECTS = ("demote", "exclude", "ignore")
 RANK = {"ignore": 0, "exclude": 1, "demote": 2}  # the lower rank wins on one document
@@ -124,8 +131,8 @@ def looks_like_drive_id(value: str) -> bool:
 
 def clean_ignore(values: Any, known: Callable[[str], bool] = lambda _: False) -> list[str]:
     """Validated ignore entries in their stored form: ``id:<ID>`` for a Drive link, an
-    ``id:`` entry, a value ``known`` says is an ID, or a bare Drive ID; a glob otherwise (same
-    checks as ``clean``). Messages never repeat a value."""
+    ``id:`` entry, a ``local:`` ID, a value ``known`` says is an ID, or a bare Drive ID; a glob
+    otherwise (same checks as ``clean``). Messages never repeat a value."""
     if not isinstance(values, list | tuple):
         raise ValueError("ignore must be a list of path patterns, Drive links or IDs")
     result: list[str] = []
@@ -137,9 +144,13 @@ def clean_ignore(values: Any, known: Callable[[str], bool] = lambda _: False) ->
             raise ValueError("ignore: an entry contains a control character")
         if is_id(entry):
             ident = entry[len(ID_PREFIX) :].strip()
-            if not ident or any(c.isspace() for c in ident):
+            if is_local_id(ident):
+                ident = normalize_local_id(ident)  # a path: spaces are allowed
+            elif not ident or any(c.isspace() for c in ident):
                 raise ValueError("ignore: an id: entry needs one ID after id:")
             stored = ID_PREFIX + ident
+        elif is_local_id(entry):  # local:<path inside the local folder>, file or folder
+            stored = ID_PREFIX + normalize_local_id(entry)
         elif "://" in entry:
             try:
                 stored = ID_PREFIX + parse_drive_link(entry)

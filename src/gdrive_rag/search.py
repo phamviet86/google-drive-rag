@@ -382,7 +382,8 @@ class SearchEngine:
                     listing = [
                         first_sync_note(r)
                         for r in connection.execute(
-                            f"{_PENDING_SOURCES} AND s.last_status='pending' AND s.kind!='file'"
+                            f"{_PENDING_SOURCES} AND s.last_status='pending' "
+                            "AND s.kind NOT IN ('file','local_file')"
                         )
                     ]
                     if listing:
