@@ -1105,6 +1105,8 @@ class Service:
                 "pending": self._pending_vectors(),
                 "rejected": self._failed_vectors(),
                 "last_error": self.db.get_meta("last_embedding_error"),
+                "key_origin": settings.public()["embedding_key_origin"],
+                "warning": settings.embedding_warning,
             },
             "google_auth": settings.google_auth,
             "settings_from": setting_origins(settings.data_dir),

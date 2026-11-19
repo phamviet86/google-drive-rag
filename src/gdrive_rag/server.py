@@ -608,8 +608,8 @@ def register_admin_tools(
     ) -> Annotated[CallToolResult, AdminOutput]:
         return run(
             lambda: admin.set_embedding(
-                _text(base_url, "base_url"),
-                _text(model, "model"),
+                _text(base_url, "base_url", required=False) or None,
+                _text(model, "model", required=False) or None,
                 _text(api_key_file, "api_key_file", required=False) or None,
                 _text(api_key, "api_key", required=False) or None,
                 _number(dimensions, "dimensions"),

@@ -493,7 +493,7 @@ def test_settings_change_during_a_sync_applies_from_the_next_step(
 def test_bad_arguments_never_echo_secrets(env: Env) -> None:
     """The SDK's own validation error prints every argument; these tools never trigger it."""
     cases = [
-        {"model": "m", "api_key": API_KEY},  # missing base_url
+        {"base_url": "https://x/v1", "model": [5], "api_key": API_KEY},  # model not a string
         {"base_url": "https://x/v1", "model": "m", "api_key": [API_KEY]},
         {"base_url": "https://x/v1", "model": "m", "api_key": {"k": API_KEY}},
         {"base_url": "https://x/v1", "model": "m", "api_key": API_KEY, "dimensions": "many"},

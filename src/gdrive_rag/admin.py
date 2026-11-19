@@ -371,6 +371,14 @@ class Admin:
             raise AdminRefused(
                 "a new address needs its own API key: pass api_key_file (or api_key) as well"
             )
+        if settings.embedding_key_mismatch and not new_key:
+            # the stored key belongs to another origin than the address in effect; saving it
+            # now would silently re-bind it to this address
+            raise AdminRefused(
+                f"the stored API key was set for {settings.embedding_key_origin}, not for "
+                f"{netcheck.origin(settings.embedding_base_url)}: pass api_key_file (or "
+                "api_key) for this address"
+            )
         if moves and os.environ.get("GDRAG_EMBEDDING_API_KEY", "").strip():
             raise AdminRefused(
                 "the API key comes from GDRAG_EMBEDDING_API_KEY in the environment (.env); the "
@@ -389,6 +397,8 @@ class Admin:
             "embedding_dimensions": dims,
         }
         changes = _refuse_environment(changes)
+        if "embedding_api_key" in changes:  # a key from the environment is never stored
+            changes["embedding_key_origin"] = netcheck.origin(base_url)
         identity = OpenAICompatibleEmbeddings(base_url, "", model, dims, "").identity
         stored = self.service.db.get_meta(EMBEDDING_IDENTITY_KEY)
         with self.service.db.read() as connection:
@@ -448,7 +458,7 @@ class Admin:
         )
         if not confirm:
             return {"applied": False, "confirm_needed": True, "would": message}
-        save_config(settings.data_dir, {"embedding_api_key": ""})
+        save_config(settings.data_dir, {"embedding_api_key": "", "embedding_key_origin": ""})
         self.service.reload()
         return {"applied": True, "message": message, "vectors_kept": vectors}
 
@@ -466,6 +476,8 @@ def import_environment(service: Service) -> dict[str, Any]:
         if os.environ.get(name, "").strip()
     }
     if values:
+        if "embedding_api_key" in values:  # bind the imported key to the address it was used with
+            values["embedding_key_origin"] = netcheck.origin(settings.embedding_base_url)
         save_config(settings.data_dir, values)
         blank += [name for name, key in ENV_FIELDS.items() if key in values]
     settings = service.reload()
