@@ -197,7 +197,7 @@ Cách kiểm tra: chạy `codex mcp list`, dòng `google-drive-rag` phải có t
 
 Câu hỏi thử: "Dùng google-drive-rag tìm tài liệu về hợp đồng thuê văn phòng."
 
-> **Lưu ý:** Nếu bản Codex của bạn quá cũ nên không hiểu `url`, hãy cập nhật Codex. Các bước trên theo tài liệu của Codex, chưa được thử trên máy thật.
+> **Lưu ý:** Nếu bản Codex của bạn quá cũ nên không hiểu `url`, hãy cập nhật Codex. Cách kết nối này đã chạy được với Codex trên VPS.
 
 ### Antigravity (Google)
 
