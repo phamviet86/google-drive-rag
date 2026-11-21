@@ -103,6 +103,14 @@ def cmd_search(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_read(args: argparse.Namespace) -> int:
+    result = _service(args).read(
+        args.document, args.start_chunk, args.max_chunks, args.page, source=args.source
+    )
+    _print(result, args.json)
+    return 0
+
+
 def cmd_source_add(args: argparse.Namespace) -> int:
     # the same rules as the add_source tool: a Drive link only when Google confirms it, a local
     # path only when it exists inside the local folder. No sync is queued in this process; the
@@ -320,6 +328,17 @@ def build_parser() -> argparse.ArgumentParser:
         help="show each hit's full-text and vector rank/score and the fused score",
     )
     search.set_defaults(func=cmd_search)
+
+    read = commands.add_parser("read", help="read one indexed document (for manual checks)")
+    read.add_argument("document", help="document_id from a search result, or a Drive file link")
+    read.add_argument(
+        "--source",
+        help="source id, name or link; the document must be in it (as search --source)",
+    )
+    read.add_argument("--start-chunk", type=int, default=0)
+    read.add_argument("--max-chunks", type=int, default=10)
+    read.add_argument("--page", type=int, help="start at this PDF page instead")
+    read.set_defaults(func=cmd_read)
 
     source = commands.add_parser(
         "source", help="manage sources (Drive links and local folders)"

@@ -266,6 +266,8 @@ Ví dụ câu hỏi cho agent:
 
 Kết quả: agent chỉ trả lời bằng tài liệu nằm trong thư mục hoặc tệp đó. Nếu thư mục hoặc tệp chưa được đọc vào chỉ mục, agent báo rõ là không tìm thấy nó, thay vì trả về kết quả rỗng.
 
+Khi tìm trong một nguồn, agent nên truyền cùng nguồn đó khi đọc nội dung tài liệu (tham số `source` của công cụ `read`). Tài liệu không nằm trong nguồn đó sẽ bị từ chối, kể cả khi nó vẫn còn trong chỉ mục nhờ nguồn khác.
+
 Nguồn vừa thêm cần một lần đọc đầu tiên. Trong lúc đó bạn vẫn tìm được trong các tệp đã đọc xong, kèm một lời nhắc như `source 'Kế toán' is still on its first sync (120 of 433 files indexed)`, nghĩa là mới đọc 120 trên 433 tệp. Kết quả lúc này chưa đủ; hãy hỏi lại khi đọc xong.
 
 > **Lưu ý:** Thư mục mới thêm hoặc mới đổi tên trên Drive được cập nhật ở lần đọc Drive kế tiếp (tối đa 15 phút, hoặc ngay khi bạn nhờ agent đọc lại Drive). Đổi tên hay chuyển thư mục không làm dịch vụ đọc lại nội dung tệp.

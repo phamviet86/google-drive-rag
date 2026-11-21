@@ -117,3 +117,30 @@ def test_search_command_with_folder_and_file(
     ]
     assert main(["--json", "search", "hợp đồng", "--folder", "folderMissing0000"]) == 2
     assert "folderMissing0000" in capsys.readouterr().out
+
+
+def test_read_command_with_source(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    from helpers import FakeDrive, make_service
+
+    import gdrive_rag.cli as cli
+
+    drive = FakeDrive()
+    for root, name in (("folderAAAAAAAAAAAA", "Một"), ("folderBBBBBBBBBBBB", "Hai")):
+        drive.add_root(root, name)
+    drive.put("folderAAAAAAAAAAAA", "fileOnlyA0000000", "a.txt", "nội dung riêng".encode())
+    service = make_service(tmp_path, drive)
+    service.add_sources(["folderAAAAAAAAAAAA", "folderBBBBBBBBBBBB"])
+    service.sync()
+    monkeypatch.setattr(cli, "_service", lambda args: service)
+
+    assert main(["--json", "read", "fileOnlyA0000000", "--source", "1"]) == 0
+    assert json.loads(capsys.readouterr().out)["chunks"][0]["text"] == "nội dung riêng"
+    assert main(["--json", "read", "fileOnlyA0000000"]) == 0
+    capsys.readouterr()
+    assert main(["--json", "read", "fileOnlyA0000000", "--source", "Hai"]) == 2
+    output = json.loads(capsys.readouterr().out)
+    assert output == {"ok": False, "error": "document fileOnlyA0000000 is not in source Hai"}
+    assert main(["--json", "read", "fileOnlyA0000000", "--source", "9"]) == 2
+    assert "unknown source" in capsys.readouterr().out

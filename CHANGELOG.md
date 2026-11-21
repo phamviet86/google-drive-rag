@@ -6,6 +6,10 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); ver
 
 Tóm tắt: chỉ sửa tài liệu, không đổi cách dịch vụ chạy. README giờ hướng dẫn kết nối cho Claude Code, Codex và Antigravity, và lời văn không còn gắn riêng với Claude.
 
+### Added
+
+- `read` (MCP tool, `Service.read`) takes an optional `source` (id, name or link, as in `search`). The document must belong to that source, otherwise it is refused with `document <id> is not in source <source>`, so a client confined to one source cannot read a document that left it but is still indexed through another. Without `source` nothing changes. New CLI command `gdrive-rag read <id> [--source S]`.
+
 ### Changed
 
 - Docs: setup for three MCP clients (Claude Code, OpenAI Codex, Google Antigravity) in README "Kết nối với agent", including the SSH tunnel for an agent on another computer; README, package description, `.env.example` and `docker-compose.yml` comments are agent-neutral. No behaviour change.
