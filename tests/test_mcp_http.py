@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import json
 import socket
 import threading
@@ -31,8 +32,6 @@ def free_port() -> int:
 
 @pytest.fixture()
 def running(tmp_path: Path) -> Iterator[tuple[str, Service]]:
-    import uvicorn
-
     drive = FakeDrive()
     drive.add_root(ROOT, "Kế toán")
     drive.add_folder(SUB, "Tháng 3", ROOT)
@@ -46,6 +45,14 @@ def running(tmp_path: Path) -> Iterator[tuple[str, Service]]:
     service = make_service(tmp_path, drive)
     service.add_sources([ROOT])
     service.sync()
+    with serve(service) as started:
+        yield started
+
+
+@contextlib.contextmanager
+def serve(service: Service) -> Iterator[tuple[str, Service]]:
+    import uvicorn
+
     port = free_port()
     server = uvicorn.Server(
         uvicorn.Config(create_app(service), host="127.0.0.1", port=port, log_level="warning")
@@ -125,6 +132,42 @@ def test_errors_are_tool_errors(running: tuple[str, Service]) -> None:
     assert call(url, "read", {"document_id": "nope"}).is_error
     assert call(url, "search", {"query": "!!!"}).is_error
     assert call(url, "search", {"query": "x", "source": "unknown"}).is_error
+
+
+def test_read_with_source_is_refused_outside_the_source(tmp_path: Path) -> None:
+    """A client confined to one source (as Codex is) passes it to `read`; a saved document ID
+    that has left the source is refused even though the document is still indexed elsewhere."""
+    other = "folderBBBBBBBBBBBB"
+    drive = FakeDrive()
+    drive.add_root(ROOT, "Kế toán")
+    drive.add_root(other, "Nhân sự")
+    for root in (ROOT, other):
+        drive.put(root, "shared1111111111", "chung.txt", "Bí mật chung của hai phòng".encode())
+    service = make_service(tmp_path, drive)
+    service.add_sources([ROOT, other])
+    service.sync()
+    with serve(service) as (url, _):
+        doc = call(url, "search", {"query": "bí mật chung", "source": "2"})
+        doc_id = doc.structured_content["results"][0]["document_id"]
+        allowed = call(url, "read", {"document_id": doc_id, "source": "2"})
+        assert not allowed.is_error
+        assert allowed.structured_content["chunks"][0]["text"] == "Bí mật chung của hai phòng"
+        drive.delete(other, "shared1111111111")  # leaves source 2, source 1 still lists it
+        service.sync()
+        assert call(url, "read", {"document_id": doc_id}).structured_content["chunks"]
+        assert call(url, "read", {"document_id": doc_id, "source": "1"}).structured_content
+        refused = call(url, "read", {"document_id": doc_id, "source": "2"})
+        assert refused.is_error
+        message = refused.content[0].text
+        assert message == f"Error: document {doc_id} is not in source 2"
+        assert "Bí mật" not in message and not refused.structured_content
+        assert call(url, "read", {"document_id": doc_id, "source": "Nhân sự"}).is_error
+        assert (
+            "unknown source"
+            in call(url, "read", {"document_id": doc_id, "source": "9"}).content[0].text
+        )
+        tools = {tool.name: tool for tool in call(url, "tools/list").tools}
+        assert "source" in tools["read"].input_schema["properties"]
 
 
 def test_sources_and_status(running: tuple[str, Service]) -> None:

@@ -323,10 +323,19 @@ def create_server(service: Service, admin: Admin | None = None) -> Any:
         page: Annotated[
             int | None, Field(ge=1, description="Start at this PDF page instead.")
         ] = None,
+        source: Annotated[
+            str | None,
+            Field(
+                description="Source name or id from list_sources. Pass the same source you "
+                "searched with: a document that is not in it is refused."
+            ),
+        ] = None,
     ) -> Annotated[CallToolResult, ReadOutput]:
-        """Read consecutive text of one document, by chunk range or starting at a PDF page."""
+        """Read consecutive text of one document, by chunk range or starting at a PDF page.
+        When you searched within a `source`, pass the same `source` here; a document that is
+        not in that source is refused."""
         try:
-            result = service.read(document_id, start_chunk, max_chunks, page)
+            result = service.read(document_id, start_chunk, max_chunks, page, source=source)
         except ValueError as exc:
             return fail(exc)
         capped = _cap_list(result, "chunks")

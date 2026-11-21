@@ -1254,9 +1254,14 @@ class Service:
         max_chunks: int = 10,
         page: int | None = None,
         max_chars: int = READ_LIMIT_CHARS,
+        source: str | None = None,
     ) -> dict[str, Any]:
+        """Read a document. With ``source`` (id, name or link, as in ``search``) the document
+        must belong to that source, so a client confined to one source cannot read, with a saved
+        ID, a document that has left it but is still indexed through another."""
         if start_chunk < 0 or not 1 <= max_chunks <= 100:
             raise ValueError("start_chunk must be >= 0 and max_chunks between 1 and 100")
+        source_id = self.search_engine.source_id(source) if source else None
         keys = [document_id.strip()]
         with contextlib.suppress(ValueError):
             keys.append(parse_drive_link(document_id))  # a Drive file link or ID
@@ -1264,15 +1269,30 @@ class Service:
             document = connection.execute(
                 "SELECT * FROM documents WHERE file_id IN (?,?) LIMIT 1", (keys[0], keys[-1])
             ).fetchone()
+            outside = f"document {document_id} is not in source {source}"
             if document is None:
-                raise ValueError(f"unknown document id: {document_id}")
+                # with a source, every refusal reads the same, so a confined client cannot tell
+                # whether an ID exists (or is ignored) outside that source
+                raise ValueError(
+                    outside if source_id is not None else f"unknown document id: {document_id}"
+                )
             rows = connection.execute(
                 "SELECT ordinal, text, locator FROM chunks WHERE document_id=? ORDER BY ordinal",
                 (document["id"],),
             ).fetchall()
         if int(document["id"]) in self.search_engine.ignored_documents():
             # being removed by the next sync: already treated as not indexed
+            if source_id is not None:
+                raise ValueError(outside)
             raise ValueError(f"document {document_id} is ignored by a path rule; not indexed")
+        if source_id is not None:
+            with self.db.read() as connection:
+                member = connection.execute(
+                    "SELECT 1 FROM document_sources WHERE document_id=? AND source_id=?",
+                    (document["id"], source_id),
+                ).fetchone()
+            if member is None:
+                raise ValueError(outside)
         if page is not None:
             matching = [r for r in rows if _locator_has_page(str(r["locator"]), page)]
             start_chunk = int(matching[0]["ordinal"]) if matching else len(rows)

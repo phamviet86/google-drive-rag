@@ -279,3 +279,32 @@ def test_scheduled_cycle_is_retried_not_skipped_and_keeps_its_deadline(
         loop.close()
         loop.thread.join(timeout=5)
     assert not loop.thread.is_alive()
+
+
+def test_read_with_source_needs_membership(tmp_path: Path) -> None:
+    import pytest
+
+    drive, service = setup_two_sources(tmp_path)
+    service.sync()
+    doc = service.search("shared")["results"][0]["document_id"]
+    assert service.read(doc, source="2")["file_name"] == "shared.txt"
+    assert service.read(doc, source="Phòng B")["chunks"]
+    drive.delete(ROOT_B, "shared11111111")  # leaves source 2, source 1 still lists it
+    assert service.sync()["removed"] == 0
+    assert service.read(doc)["chunks"]  # without source: unchanged
+    assert service.read(doc, source="1")["chunks"]
+    with pytest.raises(ValueError, match=f"^document {doc} is not in source 2$"):
+        service.read(doc, source="2")
+    with pytest.raises(ValueError, match="unknown source: 9"):
+        service.read(doc, source="9")
+    # with a source, an unknown ID is refused with the same words: no hint that it exists
+    with pytest.raises(ValueError, match="^document nope is not in source 1$"):
+        service.read("nope", source="1")
+    with pytest.raises(ValueError, match="unknown document id"):
+        service.read("nope")
+    # an ignored document is refused the same way when a source is given
+    service.set_path_rules(1, {"ignore": ["shared.txt"]})
+    with pytest.raises(ValueError, match=f"^document {doc} is not in source 1$"):
+        service.read(doc, source="1")
+    with pytest.raises(ValueError, match="ignored by a path rule"):
+        service.read(doc)

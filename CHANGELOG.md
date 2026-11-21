@@ -2,9 +2,13 @@
 
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions follow [Semantic Versioning](https://semver.org/). The install guide for the owner is `README.md` (Vietnamese).
 
-## [Unreleased]
+## [0.5.0] - 2026-11-21
 
-Tóm tắt: chỉ sửa tài liệu, không đổi cách dịch vụ chạy. README giờ hướng dẫn kết nối cho Claude Code, Codex và Antigravity, và lời văn không còn gắn riêng với Claude.
+Tóm tắt: công cụ `read` nhận thêm `source`, nên agent chỉ đọc được tài liệu thuộc đúng nguồn nó đã tìm. README giờ hướng dẫn kết nối cho Claude Code, Codex và Antigravity, và lời văn không còn gắn riêng với Claude. Không có thay đổi cơ sở dữ liệu, không đọc lại tệp và không tính lại dữ liệu ý nghĩa.
+
+### Added
+
+- `read` (MCP tool, `Service.read`) takes an optional `source` (id, name or link, as in `search`). The document must belong to that source, otherwise it is refused with `document <id> is not in source <source>` (the same words for an unknown or ignored document, so nothing leaks about IDs outside the source), so a client confined to one source cannot read a document that left it but is still indexed through another. Without `source` nothing changes. New CLI command `gdrive-rag read <id> [--source S]`.
 
 ### Changed
 
