@@ -2,6 +2,18 @@
 
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions follow [Semantic Versioning](https://semver.org/). The install guide for the owner is `README.md` (Vietnamese).
 
+## [Unreleased]
+
+Tóm tắt: GitHub tự tạo release khi một số phiên bản mới vào `main` và CI đạt. Không đổi cách dịch vụ chạy.
+
+### Added
+
+- Release workflow (`.github/workflows/release.yml`): after CI passes on a push to `main`, it reads the version from `pyproject.toml` and, if tag `vX.Y.Z` does not exist yet, creates it on the tested commit and publishes a GitHub release with that version's CHANGELOG section (`scripts/release_notes.py`). Existing tags are skipped; it can also be run by hand from the Actions tab.
+
+### Changed
+
+- README: the Codex setup is confirmed working on the VPS.
+
 ## [0.5.0] - 2026-11-21
 
 Tóm tắt: công cụ `read` nhận thêm `source`, nên agent chỉ đọc được tài liệu thuộc đúng nguồn nó đã tìm. README giờ hướng dẫn kết nối cho Claude Code, Codex và Antigravity, và lời văn không còn gắn riêng với Claude. Không có thay đổi cơ sở dữ liệu, không đọc lại tệp và không tính lại dữ liệu ý nghĩa.

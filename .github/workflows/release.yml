@@ -1,0 +1,56 @@
+name: Release
+
+# Publishes a GitHub release (tag vX.Y.Z on the tested commit, notes from CHANGELOG.md) when a new
+# version in pyproject.toml reaches main and CI passed on that commit. A version whose tag already
+# exists is skipped, so re-runs and releases made by hand are never duplicated.
+
+on:
+  workflow_run:
+    workflows: [CI]
+    types: [completed]
+    branches: [main]
+  workflow_dispatch:  # manual run from the Actions tab: releases main if its version is new
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      (github.event.workflow_run.conclusion == 'success' &&
+       github.event.workflow_run.event == 'push')
+    env:
+      GH_TOKEN: ${{ github.token }}
+      SHA: ${{ github.event.workflow_run.head_sha || github.sha }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.SHA }}
+      - name: Read the version
+        id: version
+        run: echo "version=$(python3 scripts/release_notes.py version)" >> "$GITHUB_OUTPUT"
+      - name: Skip if the tag already exists
+        id: check
+        env:
+          TAG: v${{ steps.version.outputs.version }}
+        run: |
+          if git ls-remote --exit-code --tags origin "refs/tags/$TAG" > /dev/null; then
+            echo "$TAG already exists; nothing to release"
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+          fi
+      - name: Publish the release
+        if: steps.check.outputs.skip == 'false'
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          python3 scripts/release_notes.py notes "$VERSION" > notes.md
+          gh release create "v$VERSION" --target "$SHA" --title "v$VERSION" \
+            --notes-file notes.md --latest
