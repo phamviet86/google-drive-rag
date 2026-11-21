@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "google-drive-rag"
-version = "0.4.0"
+version = "0.5.0"
 description = "Search Google Drive documents from any MCP-capable AI agent (Streamable HTTP)"
 readme = "README.md"
 requires-python = ">=3.12,<3.14"
