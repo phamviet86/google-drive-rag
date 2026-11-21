@@ -8,7 +8,7 @@ Tóm tắt: chỉ sửa tài liệu, không đổi cách dịch vụ chạy. REA
 
 ### Added
 
-- `read` (MCP tool, `Service.read`) takes an optional `source` (id, name or link, as in `search`). The document must belong to that source, otherwise it is refused with `document <id> is not in source <source>`, so a client confined to one source cannot read a document that left it but is still indexed through another. Without `source` nothing changes. New CLI command `gdrive-rag read <id> [--source S]`.
+- `read` (MCP tool, `Service.read`) takes an optional `source` (id, name or link, as in `search`). The document must belong to that source, otherwise it is refused with `document <id> is not in source <source>` (the same words for an unknown or ignored document, so nothing leaks about IDs outside the source), so a client confined to one source cannot read a document that left it but is still indexed through another. Without `source` nothing changes. New CLI command `gdrive-rag read <id> [--source S]`.
 
 ### Changed
 

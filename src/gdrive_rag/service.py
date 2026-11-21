@@ -1269,14 +1269,21 @@ class Service:
             document = connection.execute(
                 "SELECT * FROM documents WHERE file_id IN (?,?) LIMIT 1", (keys[0], keys[-1])
             ).fetchone()
+            outside = f"document {document_id} is not in source {source}"
             if document is None:
-                raise ValueError(f"unknown document id: {document_id}")
+                # with a source, every refusal reads the same, so a confined client cannot tell
+                # whether an ID exists (or is ignored) outside that source
+                raise ValueError(
+                    outside if source_id is not None else f"unknown document id: {document_id}"
+                )
             rows = connection.execute(
                 "SELECT ordinal, text, locator FROM chunks WHERE document_id=? ORDER BY ordinal",
                 (document["id"],),
             ).fetchall()
         if int(document["id"]) in self.search_engine.ignored_documents():
             # being removed by the next sync: already treated as not indexed
+            if source_id is not None:
+                raise ValueError(outside)
             raise ValueError(f"document {document_id} is ignored by a path rule; not indexed")
         if source_id is not None:
             with self.db.read() as connection:
@@ -1285,7 +1292,7 @@ class Service:
                     (document["id"], source_id),
                 ).fetchone()
             if member is None:
-                raise ValueError(f"document {document_id} is not in source {source}")
+                raise ValueError(outside)
         if page is not None:
             matching = [r for r in rows if _locator_has_page(str(r["locator"]), page)]
             start_chunk = int(matching[0]["ordinal"]) if matching else len(rows)

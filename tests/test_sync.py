@@ -297,5 +297,14 @@ def test_read_with_source_needs_membership(tmp_path: Path) -> None:
         service.read(doc, source="2")
     with pytest.raises(ValueError, match="unknown source: 9"):
         service.read(doc, source="9")
-    with pytest.raises(ValueError, match="unknown document id"):
+    # with a source, an unknown ID is refused with the same words: no hint that it exists
+    with pytest.raises(ValueError, match="^document nope is not in source 1$"):
         service.read("nope", source="1")
+    with pytest.raises(ValueError, match="unknown document id"):
+        service.read("nope")
+    # an ignored document is refused the same way when a source is given
+    service.set_path_rules(1, {"ignore": ["shared.txt"]})
+    with pytest.raises(ValueError, match=f"^document {doc} is not in source 1$"):
+        service.read(doc, source="1")
+    with pytest.raises(ValueError, match="ignored by a path rule"):
+        service.read(doc)
